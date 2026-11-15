@@ -4,8 +4,8 @@ const nextConfig: NextConfig = {
   // Every page here is per-tenant and authenticated or token-gated, so nothing is
   // statically cacheable; classic request-time rendering keeps that explicit.
   serverExternalPackages: ["@electric-sql/pglite", "pg", "pdfjs-dist", "unpdf", "mammoth"],
-  // Local PGlite needs the SQL migrations at runtime.
-  outputFileTracingIncludes: { "/**": ["./drizzle/**/*"] },
+  // Read from disk at runtime: SQL migrations (local PGlite) and the fonts embedded into PDFs.
+  outputFileTracingIncludes: { "/**": ["./drizzle/**/*", "./assets/fonts/*"] },
   turbopack: {
     rules: {
       "*.css": {
