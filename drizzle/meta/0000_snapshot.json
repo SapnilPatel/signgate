@@ -1,5 +1,5 @@
 {
-  "id": "e32dbd5e-3c67-463b-b874-ec062b9fed13",
+  "id": "6e8f38e8-8db2-4781-8210-9a35e05a8058",
   "prevId": "00000000-0000-0000-0000-000000000000",
   "version": "7",
   "dialect": "postgresql",
@@ -1349,6 +1349,12 @@
         },
         "email": {
           "name": "email",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "token_nonce": {
+          "name": "token_nonce",
           "type": "text",
           "primaryKey": false,
           "notNull": true

@@ -284,7 +284,11 @@ export const signers = pgTable(
     order: integer("order").notNull(),
     name: text("name").notNull(),
     email: text("email").notNull(),
-    /** sha256 of the secret in the signing link. Rotated when the link is reissued. */
+    /** The signing-link secret is HMAC(APP_SECRET, signer id + nonce): it can be shown
+     *  again to the sender at any time without ever being stored. Replacing the nonce
+     *  revokes the old link. */
+    tokenNonce: text("token_nonce").notNull(),
+    /** sha256 of the signing-link secret, for lookup when a link is opened. */
     tokenHash: text("token_hash").notNull(),
     /** Set for the company signer when it is a team member. */
     userId: text("user_id").references(() => users.id, { onDelete: "set null" }),

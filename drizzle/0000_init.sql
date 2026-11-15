@@ -140,6 +140,7 @@ CREATE TABLE "signers" (
 	"order" integer NOT NULL,
 	"name" text NOT NULL,
 	"email" text NOT NULL,
+	"token_nonce" text NOT NULL,
 	"token_hash" text NOT NULL,
 	"user_id" text,
 	"status" text DEFAULT 'waiting' NOT NULL,

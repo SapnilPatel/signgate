@@ -12,6 +12,15 @@ export const env = {
     if (vercel) return `https://${vercel}`;
     return `http://localhost:${process.env.PORT ?? 3000}`;
   },
+  /** Key for deriving signing-link secrets. Required in production. */
+  get appSecret(): string {
+    const secret = process.env.APP_SECRET?.trim();
+    if (secret && secret.length >= 32) return secret;
+    if (process.env.NODE_ENV === "production") {
+      throw new Error("APP_SECRET is not set (or is shorter than 32 characters). Set it to a long random string.");
+    }
+    return "dev-only-secret-do-not-use-in-production-0000";
+  },
   get resendApiKey(): string | undefined {
     return process.env.RESEND_API_KEY?.trim() || undefined;
   },
