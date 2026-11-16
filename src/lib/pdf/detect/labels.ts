@@ -24,8 +24,18 @@ export type LabelKind =
 
 export interface PartyMatch {
   party: Party;
-  /** 3: the sender's own name. 2: looks like a legal entity. 1: a generic word. */
+  /** 3: the sender's own name, or a term the agreement itself defines for a party. 2: looks like a legal entity. 1: a generic word. */
   strength: 1 | 2 | 3;
+}
+
+/**
+ * What the agreement calls each party, read from its opening sentence
+ * ('Astra AI, LLC ("Consultant") and ____ ("Company")'). Normalized words.
+ * These outrank the generic vocabulary: in that agreement "Company" is the client.
+ */
+export interface DefinedTerms {
+  sender: string[];
+  client: string[];
 }
 
 const CLIENT_WORDS =
@@ -66,8 +76,9 @@ const FILLER =
   /\b(signature|signatures|signed|sign|signatory|signer|here|by|x|of|the|authori[sz]ed|representative|rep|officer|and|or|date|dated|name|title|print|printed|for|on|behalf|please|above|below|duly|legal|electronic|digital|accepted|agreed|approved|executed|acknowledged|acknowledge?ment|acceptance|approval|if|applicable|required|under|over|age|minor|party|first|second|to|as|s|a|b|\d+)\b/g;
 
 /** What is left of a label once party words and the usual signature-block words are removed. */
-function residue(normalized: string, companyName?: string): string {
+function residue(normalized: string, companyName?: string, terms?: DefinedTerms): string {
   let rest = ` ${normalized} `;
+  for (const term of [...(terms?.sender ?? []), ...(terms?.client ?? [])]) rest = rest.split(` ${term} `).join(" ");
   if (companyName) {
     const name = normalize(companyName);
     if (name) rest = rest.split(` ${name} `).join(" ");
@@ -87,15 +98,36 @@ function residue(normalized: string, companyName?: string): string {
  * the Company", "For Astra AI") rather than a phrase that merely mentions a party
  * ("Client comments", "Company policies").
  */
-export function isPartyHeading(text: string, companyName?: string): boolean {
-  return residue(normalize(text), companyName) === "";
+export function isPartyHeading(text: string, companyName?: string, terms?: DefinedTerms): boolean {
+  return residue(normalize(text), companyName, terms) === "";
+}
+
+function termIndex(padded: string, list: string[] | undefined): number {
+  let best = -1;
+  for (const term of list ?? []) {
+    let at = padded.indexOf(` ${term} `);
+    // "Companies" and "Clients" still name the party.
+    if (at < 0) at = padded.indexOf(` ${term}s `);
+    if (at >= 0 && (best < 0 || at < best)) best = at;
+  }
+  return best;
 }
 
 /** Which party a heading or label refers to, if it says. */
-export function partyOf(text: string, companyName?: string): PartyMatch | null {
+export function partyOf(text: string, companyName?: string, terms?: DefinedTerms): PartyMatch | null {
   const n = normalize(text);
   if (!n) return null;
   if (mentionsCompanyName(n, companyName)) return { party: "company", strength: 3 };
+  if (terms) {
+    const padded = ` ${n} `;
+    const asSender = termIndex(padded, terms.sender);
+    const asClient = termIndex(padded, terms.client);
+    if (asClient >= 0 || asSender >= 0) {
+      // As a heading the defined term is decisive; inside a longer phrase it is only a mention.
+      const strength = residue(n, companyName, terms) === "" ? 3 : 1;
+      return { party: asClient >= 0 && (asSender < 0 || asClient < asSender) ? "client" : "company", strength };
+    }
+  }
   const client = n.search(CLIENT_WORDS);
   const company = n.search(COMPANY_WORDS);
   if (client >= 0 && (company < 0 || client < company)) return { party: "client", strength: 1 };
@@ -115,25 +147,44 @@ const PARTY_ONLY = new RegExp(`^(the )?(${CLIENT_WORDS.source}|${COMPANY_WORDS.s
  * Reads a short label such as "Client Signature:", "By", "Print Name" or
  * "(Date)". Returns null when the words are not a recognizable label.
  */
-export function classifyLabel(text: string, companyName?: string): LabelMatch | null {
+export function classifyLabel(text: string, companyName?: string, terms?: DefinedTerms): LabelMatch | null {
   const n = normalize(text);
   if (!n || n.length > 80) return null;
-  const party = partyOf(text, companyName);
+  const party = partyOf(text, companyName, terms);
   const kind = kindOf(n);
   // "Signed by the parties:" and "Signature requirements" mention signing without being a line to sign on.
-  if (kind === "signature" && residue(n, companyName) !== "") return null;
+  if (kind === "signature" && residue(n, companyName, terms) !== "") return null;
   if (kind) return { kind, party };
   if (!party || n.split(" ").length > 6) return null;
-  if (PARTY_ONLY.test(n) || residue(n, companyName) === "") return { kind: "party", party };
+  if (PARTY_ONLY.test(n) || residue(n, companyName, terms) === "") return { kind: "party", party };
   // A bare entity name ("Blue Heron Consulting LLC") names a party; a clause that mentions one does not.
   const clause = /["\u201c\u201d()]/.test(text) || /\b(between|and|with|by|to|is|are|this|that|agrees?|shall|will|from)\b/.test(n);
   if (party.strength >= 2 && !clause) return { kind: "party", party };
   return null;
-  return null;
 }
 
+/**
+ * True for a heading that opens a witness or notary block ("WITNESS", "Notary Public",
+ * "Signed in the presence of:"). The lines under it belong to neither signer.
+ * "IN WITNESS WHEREOF" opens the parties' own signatures and is not one of these.
+ */
+export function isWitnessHeading(text: string): boolean {
+  const n = normalize(text);
+  if (!n || n.split(" ").length > 7 || /\b(whereof|thereof)\b/.test(n)) return false;
+  if (!WITNESS_WORDS.test(n)) return false;
+  const rest = n
+    .replace(new RegExp(WITNESS_WORDS.source, "g"), " ")
+    .replace(FILLER, " ")
+    .replace(/\b(public|in|presence|before|me|was|this|document|agreement|seal|acknowledg\w*|sworn|subscribed|certificate|jurat)\b/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+  return rest === "";
+}
+
+const WITNESS_WORDS = /\b(witness|witnesses|witnessed|notary|notarized|notarised|attest|attested|attestation|in the presence of)\b/;
+
 function kindOf(n: string): LabelKind | null {
-  if (/\b(witness|witnessed|notary|notarized)\b/.test(n)) return "witness";
+  if (WITNESS_WORDS.test(n) && !/\b(whereof|thereof)\b/.test(n)) return "witness";
   if (/\binitial(s|ed)?\b|\binit\b/.test(n)) return "initials";
   if (/\be ?mail\b/.test(n)) return "email";
   if (/\b(phone|telephone|tel|mobile|cell|fax)\b/.test(n)) return "phone";
@@ -226,4 +277,75 @@ export function tailLabel(left: string, fallback: string): string {
   const label = words.join(" ");
   if (label.length < 2) return fallback;
   return (label[0].toUpperCase() + label.slice(1)).slice(0, 60);
+}
+
+const DEFINITION = /\(([^()"“”]{0,60})["“]\s*([^"“”()]{2,32}?)\s*["”]([^()]{0,40})\)/g;
+/** Defined terms that are not a party to the agreement. */
+const NOT_A_PARTY =
+  /^(the )?(agreement|contract|parties|party|effective date|commencement date|start date|term|initial term|services?|work|project|fees?|deliverables?|sow|statement of work|confidential information|premises|property|products?|software|site|event|engagement|purpose|territory|order|proposal|program|policy|terms|msa|nda|schedule|exhibit)$/;
+const CLIENT_EVIDENCE = /_{3,}|\b(named|identified|listed|specified|signing|whose name|undersigned|set forth)\b[^.]{0,30}$/;
+
+/**
+ * Reads what the agreement calls each party from where it defines them, e.g.
+ * 'between Astra AI, LLC, a Delaware company ("Consultant") and ____ ("Company")'.
+ * The term that follows the sender's own name is the sender's; the term that
+ * follows a blank, or the other term of the same sentence, is then the client's.
+ * Returns undefined unless the sender's own name is found next to a term.
+ * `text` is running text with blanks written as "____".
+ */
+export function findDefinedTerms(text: string, companyName?: string): DefinedTerms | undefined {
+  const body = text.slice(0, 40_000);
+  const found: { term: string; before: string; at: number; end: number }[] = [];
+  let lastEnd = 0;
+  DEFINITION.lastIndex = 0;
+  for (let m = DEFINITION.exec(body); m && found.length < 40; m = DEFINITION.exec(body)) {
+    const term = normalize(m[2]).replace(/^the /, "");
+    const windowStart = Math.max(lastEnd, m.index - 220);
+    lastEnd = m.index + m[0].length;
+    // "(each a "Party")" and "(collectively, the "Parties")" define no one in particular.
+    if (!term || term.split(" ").length > 3 || NOT_A_PARTY.test(term) || /\b(each|collectively|together|individually)\b/i.test(m[1])) continue;
+    found.push({ term, before: body.slice(windowStart, m.index), at: m.index, end: lastEnd });
+  }
+  if (!found.length) return undefined;
+  const sender = new Set<string>();
+  const client = new Set<string>();
+  const isSender = found.map((f) => mentionsCompanyName(normalize(f.before), companyName));
+  const isClient = found.map((f, i) => !isSender[i] && CLIENT_EVIDENCE.test(f.before.slice(-90)));
+  found.forEach((f, i) => {
+    if (isSender[i]) sender.add(f.term);
+    else if (isClient[i]) client.add(f.term);
+  });
+  // Two parties are defined side by side: knowing one tells us the other.
+  const neighbour = (i: number, taken: boolean[]): number => {
+    for (const j of [i + 1, i - 1]) {
+      const other = found[j];
+      if (!other || taken[j] || isSender[j] || isClient[j] || other.term === found[i].term) continue;
+      const gap = j > i ? other.at - found[i].end : found[i].at - other.end;
+      if (gap >= 0 && gap <= 260) return j;
+    }
+    return -1;
+  };
+  // Everything hangs on recognizing the sender by name. Without that, a blank before a term
+  // could be either party's ('provided by ____ (the "Provider")'), and the generic words decide.
+  if (!sender.size) return undefined;
+  if (!client.size) {
+    const taken = found.map(() => false);
+    found.forEach((_, i) => {
+      if (!isSender[i] || client.size) return;
+      const j = neighbour(i, taken);
+      if (j >= 0) {
+        client.add(found[j].term);
+        taken[j] = true;
+      }
+    });
+  }
+  // A term claimed by both sides tells us nothing.
+  for (const term of [...sender]) {
+    if (client.has(term)) {
+      sender.delete(term);
+      client.delete(term);
+    }
+  }
+  if (!sender.size) return undefined;
+  return { sender: [...sender], client: [...client] };
 }

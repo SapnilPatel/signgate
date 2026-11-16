@@ -14,16 +14,20 @@ import { extractLayout, type ExtractedLayout } from "../text";
 import { newId } from "@/lib/ids";
 import { anthropicCaller, applyScannedResult, applyTextReview, buildScannedRequest, buildTextRequest, callWithDeadline, AI_TIMEOUT_MS, type AiCaller } from "./ai";
 import { buildModel } from "./layout";
-import { detectByRules, finalizeFields } from "./rules";
+import { detectByRules, finalizeFields, type RuleResult } from "./rules";
 
 export interface DetectDeps {
   /** Replaces the Anthropic call; used by tests so they never touch the network. */
   ai?: AiCaller;
   aiTimeoutMs?: number;
+  /** Time allowed for the rule-based pass; tests shorten it. */
+  rulesTimeoutMs?: number;
 }
 
 /** Reading a hostile or enormous file must not hold the upload hostage. */
 const LAYOUT_TIMEOUT_MS = 20_000;
+/** The rules normally finish in well under a second; past this the document is answered with a signature page instead. */
+const RULES_TIMEOUT_MS = 8_000;
 
 const plural = (n: number, one: string, many = `${one}s`) => `${n} ${n === 1 ? one : many}`;
 const hasClientSignature = (fields: Field[]) => fields.some((f) => f.type === "signature" && f.role === "client");
@@ -61,7 +65,7 @@ function sanitizeFormFields(input: unknown, pageCount: number): Field[] {
 }
 
 async function readLayout(pdf: Uint8Array): Promise<ExtractedLayout> {
-  const empty: ExtractedLayout = { items: [], pageText: [], scanned: true, pages: [], runs: [], rules: [] };
+  const empty: ExtractedLayout = { items: [], pageText: [], scanned: true, pages: [], runs: [], rules: [], vrules: [] };
   let timer: ReturnType<typeof setTimeout> | undefined;
   try {
     return await Promise.race([
@@ -122,8 +126,22 @@ async function detect(pdf: Uint8Array, options: DetectOptions, deps: DetectDeps)
   // Fractions are relative to each page, so the reader's own page sizes are the right
   // basis for its coordinates even if they differ slightly from pdf-lib's.
   const usable = layout.pages.length === pages.length;
-  const model = buildModel(usable ? layout : { ...layout, pages, runs: [], rules: [], items: [] }, formFields);
-  const rule = detectByRules(model, companyName);
+  const model = buildModel(usable ? layout : { ...layout, pages, runs: [], rules: [], vrules: [], items: [] }, formFields);
+  let rule: RuleResult;
+  try {
+    rule = detectByRules(model, companyName, { deadline: Date.now() + (deps.rulesTimeoutMs ?? RULES_TIMEOUT_MS) });
+  } catch {
+    // Out of time, or a layout the rules could not cope with. The form's own fields are still trustworthy.
+    rule = {
+      fields: formFields,
+      origins: new Map(),
+      model,
+      stats: { signatureBlocks: 0, clientSignatures: 0, companySignatures: 0, guessedRoles: false, prefills: 0, openBlanks: 0, initials: 0, witnessLines: 0, skippedBlanks: 0 },
+    };
+    notes.push("This document has too many blanks and lines to analyse automatically. Place the fields you need by hand in the editor.");
+  }
+  if (rule.stats.skippedBlanks > 0)
+    notes.push(`This document has a very large number of blanks. ${plural(rule.stats.skippedBlanks, "blank")} beyond the first ones on each page ${rule.stats.skippedBlanks === 1 ? "was" : "were"} not looked at. Check the fields in the editor and add any that are missing.`);
   let fields = finalizeFields(rule.fields, pages.length, LIMITS.maxFieldsPerTemplate);
   const scanned = !usable || layout.scanned;
   let method: DetectionMeta["method"] = fields.some((f) => f.source === "form") ? "form" : fields.length ? "heuristic" : "none";
@@ -200,12 +218,14 @@ async function detect(pdf: Uint8Array, options: DetectOptions, deps: DetectDeps)
       const bytes = await doc.save();
       outPdf = bytes;
       pages = await getPages(doc);
-      fields = [...fields, ...page.fields];
+      // The added signature is the whole point of the page, so it goes in first and the detected
+      // fields give way: a template may hold only so many, and what is cut must never be the signature.
+      fields = [...page.fields, ...fields.slice(0, Math.max(0, LIMITS.maxFieldsPerTemplate - page.fields.length))];
       appended = true;
       if (method === "none") method = "appended";
       notes.unshift(`${why} A signature page was added at the end so the client can sign. You can also place fields by hand in the editor.`);
     } catch {
-      fields = [...fields, footOfLastPage(pages)];
+      fields = [footOfLastPage(pages), ...fields.slice(0, LIMITS.maxFieldsPerTemplate - 1)];
       notes.unshift(`${why} A signature field was placed at the foot of the last page. Move it to the right spot in the editor before sending.`);
     }
   }

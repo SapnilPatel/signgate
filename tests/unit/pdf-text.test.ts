@@ -84,10 +84,54 @@ describe("extractText", () => {
     page.drawLine({ start: { x: 60, y: 200 }, end: { x: 70, y: 200 }, thickness: 1 }); // too short
     const layout = await extractLayout(new Uint8Array(await doc.save()));
     const rules = layout.rules.map((r) => [Math.round(r.x0), Math.round(r.x1), Math.round(r.y)]);
+    // The box's top and bottom edges are reported too, together with its sides, so the detector
+    // can tell that they are borders of a cell and not lines to write on.
     expect(rules).toEqual([
       [60, 260, 100],
       [300, 480, 200],
+      [60, 260, 420],
+      [60, 260, 500],
     ]);
+    const vertical = (layout.vrules ?? []).map((r) => [Math.round(r.x), Math.round(r.y0), Math.round(r.y1)]);
+    expect(vertical).toEqual([
+      [60, 420, 500],
+      [260, 420, 500],
+      [400, 500, 700],
+    ]);
+  });
+
+  it("reads every edge of a table drawn as a single path, on a rotated page too", async () => {
+    for (const angle of [0, 90]) {
+      const doc = await PDFDocument.create();
+      const font = await doc.embedFont(StandardFonts.Helvetica);
+      const page = doc.addPage([600, 800]);
+      // Drawn turned with the page, so it reads left to right as displayed.
+      page.drawText("Signature", { x: 300, y: 400, size: 10, font, rotate: degrees(angle) });
+      // One path, stroked once: outer box plus a middle column line and a middle row line.
+      page.drawSvgPath("M 100 100 L 400 100 L 400 160 L 100 160 Z M 250 100 L 250 160 M 100 130 L 400 130", { x: 0, y: 800, borderWidth: 1, borderColor: rgb(0, 0, 0) });
+      page.setRotation(degrees(angle));
+      const layout = await extractLayout(new Uint8Array(await doc.save()));
+      expect(layout.rules, `rotation ${angle}`).toHaveLength(3);
+      expect(layout.vrules, `rotation ${angle}`).toHaveLength(3);
+      if (angle === 0) {
+        expect(layout.rules.map((r) => [Math.round(r.x0), Math.round(r.x1), Math.round(r.y)])).toEqual([
+          [100, 400, 100],
+          [100, 400, 130],
+          [100, 400, 160],
+        ]);
+      }
+    }
+  });
+
+  it("bounds the lines it returns from a page drawn full of them", async () => {
+    const doc = await PDFDocument.create();
+    const font = await doc.embedFont(StandardFonts.Helvetica);
+    const page = doc.addPage([600, 800]);
+    page.drawText("Sign on a line", { x: 20, y: 5, size: 4, font });
+    for (let i = 0; i < 2500; i++) page.drawLine({ start: { x: 20 + (i % 5) * 110, y: 790 - Math.floor(i / 5) * 1.55 }, end: { x: 120 + (i % 5) * 110, y: 790 - Math.floor(i / 5) * 1.55 }, thickness: 0.3 });
+    const layout = await extractLayout(new Uint8Array(await doc.save()));
+    expect(layout.rules.length).toBeGreaterThan(100);
+    expect(layout.rules.length).toBeLessThanOrEqual(1500);
   });
 
   it("marks an image-only document as scanned", async () => {

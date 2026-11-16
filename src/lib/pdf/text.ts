@@ -1,6 +1,6 @@
 /**
- * Reads the text layer of a PDF with positions, plus the thin horizontal lines
- * drawn on each page. Everything is expressed in display space (the page as a
+ * Reads the text layer of a PDF with positions, plus the thin horizontal and
+ * vertical lines drawn on each page (signature lines, and the borders of tables and boxes). Everything is expressed in display space (the page as a
  * reader sees it, after rotation and crop box), which is what Field geometry uses.
  *
  * Runs on pdf.js through unpdf's serverless build: no worker, no canvas, no
@@ -31,6 +31,14 @@ export interface RuleLine {
   y: number;
 }
 
+/** A thin vertical line drawn as vector graphics (a table or box edge), in display points from the top-left. */
+export interface VerticalRule {
+  page: number;
+  x: number;
+  y0: number;
+  y1: number;
+}
+
 /** A line of text assembled from runs that share a baseline. */
 export interface RunLine {
   page: number;
@@ -45,6 +53,8 @@ export interface ExtractedLayout extends ExtractedText {
   /** Horizontal text only; rotated text (watermarks, margin notes) is left out. */
   runs: TextRun[];
   rules: RuleLine[];
+  /** Vertical edges. Together with `rules` they show which lines are table borders rather than places to write. */
+  vrules?: VerticalRule[];
 }
 
 type Matrix = [number, number, number, number, number, number];
@@ -53,10 +63,23 @@ type Matrix = [number, number, number, number, number, number];
 const LINE_HINT = /sign|initial|witness|\bby\b|name|date|title|print|agree|accept|client|customer/i;
 /** Scanning drawing instructions is the slow part; text alone still gives a usable result. */
 const RULES_TIME_BUDGET_MS = 3500;
+/** Reading text is fast for real agreements; a file built to be slow is cut off here, except for its last pages, where agreements are signed. */
+const TEXT_TIME_BUDGET_MS = 6000;
 const MIN_RULE_WIDTH = 28;
 const MAX_RULE_THICKNESS = 2.6;
+const MIN_VERTICAL_LENGTH = 8;
+/** A page of graph paper or a hostile file can hold any number of lines; no agreement needs more than this to be understood. */
+const MAX_RULES_PER_PAGE = 1500;
+const MAX_SEGMENTS_PER_PATH = 4000;
+/**
+ * Text runs kept per page and per document. Some PDFs store every character as its own run, so
+ * the page limit has to allow a dense page written that way; the document limit is what stops
+ * a file built to exhaust memory.
+ */
+const MAX_RUNS_PER_PAGE = 20_000;
+const MAX_RUNS_TOTAL = 800_000;
 
-const EMPTY: ExtractedLayout = { items: [], pageText: [], scanned: true, pages: [], runs: [], rules: [] };
+const EMPTY: ExtractedLayout = { items: [], pageText: [], scanned: true, pages: [], runs: [], rules: [], vrules: [] };
 
 function multiply(m1: ArrayLike<number>, m2: ArrayLike<number>): Matrix {
   return [
@@ -156,8 +179,34 @@ function collectRuns(pageIndex: number, items: unknown[], vpTransform: number[],
     // Text outside the visible page (cropped away) cannot be signed against.
     if (x > size.width + 2 || x + width < -2 || baseline < -2 || baseline > size.height + fontSize) continue;
     runs.push({ page: pageIndex, text: item.str, x, baseline, width, size: Math.min(fontSize, 200) });
+    if (runs.length >= MAX_RUNS_PER_PAGE) break;
   }
   return runs;
+}
+
+/** Collinear segments that overlap or touch collapse into one; double-stroked lines too. */
+function mergeSegments<T extends { pos: number; a: number; b: number }>(segments: T[]): T[] {
+  const sorted = segments.slice().sort((p, q) => p.pos - q.pos || p.a - q.a);
+  const out: T[] = [];
+  // Segments within 1.5 pt of each other across the line direction are the same line.
+  let groupStart = 0;
+  for (const seg of sorted) {
+    while (groupStart < out.length && seg.pos - out[groupStart].pos >= 1.5) groupStart++;
+    let twin: T | undefined;
+    for (let i = groupStart; i < out.length; i++) {
+      if (seg.a < out[i].b + 2 && seg.b > out[i].a - 2) {
+        twin = out[i];
+        break;
+      }
+    }
+    if (twin) {
+      twin.a = Math.min(twin.a, seg.a);
+      twin.b = Math.max(twin.b, seg.b);
+    } else {
+      out.push({ ...seg });
+    }
+  }
+  return out;
 }
 
 function collectRules(
@@ -166,8 +215,9 @@ function collectRules(
   OPS: Record<string, number>,
   vpTransform: number[],
   size: PageInfo,
-): RuleLine[] {
-  const rules: RuleLine[] = [];
+): { rules: RuleLine[]; vrules: VerticalRule[] } {
+  const horizontal: { pos: number; a: number; b: number }[] = [];
+  const vertical: { pos: number; a: number; b: number }[] = [];
   interface State {
     ctm: Matrix;
     stroke: string;
@@ -179,6 +229,28 @@ function collectRules(
   const fillOps = new Set([OPS.fill, OPS.eoFill]);
   const bothOps = new Set([OPS.fillStroke, OPS.eoFillStroke, OPS.closeFillStroke, OPS.closeEOFillStroke]);
   const isWhite = (c: string) => /^#f{3}(f{3})?$/i.test(c);
+
+  // A segment between two display points, kept when it is a thin horizontal or vertical line on the page.
+  const addSegment = (ax: number, ay: number, bx: number, by: number) => {
+    if (![ax, ay, bx, by].every(Number.isFinite)) return;
+    const x0 = Math.min(ax, bx);
+    const x1 = Math.max(ax, bx);
+    const y0 = Math.min(ay, by);
+    const y1 = Math.max(ay, by);
+    if (y1 - y0 <= MAX_RULE_THICKNESS && x1 - x0 >= MIN_RULE_WIDTH) {
+      const y = (y0 + y1) / 2;
+      if (y < 0 || y > size.height) return;
+      const cx0 = Math.max(0, x0);
+      const cx1 = Math.min(size.width, x1);
+      if (cx1 - cx0 >= MIN_RULE_WIDTH && horizontal.length < MAX_RULES_PER_PAGE * 4) horizontal.push({ pos: y, a: cx0, b: cx1 });
+    } else if (x1 - x0 <= MAX_RULE_THICKNESS && y1 - y0 >= MIN_VERTICAL_LENGTH) {
+      const x = (x0 + x1) / 2;
+      if (x < 0 || x > size.width) return;
+      const cy0 = Math.max(0, y0);
+      const cy1 = Math.min(size.height, y1);
+      if (cy1 - cy0 >= MIN_VERTICAL_LENGTH && vertical.length < MAX_RULES_PER_PAGE * 4) vertical.push({ pos: x, a: cy0, b: cy1 });
+    }
+  };
 
   for (let i = 0; i < ops.fnArray.length; i++) {
     const fn = ops.fnArray[i];
@@ -204,6 +276,7 @@ function collectRules(
       if (!box || typeof box !== "object") continue;
       const b = box as ArrayLike<number>;
       if (![b[0], b[1], b[2], b[3]].every(Number.isFinite)) continue;
+      const stroked = strokeOps.has(paint) || bothOps.has(paint);
       let visible: boolean;
       if (strokeOps.has(paint)) visible = !isWhite(state.stroke);
       else if (fillOps.has(paint)) visible = !isWhite(state.fill);
@@ -211,43 +284,62 @@ function collectRules(
       else visible = false; // clip paths and no-op paths paint nothing
       if (!visible) continue;
       const m = multiply(vpTransform, state.ctm);
-      const xs: number[] = [];
-      const ys: number[] = [];
-      for (const [px, py] of [
-        [b[0], b[1]],
-        [b[2], b[1]],
-        [b[0], b[3]],
-        [b[2], b[3]],
-      ]) {
-        xs.push(m[0] * px + m[2] * py + m[4]);
-        ys.push(m[1] * px + m[3] * py + m[5]);
+      const tx = (px: number, py: number): [number, number] => [m[0] * px + m[2] * py + m[4], m[1] * px + m[3] * py + m[5]];
+      const corners = [tx(b[0], b[1]), tx(b[2], b[1]), tx(b[0], b[3]), tx(b[2], b[3])];
+      const xs = corners.map((c) => c[0]);
+      const ys = corners.map((c) => c[1]);
+      const bw = Math.max(...xs) - Math.min(...xs);
+      const bh = Math.max(...ys) - Math.min(...ys);
+      if (!Number.isFinite(bw + bh)) continue;
+      if (bw <= MAX_RULE_THICKNESS || bh <= MAX_RULE_THICKNESS) {
+        // The whole path is one thin line, drawn as a stroke or as a filled sliver.
+        addSegment(Math.min(...xs), Math.min(...ys), Math.max(...xs), Math.max(...ys));
+        continue;
       }
-      const x0 = Math.min(...xs);
-      const x1 = Math.max(...xs);
-      const y0 = Math.min(...ys);
-      const y1 = Math.max(...ys);
-      if (![x0, x1, y0, y1].every(Number.isFinite)) continue;
-      if (y1 - y0 > MAX_RULE_THICKNESS || x1 - x0 < MIN_RULE_WIDTH) continue;
-      const y = (y0 + y1) / 2;
-      if (y < 0 || y > size.height) continue;
-      const cx0 = Math.max(0, x0);
-      const cx1 = Math.min(size.width, x1);
-      if (cx1 - cx0 < MIN_RULE_WIDTH) continue;
-      rules.push({ page: pageIndex, x0: cx0, x1: cx1, y });
+      // A box, or a whole table drawn as one path: each straight edge is a line of its own.
+      // Only outlines count; a filled area is shading, not a border.
+      if (!stroked || isWhite(state.stroke)) continue;
+      const data = Array.isArray(args[1]) ? (args[1] as unknown[])[0] : null;
+      if (!data || typeof data !== "object" || typeof (data as ArrayLike<number>).length !== "number") continue;
+      const d = data as ArrayLike<number>;
+      let cur: [number, number] | null = null;
+      let start: [number, number] | null = null;
+      let segments = 0;
+      for (let k = 0; k < d.length && segments < MAX_SEGMENTS_PER_PATH; ) {
+        const op = d[k];
+        if (op === 0) {
+          cur = start = tx(d[k + 1], d[k + 2]);
+          k += 3;
+        } else if (op === 1) {
+          const next = tx(d[k + 1], d[k + 2]);
+          if (cur) addSegment(cur[0], cur[1], next[0], next[1]);
+          cur = next;
+          segments++;
+          k += 3;
+        } else if (op === 2) {
+          cur = tx(d[k + 5], d[k + 6]);
+          k += 7;
+        } else if (op === 3) {
+          cur = tx(d[k + 3], d[k + 4]);
+          k += 5;
+        } else if (op === 4) {
+          if (cur && start) addSegment(cur[0], cur[1], start[0], start[1]);
+          cur = start;
+          segments++;
+          k += 1;
+        } else {
+          break; // unknown path encoding: keep what was read so far
+        }
+      }
     }
   }
-  // Double-stroked or re-drawn lines collapse into one.
-  const unique: RuleLine[] = [];
-  for (const rule of rules) {
-    const twin = unique.find((u) => Math.abs(u.y - rule.y) < 1.5 && rule.x0 < u.x1 + 2 && rule.x1 > u.x0 - 2);
-    if (twin) {
-      twin.x0 = Math.min(twin.x0, rule.x0);
-      twin.x1 = Math.max(twin.x1, rule.x1);
-    } else {
-      unique.push({ ...rule });
-    }
-  }
-  return unique;
+  const rules = mergeSegments(horizontal)
+    .slice(0, MAX_RULES_PER_PAGE)
+    .map((s): RuleLine => ({ page: pageIndex, x0: s.a, x1: s.b, y: s.pos }));
+  const vrules = mergeSegments(vertical)
+    .slice(0, MAX_RULES_PER_PAGE)
+    .map((s): VerticalRule => ({ page: pageIndex, x: s.pos, y0: s.a, y1: s.b }));
+  return { rules, vrules };
 }
 
 /**
@@ -266,10 +358,13 @@ export async function extractLayout(pdf: Uint8Array): Promise<ExtractedLayout> {
     const pages: PageInfo[] = [];
     const runs: TextRun[] = [];
     const rules: RuleLine[] = [];
+    const vrules: VerticalRule[] = [];
     const charsPerPage: number[] = [];
     const hinted: boolean[] = [];
     const viewports: number[][] = [];
 
+    const textStarted = Date.now();
+    let unread = 0;
     for (let n = 1; n <= pageCount; n++) {
       const index = n - 1;
       let page: PdfJsPage;
@@ -289,13 +384,18 @@ export async function extractLayout(pdf: Uint8Array): Promise<ExtractedLayout> {
       };
       pages.push(size);
       let pageRuns: TextRun[] = [];
-      try {
-        const content = await page.getTextContent();
-        pageRuns = collectRuns(index, content.items ?? [], vp.transform, size);
-      } catch {
-        // A page with a broken content stream is treated as having no text.
+      // The last pages are always read: that is where agreements are signed.
+      if ((Date.now() - textStarted > TEXT_TIME_BUDGET_MS || runs.length > MAX_RUNS_TOTAL) && n <= pageCount - 2) {
+        unread++;
+      } else {
+        try {
+          const content = await page.getTextContent();
+          pageRuns = collectRuns(index, content.items ?? [], vp.transform, size);
+        } catch {
+          // A page with a broken content stream is treated as having no text.
+        }
       }
-      runs.push(...pageRuns);
+      for (const run of pageRuns) runs.push(run);
       const pageChars = pageRuns.reduce((sum, r) => sum + r.text.replace(/\s/g, "").length, 0);
       charsPerPage.push(pageChars);
 
@@ -323,7 +423,11 @@ export async function extractLayout(pdf: Uint8Array): Promise<ExtractedLayout> {
       try {
         const page = await proxy.getPage(index + 1);
         const ops = await timeout(page.getOperatorList(), remaining);
-        if (ops && Array.isArray(ops.fnArray)) rules.push(...collectRules(index, ops, pdfjs.OPS, viewports[index], pages[index]));
+        if (ops && Array.isArray(ops.fnArray)) {
+          const found = collectRules(index, ops, pdfjs.OPS, viewports[index], pages[index]);
+          for (const rule of found.rules) rules.push(rule);
+          for (const rule of found.vrules) vrules.push(rule);
+        }
         page.cleanup?.();
       } catch {
         // Lines are an enhancement; text-based detection still works without them.
@@ -350,8 +454,9 @@ export async function extractLayout(pdf: Uint8Array): Promise<ExtractedLayout> {
     // A scan is a document where (nearly) every page is an image. A few stray
     // characters from a fax header or page stamp do not make a page readable.
     const emptyPages = charsPerPage.filter((c) => c < 12).length;
-    const scanned = pages.length === 0 || emptyPages / pages.length >= 0.8;
-    return { items, pageText, scanned, pages, runs, rules };
+    // Pages skipped for lack of time say nothing either way.
+    const scanned = pages.length === 0 || (emptyPages - unread) / Math.max(1, pages.length - unread) >= 0.8;
+    return { items, pageText, scanned, pages, runs, rules, vrules };
   } catch {
     return { ...EMPTY };
   } finally {

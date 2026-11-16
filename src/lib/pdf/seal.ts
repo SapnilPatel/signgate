@@ -7,7 +7,7 @@ import { degrees, rgb } from "pdf-lib";
 import type { PDFDocument, PDFFont, PDFPage } from "pdf-lib";
 import { sha256Hex } from "@/lib/ids";
 import { PRODUCT_NAME } from "@/lib/env";
-import type { SealInput, SealResult } from "./types";
+import type { SealInput, SealResult, SealWarning } from "./types";
 import { displaySize, fracRectToPdf } from "./geometry";
 import { embedFonts } from "./fonts";
 import { drawableText, loadForStamping, savePdf, stampInto, truncateToWidth, unusable } from "./stamp";
@@ -54,7 +54,23 @@ async function seal(doc: PDFDocument, input: SealInput): Promise<SealResult> {
 
   // Captured before the certificate is appended: only the agreement's own pages get the envelope reference.
   const originalPages = doc.getPages();
-  await stampInto(doc, input.fields, input.values, fonts.regular);
+  const report = await stampInto(doc, input.fields, input.values, fonts.regular);
+  const warnings: SealWarning[] = [];
+  const named = (label: string) => (label ? `"${label}"` : "A field");
+  for (const r of report.replaced) {
+    warnings.push({
+      code: "characters_replaced",
+      fieldId: r.fieldId,
+      message: `${named(r.label)} contains ${r.characters === 1 ? "a character" : `${r.characters} characters`} that the signed PDF cannot print (for example Chinese, Japanese, Korean, Arabic or Hebrew script). ${r.characters === 1 ? "It appears as an empty box" : "They appear as empty boxes"} on the agreement; the value as entered is kept in the signing record.`,
+    });
+  }
+  for (const r of report.skippedImages) {
+    warnings.push({
+      code: "image_skipped",
+      fieldId: r.fieldId,
+      message: `${named(r.label)} was left empty on the signed PDF because the agreement was given too many different signature images. Ask the signer to sign again using one signature and one set of initials.`,
+    });
+  }
   for (const page of originalPages) {
     try {
       drawEnvelopeFooter(page, fonts.regular, envelopeId);
@@ -63,7 +79,12 @@ async function seal(doc: PDFDocument, input: SealInput): Promise<SealResult> {
     }
   }
 
-  await appendCertificate(doc, certificate, fonts);
+  for (const where of await appendCertificate(doc, certificate, fonts)) {
+    warnings.push({
+      code: "characters_replaced",
+      message: `${where} on the signing certificate contains characters that the PDF cannot print. They appear as empty boxes followed by their Unicode code points, so the original text can still be recovered.`,
+    });
+  }
 
   const completedAt =
     certificate?.completedAt instanceof Date && !Number.isNaN(certificate.completedAt.getTime()) ? certificate.completedAt : new Date();
@@ -79,5 +100,5 @@ async function seal(doc: PDFDocument, input: SealInput): Promise<SealResult> {
   doc.setModificationDate(completedAt);
 
   const pdf = await savePdf(doc);
-  return { pdf, sha256: sha256Hex(pdf) };
+  return { pdf, sha256: sha256Hex(pdf), warnings };
 }

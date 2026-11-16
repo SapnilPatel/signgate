@@ -5,9 +5,18 @@
  * All coordinates are display points measured from the top-left of the page.
  */
 import type { Field, PageInfo } from "@/lib/types";
-import { groupLines, type ExtractedLayout, type RunLine, type TextRun } from "../text";
+import { groupLines, type ExtractedLayout, type RuleLine, type RunLine, type TextRun, type VerticalRule } from "../text";
 
-export type BlankSource = "underscore" | "dots" | "rule" | "space" | "form";
+/** "cell": the empty part of a bordered table cell that a label points at. */
+export type BlankSource = "underscore" | "dots" | "rule" | "space" | "form" | "cell";
+
+/**
+ * Bounds on how much of a document the rules reason about. A real agreement has
+ * a few dozen blanks; these exist so a file made of nothing but blanks is answered
+ * in bounded time instead of pinning a serverless function.
+ */
+export const MAX_BLANKS_PER_PAGE = 400;
+export const MAX_BLANKS_TOTAL = 3000;
 
 export interface Blank {
   id: string;
@@ -21,6 +30,10 @@ export interface Blank {
   source: BlankSource;
   /** The form widget this blank came from, when source is "form". */
   form?: Field;
+  /** The highest a field on this blank may reach (the top edge of its table cell). */
+  top?: number;
+  /** A drawn line with no text of its own that spans the whole text column. */
+  fullWidth?: boolean;
 }
 
 export interface Piece {
@@ -41,11 +54,128 @@ export interface Line {
   synthetic: boolean;
 }
 
+/** A bordered table cell, in display points. */
+export interface Cell {
+  page: number;
+  x0: number;
+  x1: number;
+  y0: number;
+  y1: number;
+}
+
 export interface Model {
   pages: PageInfo[];
   lines: Line[];
   linesByPage: Line[][];
   blanks: Blank[];
+  /** The table cell around a point, when the point lies inside a drawn grid. */
+  cellAt(page: number, x: number, y: number): Cell | null;
+  /** How many blanks were left out because the document has more than the rules will consider. */
+  skippedBlanks: number;
+}
+
+const TOUCH = 2.5;
+
+interface PageGrid {
+  /** Horizontal lines that are table borders: at least two vertical lines meet them. */
+  edges: RuleLine[];
+  verticals: VerticalRule[];
+}
+
+/**
+ * Separates table borders from lines to write on. A horizontal line met by two or
+ * more vertical lines is the edge of a cell; a signature line never is.
+ */
+function findGrid(rules: RuleLine[], verticals: VerticalRule[]): { grid: PageGrid; isEdge: Set<RuleLine> } {
+  const isEdge = new Set<RuleLine>();
+  // Bounded work per page: a page with thousands of lines both ways is not a signature table.
+  if (!verticals.length || rules.length * verticals.length > 400_000) return { grid: { edges: [], verticals: [] }, isEdge };
+  const meet = (rule: RuleLine, v: VerticalRule) => v.x >= rule.x0 - TOUCH && v.x <= rule.x1 + TOUCH && rule.y >= v.y0 - TOUCH && rule.y <= v.y1 + TOUCH;
+  // A vertical line that joins two or more horizontal ones is a column divider, even when it is
+  // the only one (a table drawn without its outer sides).
+  const dividers = new Set<VerticalRule>();
+  for (const v of verticals) {
+    let meets = 0;
+    for (const rule of rules) if (meet(rule, v) && ++meets >= 2) break;
+    if (meets >= 2) dividers.add(v);
+  }
+  for (const rule of rules) {
+    let meets = 0;
+    let divided = false;
+    for (const v of verticals) {
+      if (!meet(rule, v)) continue;
+      if (dividers.has(v)) divided = true;
+      if (++meets >= 2) break;
+    }
+    if (meets >= 2 || divided) isEdge.add(rule);
+  }
+  return { grid: { edges: rules.filter((r) => isEdge.has(r)), verticals }, isEdge };
+}
+
+function cellIn(grid: PageGrid | undefined, size: PageInfo, page: number, x: number, y: number): Cell | null {
+  if (!grid || grid.edges.length < 2) return null;
+  let above: RuleLine | undefined;
+  let under: RuleLine | undefined;
+  for (const e of grid.edges) {
+    if (x < e.x0 - TOUCH || x > e.x1 + TOUCH) continue;
+    if (e.y <= y && (!above || e.y > above.y)) above = e;
+    if (e.y > y && (!under || e.y < under.y)) under = e;
+  }
+  if (!above || !under) return null;
+  const top = above.y;
+  const bottom = under.y;
+  let left = Number.NEGATIVE_INFINITY;
+  let right = Number.POSITIVE_INFINITY;
+  for (const v of grid.verticals) {
+    // The edge must run along this cell, not merely pass a corner of it.
+    if (Math.min(v.y1, bottom) - Math.max(v.y0, top) < 0.5 * (bottom - top)) continue;
+    if (v.x <= x && v.x > left) left = v.x;
+    if (v.x > x && v.x < right) right = v.x;
+  }
+  // Tables are often drawn without their outer sides: the row lines themselves end the outer cells.
+  // At least one divider must cross the row, or this is just the gap between two unrelated lines.
+  if (!Number.isFinite(left) && !Number.isFinite(right)) return null;
+  if (!Number.isFinite(left)) left = Math.max(above.x0, under.x0);
+  if (!Number.isFinite(right)) right = Math.min(above.x1, under.x1);
+  if (x < left - TOUCH || x > right + TOUCH) return null;
+  if (right - left < 20 || bottom - top < 9) return null;
+  // A frame around the page or around a whole section is not a cell.
+  if (bottom - top > 0.4 * size.height && right - left > 0.6 * size.width) return null;
+  return { page, x0: left, x1: right, y0: top, y1: bottom };
+}
+
+/** The text pieces printed inside a cell. */
+export function piecesInCell(model: Model, cell: Cell): { line: Line; piece: Piece }[] {
+  const out: { line: Line; piece: Piece }[] = [];
+  for (const line of model.linesByPage[cell.page] ?? []) {
+    if (line.synthetic) continue;
+    const mid = line.baseline - 0.3 * line.size;
+    if (mid <= cell.y0 || mid >= cell.y1) continue;
+    for (const piece of line.pieces) {
+      const cx = (piece.x0 + piece.x1) / 2;
+      if (cx > cell.x0 && cx < cell.x1) out.push({ line, piece });
+    }
+  }
+  return out;
+}
+
+/** Left and right edges of the body text, taken from the lines that run the width of the column. */
+function textColumn(pages: PageInfo[], linesByPage: Line[][]): { left: number; right: number } | null {
+  const lefts: number[] = [];
+  const rights: number[] = [];
+  linesByPage.forEach((lines, page) => {
+    for (const line of lines) {
+      if (line.synthetic || !line.pieces.length) continue;
+      const x0 = line.pieces[0].x0;
+      const x1 = line.pieces[line.pieces.length - 1].x1;
+      if (x1 - x0 >= 0.5 * pages[page].width) {
+        lefts.push(x0);
+        rights.push(x1);
+      }
+    }
+  });
+  if (lefts.length < 3) return null;
+  return { left: median(lefts, 0), right: median(rights, 0) };
 }
 
 // Approximate advance widths (thousandths of an em) of a typical sans face. Only
@@ -196,6 +326,7 @@ export function buildModel(layout: ExtractedLayout, formFields: Field[] = []): M
 
   const bodySize = pages.map((_, i) => median(linesByPage[i].map((l) => l.size), 11));
 
+  const column = textColumn(pages, linesByPage);
   const attach = (page: number, x0: number, x1: number, y: number, source: BlankSource, hostBaselines: [number, number], form?: Field) => {
     const lines = linesByPage[page];
     let host: Line | undefined;
@@ -223,18 +354,56 @@ export function buildModel(layout: ExtractedLayout, formFields: Field[] = []): M
       lines.push(host);
     }
     const blank: Blank = { id: "", page, line: host, x0: bx0, x1: bx1, y, size: host.size, source, form };
+    if (source === "rule" && host.synthetic && column) {
+      const slack = 0.03 * (column.right - column.left);
+      if (x0 <= column.left + slack && x1 >= column.right - slack && x1 - x0 >= 0.5 * pages[page].width) blank.fullWidth = true;
+    }
     host.pieces.push({ kind: "blank", text: "", x0: bx0, x1: bx1, blank });
     host.pieces.sort((a, b) => a.x0 - b.x0);
     blanks.push(blank);
   };
 
-  for (const rule of layout.rules) {
-    const size = pages[rule.page];
-    if (!size) continue;
-    // Page-wide lines are separators, header rules and table edges.
-    if (rule.x1 - rule.x0 > 0.85 * size.width) continue;
-    attach(rule.page, rule.x0, rule.x1, rule.y, "rule", [Number.NEGATIVE_INFINITY, Number.POSITIVE_INFINITY]);
+  const rulesByPage: RuleLine[][] = pages.map(() => []);
+  const verticalsByPage: VerticalRule[][] = pages.map(() => []);
+  for (const rule of layout.rules) rulesByPage[rule.page]?.push(rule);
+  for (const rule of layout.vrules ?? []) verticalsByPage[rule.page]?.push(rule);
+
+  // A wide line at the same place on most pages is page furniture (a header or footer rule).
+  const repeats = new Map<string, number>();
+  const repeatKey = (rule: RuleLine) => `${Math.round(rule.x0 / 3)}:${Math.round(rule.x1 / 3)}:${Math.round(rule.y / 3)}`;
+  for (const pageRules of rulesByPage) {
+    const seen = new Set<string>();
+    for (const rule of pageRules) {
+      const key = repeatKey(rule);
+      if (!seen.has(key)) {
+        seen.add(key);
+        repeats.set(key, (repeats.get(key) ?? 0) + 1);
+      }
+    }
   }
+  const pagesWithRules = rulesByPage.filter((r) => r.length > 0).length;
+
+  const grids: (PageGrid | undefined)[] = pages.map(() => undefined);
+  rulesByPage.forEach((pageRules, page) => {
+    const size = pages[page];
+    const { grid, isEdge } = findGrid(pageRules, verticalsByPage[page]);
+    grids[page] = grid;
+    for (const rule of pageRules) {
+      const width = rule.x1 - rule.x0;
+      // Page-wide lines are separators, header rules and table edges.
+      if (width > 0.85 * size.width) continue;
+      // The border of a table cell is not a line to write on; cells are read on their own.
+      if (isEdge.has(rule)) continue;
+      if (width >= 0.5 * size.width) {
+        const edge = Math.min(rule.y, size.height - rule.y) / size.height;
+        // Running headers and footers are ruled off from the body: nobody signs in the page margin on a line that wide.
+        if (edge < 0.08) continue;
+        const count = repeats.get(repeatKey(rule)) ?? 0;
+        if (edge < 0.15 && count >= 2 && count >= 0.5 * pagesWithRules) continue;
+      }
+      attach(rule.page, rule.x0, rule.x1, rule.y, "rule", [Number.NEGATIVE_INFINITY, Number.POSITIVE_INFINITY]);
+    }
+  });
 
   for (const field of formFields) {
     const size = pages[field.page];
@@ -242,6 +411,37 @@ export function buildModel(layout: ExtractedLayout, formFields: Field[] = []): M
     const top = field.y * size.height;
     const bottom = (field.y + field.h) * size.height;
     attach(field.page, field.x * size.width, (field.x + field.w) * size.width, bottom, "form", [top, bottom + 3], field);
+  }
+
+  // ---- Bound the work: keep the blanks most likely to matter ------------------
+  blanks.sort((a, b) => a.page - b.page || a.y - b.y || a.x0 - b.x0);
+  const keep = new Set<Blank>();
+  const perPage: Blank[][] = pages.map(() => []);
+  for (const blank of blanks) {
+    // Form widgets were chosen by the document's author and are already capped at ingest.
+    if (blank.form) keep.add(blank);
+    else if (perPage[blank.page].length < MAX_BLANKS_PER_PAGE) perPage[blank.page].push(blank);
+  }
+  let budget = MAX_BLANKS_TOTAL;
+  // Agreements are signed at the end, so the last pages with blanks are kept before the rest.
+  const withBlanks = perPage.map((list, page) => ({ list, page })).filter((p) => p.list.length);
+  const order = [...withBlanks.slice(-2).reverse(), ...withBlanks.slice(0, -2)];
+  for (const { list } of order) {
+    for (const blank of list) {
+      if (budget <= 0) break;
+      keep.add(blank);
+      budget--;
+    }
+  }
+  const skippedBlanks = blanks.length - keep.size;
+  if (skippedBlanks > 0) {
+    for (const pageLines of linesByPage) {
+      for (const line of pageLines) {
+        if (line.pieces.some((p) => p.blank && !keep.has(p.blank))) line.pieces = line.pieces.filter((p) => !p.blank || keep.has(p.blank));
+      }
+    }
+    linesByPage.forEach((pageLines, page) => (linesByPage[page] = pageLines.filter((l) => l.pieces.length > 0)));
+    blanks.splice(0, blanks.length, ...blanks.filter((b) => keep.has(b)));
   }
 
   const lines: Line[] = [];
@@ -254,7 +454,8 @@ export function buildModel(layout: ExtractedLayout, formFields: Field[] = []): M
   });
   blanks.sort((a, b) => a.page - b.page || a.y - b.y || a.x0 - b.x0);
   blanks.forEach((blank, i) => (blank.id = `b${i + 1}`));
-  return { pages, lines, linesByPage, blanks };
+  const cellAt = (page: number, x: number, y: number): Cell | null => (pages[page] ? cellIn(grids[page], pages[page], page, x, y) : null);
+  return { pages, lines, linesByPage, blanks, cellAt, skippedBlanks };
 }
 
 /** A line as plain text, with each blank shown as a marker. Used for context and for the AI pass. */
@@ -269,12 +470,12 @@ const MAX_WIDTH: Record<string, number> = { signature: 280, initials: 90, date_s
  * The box for a field of the given type on a blank: resting on the writing line,
  * as tall as the type wants but never reaching into the text or line above it.
  */
-export function rectFor(model: Model, blank: Pick<Blank, "page" | "x0" | "x1" | "y" | "size" | "line">, type: string): { x: number; y: number; w: number; h: number } {
+export function rectFor(model: Model, blank: Pick<Blank, "page" | "x0" | "x1" | "y" | "size" | "line" | "top">, type: string): { x: number; y: number; w: number; h: number } {
   const size = model.pages[blank.page];
   const x0 = Math.max(0, blank.x0);
   const x1 = Math.min(size.width, Math.max(blank.x1, x0 + 12), x0 + (MAX_WIDTH[type] ?? Number.POSITIVE_INFINITY));
   const desired = DESIRED_HEIGHT[type] ?? Math.max(14, Math.min(22, blank.size * 1.5));
-  let ceiling = 0; // lowest obstruction above the writing line
+  let ceiling = blank.top ?? 0; // lowest obstruction above the writing line
   for (const line of model.linesByPage[blank.page] ?? []) {
     if (line === blank.line || line.baseline >= blank.y - 2) continue;
     for (const piece of line.pieces) {

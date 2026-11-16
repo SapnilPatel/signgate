@@ -44,7 +44,17 @@ import { jpegInfo, pngSize, ORIENTATION_MATRIX } from "./ingest-image";
 
 const LETTER = { width: 612, height: 792 };
 const IMAGE_MARGIN = 36;
+/** JPEG data is stored as it is, so only absurd dimensions are refused. */
 const MAX_IMAGE_PIXELS = 80_000_000;
+/**
+ * A PNG is decoded to raw pixels and re-compressed in memory, at around 16 bytes of working
+ * memory per pixel whatever its bit depth: a few-hundred-kilobyte solid-colour file of
+ * 8900 x 8900 pixels needs close to a gigabyte, which a serverless function does not have.
+ * 25 million pixels is a Letter page at over 500 dpi.
+ */
+export const MAX_PNG_PIXELS = 25_000_000;
+/** PNG pixels decoded for one document made of several pictures; keeps a many-page upload inside time and memory limits. */
+const MAX_PNG_PIXELS_PER_DOCUMENT = 60_000_000;
 /** A zip can expand enormously; refuse before handing it to a decompressor. */
 const MAX_UNZIPPED_BYTES = 300 * 1024 * 1024;
 const FALLBACK_TITLE = "Agreement";
@@ -726,17 +736,27 @@ function unreadableImage(): DocumentError {
   );
 }
 
-async function embedImage(doc: PDFDocument, bytes: Uint8Array): Promise<{ image: PDFImage; orientation: number }> {
+async function embedImage(doc: PDFDocument, bytes: Uint8Array, budget?: { pngPixels: number }): Promise<{ image: PDFImage; orientation: number }> {
   const png = startsWith(bytes, [0x89, 0x50, 0x4e, 0x47]);
   const jpeg = startsWith(bytes, [0xff, 0xd8, 0xff]);
   if (!png && !jpeg) throw unreadableImage();
   const info = png ? { size: pngSize(bytes), orientation: 1 } : jpegInfo(bytes);
   if (!info.size || info.size.width < 1 || info.size.height < 1) throw unreadableImage();
-  if (info.size.width * info.size.height > MAX_IMAGE_PIXELS) {
+  const pixels = info.size.width * info.size.height;
+  if (pixels > (png ? MAX_PNG_PIXELS : MAX_IMAGE_PIXELS)) {
     throw new DocumentError(
       "too_large",
       `This image is ${info.size.width} by ${info.size.height} pixels, which is too large to process. Export it at a lower resolution (300 dpi is plenty for a page) or save it as PDF, then upload again.`,
     );
+  }
+  if (png && budget) {
+    budget.pngPixels -= pixels;
+    if (budget.pngPixels < 0) {
+      throw new DocumentError(
+        "too_large",
+        "The pages of this document are too large to process as PNG pictures. Send the pages as JPEG pictures or at a lower resolution, or upload the PDF itself.",
+      );
+    }
   }
   try {
     // pdf-lib's JPEG reader ignores a view's offset into its buffer, so a slice of a
@@ -818,9 +838,10 @@ export async function ingestPageImages(
     );
   }
   const doc = await PDFDocument.create();
+  const budget = { pngPixels: MAX_PNG_PIXELS_PER_DOCUMENT };
   for (const item of images) {
     if (!item || !(item.bytes instanceof Uint8Array) || item.bytes.length === 0) throw unreadableImage();
-    const { image, orientation } = await embedImage(doc, item.bytes);
+    const { image, orientation } = await embedImage(doc, item.bytes, budget);
     const sideways = orientation >= 5 && orientation <= 8;
     const aspect = sideways ? image.height / image.width : image.width / image.height;
     const valid = (n: number) => Number.isFinite(n) && n >= 18 && n <= 14_400;

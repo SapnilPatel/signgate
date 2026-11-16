@@ -7,7 +7,7 @@ import type { Field, FieldType, FieldValues } from "@/lib/types";
 import { DocumentError } from "@/lib/pdf/types";
 import { displaySize, pdfRectToFrac } from "@/lib/pdf/geometry";
 import { embedFonts } from "@/lib/pdf/fonts";
-import { MIN_FONT_SIZE, drawableText, parseImageDataUrl, stampFields, truncateToWidth, wrapText } from "@/lib/pdf/stamp";
+import { MAX_TOTAL_IMAGE_PIXELS, MIN_FONT_SIZE, drawableText, parseImageDataUrl, stampFields, stampInto, truncateToWidth, undrawableCharacters, wrapText } from "@/lib/pdf/stamp";
 
 /* ---------------------------------------------------------------- fixtures */
 
@@ -560,6 +560,15 @@ describe("parseImageDataUrl", () => {
     expect(Date.now() - started).toBeLessThan(500);
   });
 
+  it("accepts a signature pad at 3x and refuses a canvas far beyond one", () => {
+    expect(parseImageDataUrl(dataUrl(makePng(1800, 600))).ok).toBe(true);
+    // About 0.11 MB as a file, 4.2 million pixels to decode: half a second of sealing time per copy.
+    const big = parseImageDataUrl(dataUrl(makePng(2048, 2048)));
+    expect(big.ok).toBe(false);
+    if (!big.ok) expect(big.reason).toMatch(/too large \(2048 x 2048 pixels\)/);
+    expect(parseImageDataUrl(dataUrl(makePng(1300, 1300))).ok).toBe(false);
+  });
+
   it("stamping a huge signature skips it and leaves the rest of the document intact", async () => {
     const pdf = await makePdf();
     const big = field("signature", { x: 0.1, y: 0.1, w: 0.4, h: 0.1 });
@@ -573,4 +582,56 @@ describe("parseImageDataUrl", () => {
     expect(await extractImages(out.slice(), 1)).toHaveLength(0);
     expect(await pageText(out)).toBe("Pat Sample");
   });
+});
+
+describe("stampInto: report", () => {
+  it("counts what was drawn and lists fields whose characters the font cannot draw", async () => {
+    const doc = await PDFDocument.load(await makePdf());
+    const latin = field("full_name", { x: 0.1, y: 0.1, w: 0.5, h: 0.03 });
+    const mixed = field("text", { x: 0.1, y: 0.2, w: 0.5, h: 0.03 });
+    const emoji = field("text", { x: 0.1, y: 0.3, w: 0.5, h: 0.03 });
+    const empty = field("text", { x: 0.1, y: 0.4, w: 0.5, h: 0.03 });
+    const report = await stampInto(doc, [latin, mixed, emoji, empty], {
+      [latin.id]: "Zo\u00eb Nguy\u1ec5n Th\u1ecb",
+      [mixed.id]: "\u6771\u4eac \u0645\u0631\u062d\u0628\u0627 Jane",
+      [emoji.id]: "Thanks \ud83d\ude00",
+    });
+    expect(report.drawn).toBe(3);
+    // Dropped decoration (emoji) loses no meaning and is not reported; replaced letters are.
+    expect(report.replaced).toEqual([{ fieldId: mixed.id, label: "text", characters: 7 }]);
+    expect(report.skippedImages).toEqual([]);
+  });
+
+  it("names the characters a font cannot draw", async () => {
+    const doc = await PDFDocument.create();
+    const font = (await embedFonts(doc, ["regular"])).regular;
+    expect(undrawableCharacters(font, "Jane \u5c71\u7530")).toEqual(["\u5c71", "\u7530"]);
+    expect(undrawableCharacters(font, "Jane Example \ud83d\ude00")).toEqual([]);
+    expect(undrawableCharacters(font, null)).toEqual([]);
+  });
+
+  it("stops embedding distinct large images at the budget and reports the fields left empty", async () => {
+    const doc = await PDFDocument.load(await makePdf());
+    const fields: Field[] = [];
+    const values: FieldValues = {};
+    let pixels = 0;
+    let expectedDrawn = 0;
+    for (let i = 0; i < 18; i++) {
+      const f = field("initials", { x: 0.05 + (i % 6) * 0.15, y: 0.1 + Math.floor(i / 6) * 0.1, w: 0.1, h: 0.04 });
+      fields.push(f);
+      // A different image for every field, each just under the per-image limit.
+      values[f.id] = dataUrl(makePng(1224, 1200 + i));
+      pixels += 1224 * (1200 + i);
+      if (pixels <= MAX_TOTAL_IMAGE_PIXELS) expectedDrawn++;
+    }
+    // The same image reused in many fields costs one embed, however many fields there are.
+    const repeat = Array.from({ length: 30 }, (_, i) => field("initials", { x: 0.05 + (i % 10) * 0.09, y: 0.6 + Math.floor(i / 10) * 0.05, w: 0.08, h: 0.03 }));
+    for (const f of repeat) values[f.id] = values[fields[0].id];
+    const started = Date.now();
+    const report = await stampInto(doc, [...fields, ...repeat], values);
+    expect(Date.now() - started).toBeLessThan(10_000);
+    expect(expectedDrawn).toBeLessThan(18);
+    expect(report.drawn).toBe(expectedDrawn + 30);
+    expect(report.skippedImages.map((s) => s.fieldId)).toEqual(fields.slice(expectedDrawn).map((f) => f.id));
+  }, 40_000);
 });

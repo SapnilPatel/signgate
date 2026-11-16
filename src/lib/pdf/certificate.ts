@@ -9,7 +9,7 @@ import { rgb } from "pdf-lib";
 import type { PDFDocument, PDFFont, PDFPage } from "pdf-lib";
 import type { CertificateData, CertificateEvent, CertificateSigner } from "./types";
 import { embedFonts } from "./fonts";
-import { drawableText, truncateToWidth, wrapText } from "./stamp";
+import { drawableText, truncateToWidth, undrawableCharacters, wrapText } from "./stamp";
 
 const PAGE_WIDTH = 612;
 const PAGE_HEIGHT = 792;
@@ -169,9 +169,30 @@ interface Row {
   height: number;
 }
 
-function row(fonts: CertificateFonts, label: string, value: unknown, maxLines = 4, width = VALUE_WIDTH): Row {
+/** Code points printed after a value whose characters the font cannot draw; enough for any name. */
+const MAX_CODE_POINTS = 48;
+
+/**
+ * A certificate is evidence of who signed. When a name is in a script the font cannot draw, the
+ * boxes alone would identify nobody, so the characters' Unicode code points are printed after
+ * them: unambiguous, and enough to recover the exact text.
+ */
+function withCodePoints(fonts: CertificateFonts, value: unknown, max: number): { text: string; lost: boolean } {
+  const text = drawableText(fonts.regular, value, max);
+  const lost = undrawableCharacters(fonts.regular, value, max);
+  if (!lost.length) return { text, lost: false };
+  const codes = lost.slice(0, MAX_CODE_POINTS).map((ch) => `U+${ch.codePointAt(0)!.toString(16).toUpperCase().padStart(4, "0")}`);
+  // The code points are the part that identifies the signer, so the boxes give way to them when space is short.
+  const shown = Array.from(text);
+  const head = shown.length > 80 ? `${shown.slice(0, 80).join("")}...` : text;
+  return { text: `${head} [${codes.join(" ")}${lost.length > MAX_CODE_POINTS ? " ..." : ""}]`, lost: true };
+}
+
+function row(fonts: CertificateFonts, label: string, value: unknown, maxLines = 4, width = VALUE_WIDTH, lostLabels?: string[]): Row {
   // Values are capped before measuring so a megabyte of pasted text cannot stall sealing.
-  const text = drawableText(fonts.regular, value, 600) || "\u2014";
+  const rendered = lostLabels ? withCodePoints(fonts, value, 600) : { text: drawableText(fonts.regular, value, 600), lost: false };
+  if (rendered.lost && lostLabels) lostLabels.push(label);
+  const text = rendered.text || "\u2014";
   const lines = wrapText(fonts.regular, text, BODY, width, maxLines);
   return { label, lines, height: Math.max(1, lines.length) * LEADING + 4 };
 }
@@ -182,14 +203,16 @@ function drawRow(flow: Flow, r: Row, labelX = MARGIN, valueX = VALUE_X): void {
   flow.y -= r.height;
 }
 
-function drawSigner(flow: Flow, signer: CertificateSigner, index: number): void {
+function drawSigner(flow: Flow, signer: CertificateSigner, index: number, lost: string[]): void {
   const fonts = flow.fonts;
   const inset = 12;
   const valueX = VALUE_X + inset;
   const width = VALUE_WIDTH - inset * 2;
   const role = signer?.role === "company" ? "Company" : "Client";
+  const signerLost: string[] = [];
   const rows = [
-    row(fonts, "Name", signer?.name, 3, width),
+    // Room for the code points of a name the font cannot draw.
+    row(fonts, "Name", signer?.name, 8, width, signerLost),
     row(fonts, "Email", signer?.email, 3, width),
     row(fonts, "Signed at", formatUtc(signer?.signedAt), 1, width),
     row(fonts, "Consent to sign electronically", signer?.consentAt ? `Recorded ${formatUtc(signer.consentAt)}` : NOT_RECORDED, 2, width),
@@ -197,6 +220,7 @@ function drawSigner(flow: Flow, signer: CertificateSigner, index: number): void 
     row(fonts, "Device", describeUserAgent(signer?.userAgent), 3, width),
     row(fonts, "Method", signer?.method || NOT_RECORDED, 3, width),
   ];
+  if (signerLost.length) lost.push(`The name of signer ${index + 1}`);
   const titleHeight = 22;
   const height = titleHeight + rows.reduce((sum, r) => sum + r.height, 0) + 10;
   // A signer's record is evidence; splitting it across pages invites misreading.
@@ -245,8 +269,11 @@ function drawTimeline(flow: Flow, events: readonly CertificateEvent[]): void {
  * Appends the signing certificate to the document as one or more Letter pages.
  * Pass `fonts` when the caller has already embedded Noto Sans in this document,
  * so the sealed file does not carry the same font twice.
+ * Returns a plain description of each name that holds characters the font could not draw
+ * (printed as boxes followed by their code points); empty when everything printed as given.
  */
-export async function appendCertificate(doc: PDFDocument, data: CertificateData, fonts?: CertificateFonts): Promise<void> {
+export async function appendCertificate(doc: PDFDocument, data: CertificateData, fonts?: CertificateFonts): Promise<string[]> {
+  const lost: string[] = [];
   const f = fonts ?? (await embedFonts(doc, ["regular", "bold"]));
   const text = (value: unknown, max = 600) => drawableText(f.regular, value, max);
   const signers = Array.isArray(data?.signers) ? data.signers : [];
@@ -255,15 +282,17 @@ export async function appendCertificate(doc: PDFDocument, data: CertificateData,
 
   const flow = new Flow(doc, f, text(data?.orgName, 200));
 
+  const summaryLost: string[] = [];
   const summary = [
-    row(f, "Agreement", data?.agreementName, 4),
+    row(f, "Agreement", data?.agreementName, 6, VALUE_WIDTH, summaryLost),
     row(f, "File reference", data?.fileReference, 3),
-    row(f, "Organization", data?.orgName, 3),
+    row(f, "Organization", data?.orgName, 6, VALUE_WIDTH, summaryLost),
     row(f, "Envelope ID", data?.envelopeId, 3),
     row(f, "Completed", formatUtc(data?.completedAt), 1),
     row(f, "Original document SHA-256", data?.originalSha256, 3),
   ];
   if (text(data?.verifyUrl)) summary.push(row(f, "Verify this document", data.verifyUrl, 5));
+  for (const label of summaryLost) lost.push(`The ${label.toLowerCase()} name`);
   for (const r of summary) {
     flow.ensure(r.height);
     drawRow(flow, r);
@@ -282,7 +311,7 @@ export async function appendCertificate(doc: PDFDocument, data: CertificateData,
 
   flow.heading(count === 1 ? "Signer" : "Signers", 150);
   if (count === 0) flow.paragraph("No signers were recorded.", BODY - 0.5, MUTED);
-  signers.forEach((signer, i) => drawSigner(flow, signer, i));
+  signers.forEach((signer, i) => drawSigner(flow, signer, i, lost));
 
   drawTimeline(flow, events);
 
@@ -295,4 +324,5 @@ export async function appendCertificate(doc: PDFDocument, data: CertificateData,
     if (left) page.drawText(left, { x: MARGIN, y: MARGIN - 6, size: SMALL, font: f.regular, color: MUTED });
     page.drawText(pageLabel, { x: PAGE_WIDTH - MARGIN - labelWidth, y: MARGIN - 6, size: SMALL, font: f.regular, color: MUTED });
   });
+  return lost;
 }

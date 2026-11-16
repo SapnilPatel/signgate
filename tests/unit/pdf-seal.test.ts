@@ -344,3 +344,54 @@ describe("sealDocument", () => {
     await writeFile(`${dir}/sealed-sample.pdf`, (await sealDocument(input)).pdf);
   });
 });
+
+describe("sealDocument: what could not be shown as entered", () => {
+  const nameField = (id: string, y: number): Field => ({ id, page: 0, x: 0.1, y, w: 0.5, h: 0.03, type: "full_name", role: "client", required: true, label: "Client name", source: "manual" });
+
+  it("reports nothing for values the font can draw", async () => {
+    const f = nameField("fld_latin", 0.3);
+    const sealed = await sealDocument({ pdf: await agreement(), fields: [f], values: { [f.id]: "Zo\u00eb Nguy\u1ec5n Th\u1ecb \u0141ukasz" }, certificate: certificate() });
+    expect(sealed.warnings).toEqual([]);
+  });
+
+  it("says which field lost characters when a name is in a script the font cannot draw", async () => {
+    const a = nameField("fld_cjk", 0.3);
+    const b = nameField("fld_ok", 0.4);
+    const sealed = await sealDocument({
+      pdf: await agreement(),
+      fields: [a, b],
+      values: { [a.id]: "\u5c71\u7530\u592a\u90ce", [b.id]: "Jane Example" },
+      certificate: certificate(),
+    });
+    expect(sealed.warnings).toHaveLength(1);
+    expect(sealed.warnings[0]).toMatchObject({ code: "characters_replaced", fieldId: "fld_cjk" });
+    expect(sealed.warnings[0].message).toMatch(/"Client name" contains 4 characters that the signed PDF cannot print/);
+    // Still sealed, and the readable value is untouched.
+    const pages = await readPages(sealed.pdf);
+    expect(pages[0].text).toContain("Jane Example");
+    expect(sealed.sha256).toBe(sha256Hex(sealed.pdf));
+  });
+
+  it("prints the code points of an undrawable signer name on the certificate and reports it", async () => {
+    const cert = certificate();
+    cert.signers[0] = { ...cert.signers[0], name: "\u05d3\u05d5\u05d3 Example" };
+    const sealed = await sealDocument({ pdf: await agreement(), fields: [], values: {}, certificate: cert });
+    const text = (await readPages(sealed.pdf)).map((p) => p.text).join(" ").replace(/\s+/g, " ");
+    expect(text).toContain("[U+05D3 U+05D5 U+05D3]");
+    expect(text).toContain("Example");
+    expect(sealed.warnings).toHaveLength(1);
+    expect(sealed.warnings[0].code).toBe("characters_replaced");
+    expect(sealed.warnings[0].fieldId).toBeUndefined();
+    expect(sealed.warnings[0].message).toMatch(/The name of signer 1 on the signing certificate/);
+    const pages = await readPages(sealed.pdf);
+    expectInsideMargins(pages.slice(2));
+  });
+
+  it("keeps a very long undrawable name inside the certificate", async () => {
+    const cert = certificate();
+    cert.signers[0] = { ...cert.signers[0], name: "\u5c71".repeat(300) };
+    const pages = await readPages(await certificateOnly(cert));
+    expectInsideMargins(pages);
+    expect(pages.map((p) => p.text).join(" ")).toMatch(/U\+5C71 \.\.\.\]/);
+  });
+});

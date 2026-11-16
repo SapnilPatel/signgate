@@ -123,9 +123,25 @@ export interface SealInput {
   certificate: CertificateData;
 }
 
+/**
+ * Something the sealed record shows differently from what was entered. Sealing
+ * still succeeds; the caller should record these and tell the sender.
+ */
+export interface SealWarning {
+  /** characters_replaced: text held characters the document font cannot draw; they print as placeholder boxes.
+   *  image_skipped: a signature or initials image was left out because too many different images were supplied. */
+  code: "characters_replaced" | "image_skipped";
+  /** The field concerned, or absent when the certificate page is. */
+  fieldId?: string;
+  /** Plain sentence, safe to show to the sender. */
+  message: string;
+}
+
 export interface SealResult {
   pdf: Uint8Array;
   sha256: string;
+  /** Empty when the sealed document shows every value exactly as entered. */
+  warnings: SealWarning[];
 }
 
 /**
@@ -137,7 +153,7 @@ export interface SealResult {
  *   detectFields(pdf, options)                 -> DetectionResult   (never throws; always returns a signable result)
  *   appendSignaturePage(pdf, { companyName, includeCompany }) -> { pdf, pages, fields }
  *   stampFields(pdf, fields, values)           -> Uint8Array        (values drawn onto the pages; used for previews)
- *   sealDocument(input)                        -> SealResult        (stamps, appends certificate, hashes)
+ *   sealDocument(input)                        -> SealResult        (stamps, appends certificate, hashes; lists what could not be shown as entered)
  *   getPages(pdf)                              -> PageInfo[]
  */
 export type { Field, FieldValues, PageInfo, DetectionMeta };

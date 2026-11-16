@@ -25,8 +25,18 @@ const INK = rgb(0.06, 0.07, 0.12);
 
 /** A signature pad on a 3x display produces about 1800x600; anything far beyond that is not a signature. */
 const MAX_IMAGE_SIDE = 4096;
-/** pdf-lib inflates PNGs to raw pixels in memory, so a small file with huge dimensions must be refused up front. */
-const MAX_IMAGE_PIXELS = 4_194_304;
+/**
+ * pdf-lib decodes a PNG to raw pixels and re-compresses it in JavaScript, at roughly a tenth of a
+ * second per million pixels, so a small file with huge dimensions must be refused up front.
+ * 1.5 million pixels leaves room for a 1800x600 pad with margin to spare.
+ */
+export const MAX_IMAGE_PIXELS = 1_500_000;
+/**
+ * Pixels of distinct images embedded in one pass. A signer normally contributes two images
+ * (signature and initials) however many fields they fill; this allows sixteen full-size ones and
+ * keeps sealing to a few seconds even when every field carries a different large image.
+ */
+export const MAX_TOTAL_IMAGE_PIXELS = 24_000_000;
 
 const PNG_MAGIC = [0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a];
 
@@ -205,7 +215,21 @@ function has(font: PDFFont, code: number): boolean {
  * character was there rather than silently losing it.
  */
 export function drawableText(font: PDFFont, input: unknown, maxChars: number = LIMITS.maxTextFieldLength): string {
-  if (typeof input !== "string" && typeof input !== "number") return "";
+  return renderText(font, input, maxChars).text;
+}
+
+/**
+ * The characters of a value that the font cannot draw and that are printed as placeholders
+ * (a name in Chinese, Arabic or Hebrew, for example). Empty when the value prints as written.
+ * Emoji and other decoration that is dropped without a placeholder is not counted.
+ */
+export function undrawableCharacters(font: PDFFont, input: unknown, maxChars: number = LIMITS.maxTextFieldLength): string[] {
+  return renderText(font, input, maxChars).lost;
+}
+
+function renderText(font: PDFFont, input: unknown, maxChars: number): { text: string; lost: string[] } {
+  const lost: string[] = [];
+  if (typeof input !== "string" && typeof input !== "number") return { text: "", lost };
   // Cut in UTF-16 units first so a multi-megabyte string is never expanded into an array.
   const clipped = Array.from(String(input).slice(0, maxChars * 2)).slice(0, maxChars).join("");
   const missing = has(font, 0x25a1) ? "\u25a1" : "?";
@@ -217,10 +241,13 @@ export function drawableText(font: PDFFont, input: unknown, maxChars: number = L
     else {
       const folded = Array.from(ch.normalize("NFKC"));
       if (folded.length > 0 && folded.every((f) => f === " " || has(font, f.codePointAt(0)!))) out += folded.join("");
-      else out += missing;
+      else {
+        out += missing;
+        lost.push(ch);
+      }
     }
   }
-  return safeText(font, out, "?").replace(/ {2,}/g, " ").trim();
+  return { text: safeText(font, out, "?").replace(/ {2,}/g, " ").trim(), lost };
 }
 
 function widthOf(font: PDFFont, text: string, size: number): number {
@@ -409,21 +436,34 @@ function isBlank(value: unknown): boolean {
   return value === undefined || value === null || value === false || (typeof value === "string" && value.trim() === "");
 }
 
+/** What happened while values were drawn, for the caller to record and tell the sender about. */
+export interface StampReport {
+  /** How many fields were drawn. */
+  drawn: number;
+  /** Text fields holding characters the embedded font cannot draw; each such character was printed as a placeholder box. */
+  replaced: { fieldId: string; label: string; characters: number }[];
+  /** Signature or initials fields left empty because the document already carries as many distinct images as one pass can embed. */
+  skippedImages: { fieldId: string; label: string }[];
+}
+
 /**
  * Draws values onto an already loaded document. Shared by previews and sealing
  * so the sealed PDF is drawn by exactly the code the signer previewed.
- * Returns how many fields were drawn.
  */
 export async function stampInto(
   doc: PDFDocument,
   fields: readonly Field[],
   values: FieldValues,
   font?: PDFFont,
-): Promise<number> {
+): Promise<StampReport> {
   const pages = doc.getPages();
   const images = new Map<string, PDFImage | null>();
   let textFont = font;
   let drawn = 0;
+  let pixelBudget = MAX_TOTAL_IMAGE_PIXELS;
+  const replaced: StampReport["replaced"] = [];
+  const skippedImages: StampReport["skippedImages"] = [];
+  const labelOf = (field: Field) => (typeof field.label === "string" ? field.label.slice(0, 80) : "");
 
   for (const field of Array.isArray(fields) ? fields : []) {
     try {
@@ -449,6 +489,12 @@ export async function stampInto(
         let image = images.get(value);
         if (image === undefined) {
           const parsed = parseImageDataUrl(value);
+          if (parsed.ok && parsed.width * parsed.height > pixelBudget) {
+            // Not cached: the same image is reported for every field it was meant for.
+            skippedImages.push({ fieldId: String(field.id), label: labelOf(field) });
+            continue;
+          }
+          if (parsed.ok) pixelBudget -= parsed.width * parsed.height;
           image = parsed.ok ? await doc.embedPng(parsed.bytes).catch(() => null) : null;
           images.set(value, image);
         }
@@ -461,16 +507,17 @@ export async function stampInto(
 
       if (typeof value !== "string" && typeof value !== "number") continue;
       if (!textFont) textFont = (await embedFonts(doc, ["regular"])).regular;
-      const text = drawableText(textFont, value);
-      if (!text) continue;
-      drawText(page, pl, textFont, text);
+      const rendered = renderText(textFont, value, LIMITS.maxTextFieldLength);
+      if (!rendered.text) continue;
+      drawText(page, pl, textFont, rendered.text);
       drawn++;
+      if (rendered.lost.length) replaced.push({ fieldId: String(field.id), label: labelOf(field), characters: rendered.lost.length });
     } catch {
       // One undrawable field must not cost the signer the whole document.
       continue;
     }
   }
-  return drawn;
+  return { drawn, replaced, skippedImages };
 }
 
 /** Loads a PDF for modification, turning parser failures into an error the uploader can act on. */
@@ -525,7 +572,7 @@ export async function stampFields(pdf: Uint8Array, fields: Field[], values: Fiel
   const doc = await loadForStamping(pdf);
   let drawn: number;
   try {
-    drawn = await stampInto(doc, fields, values);
+    drawn = (await stampInto(doc, fields, values)).drawn;
   } catch (error) {
     throw unusable(error);
   }

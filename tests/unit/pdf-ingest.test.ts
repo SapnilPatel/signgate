@@ -618,6 +618,30 @@ describe("ingestDocument: images", () => {
     new DataView(huge.buffer, huge.byteOffset).setUint32(20, 60000);
     await expectError(ingestDocument({ bytes: huge, filename: "huge.png" }), "too_large");
   });
+
+  it("refuses a PNG whose pixels would not fit in memory, before decoding it", async () => {
+    // A small file that claims 5,200 x 5,200 pixels: decoding it takes hundreds of megabytes.
+    const wide = makePng(1, 1);
+    new DataView(wide.buffer, wide.byteOffset).setUint32(16, 5200);
+    new DataView(wide.buffer, wide.byteOffset).setUint32(20, 5200);
+    const started = Date.now();
+    const error = await expectError(ingestDocument({ bytes: wide, filename: "scan.png" }), "too_large");
+    expect(Date.now() - started).toBeLessThan(500);
+    expect(error.message).toMatch(/5200 by 5200 pixels/);
+    expect(error.message).toMatch(/lower resolution/);
+    // A Letter page scanned at 300 dpi is well inside the limit.
+    const page = await ingestDocument({ bytes: makePng(2550, 330), filename: "strip.png" });
+    expect(page.sourceKind).toBe("image");
+  });
+
+  it("refuses page pictures sent as PNGs once together they are too much to decode", async () => {
+    const big = makePng(1, 1);
+    new DataView(big.buffer, big.byteOffset).setUint32(16, 4000);
+    new DataView(big.buffer, big.byteOffset).setUint32(20, 5000);
+    const pages = Array.from({ length: 4 }, () => ({ bytes: big, widthPt: 612, heightPt: 792 }));
+    const error = await expectError(ingestPageImages(pages, "x"), "too_large");
+    expect(error.message).toMatch(/JPEG/);
+  });
 });
 
 function inflateMaybe(stream: PDFStream): Uint8Array {
@@ -763,6 +787,49 @@ describe("typeset", () => {
     await expectError(typesetText(pages, { maxPages: 10 }), "too_many_pages");
     const ok = await typesetText(pages, { maxPages: 12 });
     expect(ok.pageCount).toBe(12);
+  });
+
+  it("refuses oversized text quickly instead of laying all of it out first", async () => {
+    const line = "The provider shall perform the services described in the schedule with reasonable skill and care. ";
+    const cases: [string, string][] = [
+      ["15,000 lines with no blank line between them", Array.from({ length: 15_000 }, () => line.repeat(1).padEnd(130, "x")).join("\n")],
+      ["one unbroken 3 MB line", "x".repeat(3_000_000)],
+      ["one 2.7 MB paragraph of words", line.repeat(27_000)],
+      ["just over the limit, in one paragraph", line.repeat(11_000)],
+    ];
+    for (const [name, text] of cases) {
+      const started = Date.now();
+      const error = await expectError(typesetText(text), "too_many_pages");
+      expect(Date.now() - started, name).toBeLessThan(4000);
+      expect(error.message, name).toMatch(/longer than 200 pages/);
+    }
+    const started = Date.now();
+    await expectError(typesetHtml(`<p>${line.repeat(27_000)}</p>`), "too_many_pages");
+    await expectError(typesetHtml(`<table><tr><td>${line.repeat(27_000)}</td><td>x</td></tr></table>`), "too_many_pages");
+    expect(Date.now() - started).toBeLessThan(4000);
+  }, 40_000);
+
+  it("converts a long document that is within the limit in a few seconds", async () => {
+    const para = "The provider shall perform the services described in the schedule with reasonable skill and care, and the client shall pay the fees when they fall due. ";
+    const started = Date.now();
+    const result = await typesetText(Array.from({ length: 1500 }, (_, i) => `${i + 1}. ${para.repeat(2)}`).join("\n\n"));
+    expect(Date.now() - started).toBeLessThan(8000);
+    expect(result.pageCount).toBeGreaterThan(120);
+    expect(result.pageCount).toBeLessThanOrEqual(200);
+  }, 30_000);
+
+  it("leaves out a picture too large to decode and says one was skipped", async () => {
+    const bomb = makePng(1, 1);
+    new DataView(bomb.buffer, bomb.byteOffset).setUint32(16, 9000);
+    new DataView(bomb.buffer, bomb.byteOffset).setUint32(20, 9000);
+    const ok = makePng(40, 20);
+    const uri = (b: Uint8Array) => `data:image/png;base64,${Buffer.from(b).toString("base64")}`;
+    const started = Date.now();
+    const result = await typesetHtml(`<p>Logo <img src="${uri(ok)}"> and a huge one <img src="${uri(bomb)}"></p><p>Signature: ____________</p>`);
+    expect(Date.now() - started).toBeLessThan(3000);
+    expect(result.skippedImages).toBe(1);
+    expect(result.hasContent).toBe(true);
+    expect(await allText(result.pdf)).toContain("Signature: ____________");
   });
 
   it("survives hostile markup", async () => {

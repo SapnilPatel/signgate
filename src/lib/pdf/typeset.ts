@@ -25,6 +25,20 @@ const LIST_INDENT = 24;
 const CELL_PAD = 4;
 const MAX_DEPTH = 150;
 const MAX_IMAGES = 300;
+/**
+ * No letter, digit or punctuation mark in the embedded fonts is narrower than about a fifth of its font size, and a line is
+ * 1.4 sizes tall, so every printed character needs at least this share of size-squared of paper.
+ * It turns "can this possibly fit in the page limit?" into a count, answered before any layout.
+ */
+const MIN_GLYPH_AREA = 0.18 * LEADING;
+/**
+ * A backstop, not the normal limit: a document at the page limit converts in two to three
+ * seconds on a laptop, and the page-limit checks stop oversized input long before this.
+ */
+const TYPESET_BUDGET_MS = 12_000;
+/** PNG pictures inside a document are decoded in memory at roughly 16 bytes per pixel and a tenth of a second per million pixels. */
+const MAX_PNG_PIXELS_EACH = 25_000_000;
+const MAX_PNG_PIXELS_TOTAL = 60_000_000;
 const INK = rgb(0.1, 0.1, 0.1);
 const GRID = rgb(0.72, 0.72, 0.72);
 const FOOTER = rgb(0.45, 0.45, 0.45);
@@ -116,6 +130,9 @@ interface LaidTable {
 type Item = Box | { k: "space"; h: number } | { k: "break" } | LaidTable;
 
 interface Env {
+  /** Epoch milliseconds after which conversion stops with an error the uploader can act on. */
+  deadline: number;
+  maxPages: number;
   fonts: FontSet;
   images: Map<string, { image: PDFImage; w: number; h: number } | null>;
   rawImages: Map<string, Uint8Array | null>;
@@ -626,8 +643,67 @@ interface Line {
   imgH: number;
 }
 
+const widthCache = new WeakMap<PDFFont, Map<string, number>>();
+const WIDTH_CACHE_ENTRIES = 60_000;
+
+/**
+ * Width of a word. Shaping a string is the single most expensive step of conversion and
+ * agreements repeat the same words thousands of times, so each word is shaped once per font;
+ * width scales linearly with size.
+ */
+function measure(font: PDFFont, text: string, size: number): number {
+  if (text.length > 48) return font.widthOfTextAtSize(text, size);
+  let cache = widthCache.get(font);
+  if (!cache) {
+    cache = new Map();
+    widthCache.set(font, cache);
+  }
+  let unit = cache.get(text);
+  if (unit === undefined) {
+    unit = font.widthOfTextAtSize(text, 1000);
+    if (cache.size >= WIDTH_CACHE_ENTRIES) cache.clear();
+    cache.set(text, unit);
+  }
+  return (unit * size) / 1000;
+}
+
 function widthOf(env: Env, st: Style, text: string): number {
-  return fontFor(env, st).widthOfTextAtSize(text, st.size);
+  return measure(fontFor(env, st), text, st.size);
+}
+
+function tooManyPages(maxPages: number): DocumentError {
+  return new DocumentError(
+    "too_many_pages",
+    `This document is longer than ${maxPages} pages, which is the most an agreement can have here. Shorten it or split it, then upload again.`,
+  );
+}
+
+function checkDeadline(env: Env): void {
+  if (Date.now() > env.deadline) {
+    throw new DocumentError("too_large", "This document is too large to convert here. Save or export it as a PDF and upload that instead.");
+  }
+}
+
+function inkCount(text: string): number {
+  let n = 0;
+  for (let i = 0; i < text.length; i++) {
+    const c = text.charCodeAt(i);
+    if (c > 32 && c !== 0xa0) n++;
+  }
+  return n;
+}
+
+/** Paper the text needs at the very least, in square points. */
+function minimumArea(blocks: Block[]): number {
+  let area = 0;
+  for (const block of blocks) {
+    if (block.k === "para") {
+      for (const inline of block.inlines) if (inline.t === "text") area += inkCount(inline.text) * inline.st.size * inline.st.size * MIN_GLYPH_AREA;
+    } else if (block.k === "table") {
+      for (const row of block.rows) for (const cell of row) area += minimumArea(cell.blocks);
+    }
+  }
+  return area;
 }
 
 function layoutPara(p: Para, width: number, env: Env): Item[] {
@@ -637,6 +713,7 @@ function layoutPara(p: Para, width: number, env: Env): Item[] {
   /** True right after an automatic wrap, where leading spaces are dropped. */
   let wrapped = false;
   let lastSize = p.size;
+  let laidHeight = 0;
 
   const finish = (soft: boolean) => {
     const last = line.segs[line.segs.length - 1];
@@ -644,14 +721,20 @@ function layoutPara(p: Para, width: number, env: Env): Item[] {
       const trimmed = last.text.replace(/ +$/, "");
       if (trimmed !== last.text) {
         line.w -= last.w;
+        // Taking off the width of the spaces themselves avoids shaping the whole line a second time.
+        last.w = trimmed ? Math.max(0, last.w - widthOf(env, last.st, last.text.slice(trimmed.length))) : 0;
         last.text = trimmed;
-        last.w = trimmed ? widthOf(env, last.st, trimmed) : 0;
         line.w += last.w;
         if (!trimmed) line.segs.pop();
       }
     }
     if (line.size === 0) line.size = lastSize;
     lines.push(line);
+    // One paragraph can be the whole upload (a text file with no blank lines). Stop as soon as it
+    // alone is past the page limit, rather than breaking megabytes into lines that are then refused.
+    laidHeight += Math.max(line.size * LEADING, line.imgH);
+    if (laidHeight > (env.maxPages + 1) * CONTENT_H) throw tooManyPages(env.maxPages);
+    if ((lines.length & 63) === 0) checkDeadline(env);
     line = { segs: [], w: 0, size: 0, imgH: 0 };
     wrapped = soft;
   };
@@ -763,7 +846,7 @@ function layoutPara(p: Para, width: number, env: Env): Item[] {
           const st: Style = { ...DEFAULT_STYLE, size: p.size };
           const font = fontFor(env, st);
           const text = canRender(font, marker) ? marker : "-";
-          const mw = font.widthOfTextAtSize(text, st.size);
+          const mw = measure(font, text, st.size);
           page.drawText(text, { x: left + p.indent - 6 - mw, y: baseline, size: st.size, font, color: INK });
         }
         for (const seg of ln.segs) {
@@ -810,7 +893,8 @@ function naturalWidth(blocks: Block[], env: Env): number {
         run += inline.w ?? env.images.get(inline.key)?.w ?? 0;
       } else {
         for (const part of inline.text.split("\n")) {
-          run += widthOf(env, inline.st, safeText(fontFor(env, inline.st), part));
+          // Only "does it exceed the column?" matters, and a few hundred characters always do.
+          run += widthOf(env, inline.st, safeText(fontFor(env, inline.st), part.slice(0, 400)));
           if (run > CONTENT_W) break;
         }
       }
@@ -932,12 +1016,7 @@ class Flow {
   }
 
   private newPage() {
-    if (this.pages.length >= this.maxPages) {
-      throw new DocumentError(
-        "too_many_pages",
-        `This document is longer than ${this.maxPages} pages, which is the most an agreement can have here. Shorten it or split it, then upload again.`,
-      );
-    }
+    if (this.pages.length >= this.maxPages) throw tooManyPages(this.maxPages);
     this.page = this.doc.addPage([PAGE_W, PAGE_H]);
     this.pages.push(this.page);
     this.y = PAGE_H - MARGIN;
@@ -1050,10 +1129,24 @@ function isJpeg(b: Uint8Array) {
   return b.length > 4 && b[0] === 0xff && b[1] === 0xd8 && b[2] === 0xff;
 }
 
+/** Width times height from a PNG header, or 0 when the header is not where it should be. */
+function pngPixels(b: Uint8Array): number {
+  if (b.length < 24 || b[12] !== 0x49 || b[13] !== 0x48 || b[14] !== 0x44 || b[15] !== 0x52) return 0;
+  const view = new DataView(b.buffer, b.byteOffset, b.byteLength);
+  return view.getUint32(16) * view.getUint32(20);
+}
+
 async function embedImages(doc: PDFDocument, env: Env) {
+  // PNGs are decoded to raw pixels in memory; pictures beyond the budget are left out and reported
+  // as skipped rather than letting one oversized screenshot take the whole upload down.
+  let pngBudget = MAX_PNG_PIXELS_TOTAL;
   for (const [key, bytes] of env.rawImages) {
     let entry: { image: PDFImage; w: number; h: number } | null = null;
-    if (bytes) {
+    checkDeadline(env);
+    const pixels = bytes && isPng(bytes) ? pngPixels(bytes) : 0;
+    const affordable = !bytes || !isPng(bytes) || (pixels > 0 && pixels <= MAX_PNG_PIXELS_EACH && pixels <= pngBudget);
+    if (bytes && affordable) {
+      pngBudget -= pixels;
       try {
         const image = isPng(bytes) ? await doc.embedPng(bytes) : isJpeg(bytes) ? await doc.embedJpg(new Uint8Array(bytes)) : null;
         // Pixels are treated as CSS pixels (96 per inch), which is what Word and browsers assume.
@@ -1070,15 +1163,22 @@ async function embedImages(doc: PDFDocument, env: Env) {
 async function typesetBlocks(build: (env: Env) => Block[], options: TypesetOptions): Promise<TypesetResult> {
   const doc = await PDFDocument.create();
   const fonts = await embedFonts(doc, ["regular", "bold", "italic", "boldItalic"] as const);
-  const env: Env = { fonts, images: new Map(), rawImages: new Map(), options, replaced: false, skippedImages: 0, drew: false };
+  const maxPages = options.maxPages ?? LIMITS.maxPages;
+  const env: Env = { deadline: Date.now() + TYPESET_BUDGET_MS, maxPages, fonts, images: new Map(), rawImages: new Map(), options, replaced: false, skippedImages: 0, drew: false };
 
   const blocks = build(env);
+  // Text that could not fit in the page limit even if every character were as narrow as the
+  // narrowest glyph is refused here, before a single word is measured.
+  if (minimumArea(blocks) > maxPages * CONTENT_W * CONTENT_H) throw tooManyPages(maxPages);
   await embedImages(doc, env);
 
-  const flow = new Flow(doc, options.maxPages ?? LIMITS.maxPages);
+  const flow = new Flow(doc, maxPages);
   // Blocks are laid out and placed one at a time so an enormous input stops at the
   // page limit instead of being measured in full first.
-  for (const block of blocks) flow.run(layoutBlock(block, CONTENT_W, env));
+  for (const block of blocks) {
+    checkDeadline(env);
+    flow.run(layoutBlock(block, CONTENT_W, env));
+  }
 
   const count = flow.pages.length;
   flow.pages.forEach((page, i) => {
