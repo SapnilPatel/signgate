@@ -7,8 +7,9 @@
  * resolving the secret to its signer and checking the id against that signer.
  */
 import { and, asc, eq, inArray, isNull, ne, or, gt, sql } from "drizzle-orm";
-import { getDb, type DbOrTx } from "@/lib/db";
+import { getDb, type Db, type DbOrTx, type Tx } from "@/lib/db";
 import {
+  emailLog,
   envelopes,
   events as eventsTable,
   files,
@@ -22,7 +23,7 @@ import {
   type Signer,
   type User,
 } from "@/lib/db/schema";
-import { env } from "@/lib/env";
+import { env, PRODUCT_NAME } from "@/lib/env";
 import { IMAGE_FIELD_TYPES, LIMITS, type Field, type FieldValues, type PageInfo } from "@/lib/types";
 import { sealDocument, stampFields, type CertificateData, type CertificateSigner } from "@/lib/pdf";
 import { parseImageDataUrl } from "@/lib/pdf/stamp";
@@ -33,9 +34,10 @@ import { getBlob, getBlobUnscopedForSigningLink, putBlob } from "./blobs";
 import { describeEvent, listEvents, recordEvent, type EventActor } from "./events";
 import { enqueueWebhookEvent } from "./webhooks";
 import { attachmentsFit, sendEmail } from "./email";
-import { completedEmail, countersignRequestEmail, declinedEmail, voidedEmail, type Brand } from "./email-templates";
+import { completedEmail, countersignRequestEmail, declinedEmail, escapeHtml, voidedEmail, type Brand, type EmailContent } from "./email-templates";
 import { describeWait, rateLimit } from "./rate-limit";
-import { findSignerBySecret, linkRateKey, signingUrl } from "./tokens";
+import { resolveCountersigner } from "./templates";
+import { findSignerBySecret, mintSigningToken, signingUrl } from "./tokens";
 
 // ---------------------------------------------------------------------------
 // Shared pieces (also used by envelopes.ts and jobs.ts)
@@ -46,9 +48,14 @@ export const OPEN_STATUSES: EnvelopeStatus[] = ["draft", "sent", "viewed", "clie
 /** Statuses in which the client has not signed yet. */
 export const AWAITING_CLIENT_STATUSES: EnvelopeStatus[] = ["draft", "sent", "viewed"];
 
-/** Recorded on the audit trail when sealing fails; the scheduler stops retrying after this many. */
+/** Recorded on the audit trail each time sealing fails; the scheduler backs off between attempts. */
 export const FINALIZE_FAILED_EVENT = "envelope.finalize_failed";
-export const MAX_FINALIZE_ATTEMPTS = 5;
+/** First retry waits this long; each further failure doubles the wait, up to the cap. */
+export const FINALIZE_RETRY_BASE_MS = 5 * 60_000;
+export const FINALIZE_RETRY_MAX_MS = 6 * 3_600_000;
+/** Chasing the countersigner: used when the company has switched client reminders off. */
+export const COUNTERSIGN_REMINDER_DAYS = 2;
+export const COUNTERSIGN_MAX_REMINDERS = 5;
 
 /** Thrown inside a transaction to abandon it when a guarded update matched nothing. */
 export class Raced extends Error {
@@ -56,6 +63,43 @@ export class Raced extends Error {
     super("raced");
     this.name = "Raced";
   }
+}
+
+/** True for the errors Postgres raises when it aborts one side of a lock cycle or a serialization clash. */
+export function isRetryableTxError(err: unknown): boolean {
+  for (let e: unknown = err, depth = 0; e && typeof e === "object" && depth < 6; depth++) {
+    const code = (e as { code?: unknown }).code;
+    if (code === "40P01" || code === "40001") return true;
+    e = (e as { cause?: unknown }).cause;
+  }
+  return false;
+}
+
+/**
+ * db.transaction, run once more if Postgres aborted it as a deadlock victim. The
+ * aborted attempt changed nothing, and every transaction here is a set of guarded
+ * updates, so the second run simply sees whatever the winner committed.
+ * `work` must not leave anything behind outside the transaction.
+ */
+export async function inTransaction<T>(db: Db, work: (tx: Tx) => Promise<T>): Promise<T> {
+  try {
+    return await db.transaction(work);
+  } catch (err) {
+    if (!isRetryableTxError(err)) throw err;
+    return db.transaction(work);
+  }
+}
+
+/**
+ * Every transaction that changes an envelope takes its file's row lock first, then
+ * the envelope, then signers. One order everywhere is what keeps a signature, a
+ * void, an expiry and a re-send for the same file from deadlocking each other.
+ */
+export async function lockFile(tx: DbOrTx, orgId: string, fileId: string): Promise<void> {
+  // NO KEY UPDATE, not UPDATE: it still excludes every other holder of this lock and every
+  // update of the row, but lets rows that merely reference the file (audit events, email
+  // log entries written outside this order) be inserted without waiting on it.
+  await tx.select({ id: files.id }).from(files).where(and(eq(files.id, fileId), eq(files.orgId, orgId))).for("no key update");
 }
 
 export interface EnvelopeContext {
@@ -124,7 +168,13 @@ export async function teamRecipient(db: DbOrTx, envelope: Pick<Envelope, "orgId"
   );
 }
 
-export function webhookPayload(ctx: Pick<EnvelopeContext, "envelope" | "file">, status: string, extra: Record<string, unknown> = {}): Record<string, unknown> {
+export function webhookPayload(
+  ctx: Pick<EnvelopeContext, "envelope" | "file"> & { signers?: Pick<Signer, "role" | "name" | "email">[] },
+  status: string,
+  extra: Record<string, unknown> = {},
+): Record<string, unknown> {
+  // The signer row is who the agreement actually went to; the file can lag behind a correction.
+  const client = ctx.signers?.find((s) => s.role === "client");
   return {
     envelopeId: ctx.envelope.id,
     fileId: ctx.file.id,
@@ -132,7 +182,7 @@ export function webhookPayload(ctx: Pick<EnvelopeContext, "envelope" | "file">, 
     externalId: ctx.file.externalId,
     agreementName: ctx.envelope.templateName,
     status,
-    client: { name: ctx.file.clientName, email: ctx.file.clientEmail },
+    client: { name: client?.name ?? ctx.file.clientName, email: client?.email ?? ctx.file.clientEmail },
     ...extra,
   };
 }
@@ -170,13 +220,37 @@ export function longDate(at: Date, timeZone = "UTC"): string {
   }
 }
 
-function plausibleTimeZone(value: unknown): string | null {
+export function plausibleTimeZone(value: unknown): string | null {
   if (typeof value !== "string" || value.length < 3 || value.length > 64 || !/^[A-Za-z0-9_+\-/]+$/.test(value)) return null;
   try {
     new Intl.DateTimeFormat("en-GB", { timeZone: value });
     return value;
   } catch {
     return null;
+  }
+}
+
+/**
+ * The company's own time zone (IANA name), or null when none is stored. Dates the
+ * company puts on a document (the agreement date, its countersignature date) are
+ * calendar days where the company is, not in UTC.
+ */
+export function orgTimeZone(org: { settings?: unknown } | null | undefined): string | null {
+  const stored = org?.settings && typeof org.settings === "object" ? (org.settings as Record<string, unknown>) : {};
+  return plausibleTimeZone(stored.timeZone) ?? plausibleTimeZone(stored.timezone);
+}
+
+/** Day of the month, month name and year of an instant as a calendar date in `timeZone`. */
+export function calendarParts(at: Date, timeZone: string | null | undefined): { day: number; month: string; year: number } {
+  const read = (zone: string) => {
+    const parts = new Intl.DateTimeFormat("en-GB", { day: "numeric", month: "long", year: "numeric", timeZone: zone }).formatToParts(at);
+    const get = (type: string) => parts.find((p) => p.type === type)?.value ?? "";
+    return { day: Number(get("day")), month: get("month"), year: Number(get("year")) };
+  };
+  try {
+    return read(timeZone || "UTC");
+  } catch {
+    return read("UTC");
   }
 }
 
@@ -351,7 +425,7 @@ export function validateSignerValues(ownFields: Field[], raw: unknown, defaults:
 }
 
 /** Prefill plus what every signer before `signer` has already put on the document. */
-function valuesVisibleTo(ctx: EnvelopeContext, signer: Signer): FieldValues {
+export function valuesVisibleTo(ctx: EnvelopeContext, signer: Signer): FieldValues {
   const merged: FieldValues = { ...(ctx.envelope.prefill ?? {}) };
   for (const other of ctx.signers) {
     if (other.id !== signer.id && other.order < signer.order && other.status === "signed") Object.assign(merged, other.values ?? {});
@@ -359,7 +433,7 @@ function valuesVisibleTo(ctx: EnvelopeContext, signer: Signer): FieldValues {
   return merged;
 }
 
-function allValues(ctx: EnvelopeContext): FieldValues {
+export function allValues(ctx: EnvelopeContext): FieldValues {
   const merged: FieldValues = { ...(ctx.envelope.prefill ?? {}) };
   for (const s of ctx.signers) if (s.status === "signed") Object.assign(merged, s.values ?? {});
   return merged;
@@ -452,7 +526,7 @@ function stateMessage(state: SigningState, orgName: string): string {
     case "not_your_turn":
       return "This agreement is not ready for your signature yet. You will get an email as soon as it is your turn.";
     case "signed":
-      return "You have signed this agreement. You will get an email with the completed copy as soon as it is finalized.";
+      return "You have signed this agreement. The completed copy can be downloaded from this link as soon as it is finalized.";
     case "completed":
       return "This agreement is signed and complete. You can download your copy at any time.";
     case "ready":
@@ -468,10 +542,19 @@ function stateError(state: SigningState, orgName: string): ServiceError {
   return new ServiceError("gone", message);
 }
 
-async function limitPublic(action: string, secret: unknown, meta: RequestMeta | undefined, perLink: number, perIp: number, windowSeconds: number): Promise<void> {
+/**
+ * Limits for the public signing endpoints. A counter is kept per real link and per
+ * caller address. A value that does not resolve to a signer never gets a counter of
+ * its own, so junk links cannot fill the table; they count against the caller's
+ * address, or against one shared counter when the route could not tell us the address,
+ * so there is never a way to probe without any limit at all.
+ */
+async function limitPublic(action: string, signerId: string | null, meta: RequestMeta | undefined, perLink: number, perIp: number, windowSeconds: number): Promise<void> {
   const ip = cleanText(meta?.ip, 64);
-  const checks = [rateLimit(`sign:${action}:link:${linkRateKey(secret)}`, perLink, windowSeconds)];
+  const checks: ReturnType<typeof rateLimit>[] = [];
+  if (signerId) checks.push(rateLimit(`sign:${action}:link:${signerId}`, perLink, windowSeconds));
   if (ip) checks.push(rateLimit(`sign:${action}:ip:${ip}`, perIp, windowSeconds));
+  else if (!signerId) checks.push(rateLimit(`sign:${action}:ip:unknown`, perIp, windowSeconds));
   for (const result of await Promise.all(checks)) {
     if (!result.ok) {
       throw new ServiceError("rate_limited", `Too many attempts. Wait a moment and try again ${describeWait(result.retryAfterSeconds)}.`);
@@ -479,7 +562,15 @@ async function limitPublic(action: string, secret: unknown, meta: RequestMeta | 
   }
 }
 
-async function resolveLink(secret: unknown): Promise<{ db: Awaited<ReturnType<typeof getDb>>; signer: Signer; ctx: EnvelopeContext } | null> {
+interface ResolvedLink {
+  db: Db;
+  signer: Signer;
+  ctx: EnvelopeContext;
+  /** The team member behind a company signer; null for a client. */
+  user: Pick<User, "id" | "title"> | null;
+}
+
+async function resolveLink(secret: unknown): Promise<ResolvedLink | null> {
   const db = await getDb();
   const signer = await findSignerBySecret(secret, db);
   if (!signer) return null;
@@ -487,7 +578,28 @@ async function resolveLink(secret: unknown): Promise<{ db: Awaited<ReturnType<ty
   if (!ctx) return null;
   // Use the row from the context so every later check reads one consistent snapshot.
   const current = ctx.signers.find((s) => s.id === signer.id);
-  return current ? { db, signer: current, ctx } : null;
+  if (!current) return null;
+  let user: Pick<User, "id" | "title"> | null = null;
+  if (current.role === "company") {
+    // A countersign link signs for the company, so it is only as good as the account
+    // behind it: once that person is turned off or gone, the link in their inbox is dead.
+    if (!current.userId) return null;
+    const [row] = await db
+      .select({ id: users.id, title: users.title, disabledAt: users.disabledAt })
+      .from(users)
+      .where(and(eq(users.id, current.userId), eq(users.orgId, ctx.org.id)))
+      .limit(1);
+    if (!row || row.disabledAt) return null;
+    user = { id: row.id, title: row.title };
+  }
+  return { db, signer: current, ctx, user };
+}
+
+/** A secret resolved once, then counted against the limits for `action`. */
+async function openLink(action: string, secret: unknown, meta: RequestMeta | undefined, perLink: number, perIp: number, windowSeconds: number): Promise<ResolvedLink | null> {
+  const resolved = await resolveLink(secret);
+  await limitPublic(action, resolved?.signer.id ?? null, meta, perLink, perIp, windowSeconds);
+  return resolved;
 }
 
 // ---------------------------------------------------------------------------
@@ -535,10 +647,9 @@ export type SigningSession =
  * that is ready to sign records the first view, exactly once.
  */
 export async function getSigningSession(secret: unknown, meta?: RequestMeta): Promise<SigningSession> {
-  await limitPublic("view", secret, meta, 120, 600, 300);
-  const resolved = await resolveLink(secret);
+  const resolved = await openLink("view", secret, meta, 120, 600, 300);
   if (!resolved) return { state: "unknown", message: stateMessage("unknown", "") };
-  const { db, ctx } = resolved;
+  const { ctx, user } = resolved;
   let { signer } = resolved;
   let { envelope } = ctx;
   const now = new Date();
@@ -560,31 +671,7 @@ export async function getSigningSession(secret: unknown, meta?: RequestMeta): Pr
   const settings = resolveSettings(ctx.org);
   const ready = state === "ready";
   const own = ready ? fieldsFor(envelope, signer.role) : [];
-  let user: Pick<User, "title"> | null = null;
-  if (ready && signer.role === "company" && signer.userId) {
-    [user] = await db.select({ title: users.title }).from(users).where(and(eq(users.id, signer.userId), eq(users.orgId, ctx.org.id))).limit(1);
-  }
-
-  const readOnly: ReadOnlyValue[] = [];
-  if (ready) {
-    const visible = valuesVisibleTo(ctx, signer);
-    for (const field of Array.isArray(envelope.fields) ? envelope.fields : []) {
-      if (!field || field.role === signer.role || !(field.id in visible)) continue;
-      const image = isImageField(field);
-      readOnly.push({
-        fieldId: field.id,
-        page: field.page,
-        x: field.x,
-        y: field.y,
-        w: field.w,
-        h: field.h,
-        type: field.type,
-        label: field.label,
-        isImage: image,
-        value: image ? null : visible[field.id],
-      });
-    }
-  }
+  const readOnly = ready ? readOnlyValues(envelope, signer.role, valuesVisibleTo(ctx, signer)) : [];
 
   return {
     state,
@@ -604,9 +691,33 @@ export async function getSigningSession(secret: unknown, meta?: RequestMeta): Pr
   };
 }
 
+/** Values already on the document that are not this role's to fill in, with where they sit. */
+export function readOnlyValues(envelope: Pick<Envelope, "fields">, role: "client" | "company", visible: FieldValues): ReadOnlyValue[] {
+  const out: ReadOnlyValue[] = [];
+  for (const field of Array.isArray(envelope.fields) ? envelope.fields : []) {
+    if (!field || field.role === role || !(field.id in visible)) continue;
+    const image = isImageField(field);
+    out.push({
+      fieldId: field.id,
+      page: field.page,
+      x: field.x,
+      y: field.y,
+      w: field.w,
+      h: field.h,
+      type: field.type,
+      label: field.label,
+      isImage: image,
+      value: image ? null : visible[field.id],
+    });
+  }
+  return out;
+}
+
 async function recordFirstView(ctx: EnvelopeContext, signer: Signer, meta: RequestMeta | undefined, now: Date): Promise<{ signer: Signer; envelope: Envelope | null } | null> {
   const db = await getDb();
-  return db.transaction(async (tx) => {
+  return inTransaction(db, async (tx) => {
+    await lockFile(tx, ctx.org.id, ctx.file.id);
+    await tx.select({ id: envelopes.id }).from(envelopes).where(eq(envelopes.id, ctx.envelope.id)).for("no key update");
     // The WHERE clause is what makes this happen once: a second request finds viewed_at set.
     const [updated] = await tx
       .update(signers)
@@ -618,10 +729,14 @@ async function recordFirstView(ctx: EnvelopeContext, signer: Signer, meta: Reque
     if (signer.role === "client") {
       [envelope] = await tx
         .update(envelopes)
-        .set({ status: "viewed", updatedAt: now })
+        .set({
+          status: "viewed",
+          // A client who has the page open has the agreement, however the link reached them.
+          sentAt: sql`coalesce(${envelopes.sentAt}, ${now.toISOString()}::timestamptz)`,
+          updatedAt: now,
+        })
         .where(and(eq(envelopes.id, ctx.envelope.id), inArray(envelopes.status, ["draft", "sent"])))
         .returning();
-      // A client who has the page open clearly received the link, whatever the email provider said.
       await tx
         .update(files)
         .set({ agreementStatus: "out_for_signature", updatedAt: now })
@@ -661,8 +776,7 @@ export function documentFilename(envelope: Pick<Envelope, "templateName">, file:
 
 /** The PDF the signing page displays: the agreement with prefilled values and earlier signatures drawn in. */
 export async function getSigningDocument(secret: unknown, meta?: RequestMeta): Promise<DocumentDownload> {
-  await limitPublic("doc", secret, meta, 60, 600, 300);
-  const resolved = await resolveLink(secret);
+  const resolved = await openLink("doc", secret, meta, 60, 600, 300);
   if (!resolved) throw stateError("unknown", "");
   const { db, signer, ctx } = resolved;
   const state = signingState(ctx.envelope, signer);
@@ -671,31 +785,33 @@ export async function getSigningDocument(secret: unknown, meta?: RequestMeta): P
   if (!original || original.orgId !== ctx.org.id) {
     throw new ServiceError("not_found", `The agreement could not be loaded. Ask ${ctx.org.name} to send it again.`);
   }
-  const visible = valuesVisibleTo(ctx, signer);
-  const shown = (Array.isArray(ctx.envelope.fields) ? ctx.envelope.fields : []).filter((f) => f && f.id in visible);
-  let bytes: Uint8Array = original.bytes;
-  if (shown.length) {
-    try {
-      bytes = await stampFields(new Uint8Array(original.bytes), shown, visible);
-    } catch (err) {
-      // The unstamped agreement is still the agreement; the page overlays the values itself.
-      console.error("[signing] could not stamp preview", err instanceof Error ? err.message : err);
-    }
+  const bytes = await stampVisible(original.bytes, ctx.envelope, valuesVisibleTo(ctx, signer));
+  return { bytes, filename: documentFilename(ctx.envelope, ctx.file, ""), contentType: "application/pdf", sha256: original.sha256 };
+}
+
+/** The agreement with the given values drawn in. Falls back to the plain agreement if drawing fails. */
+export async function stampVisible(original: Buffer, envelope: Pick<Envelope, "fields">, visible: FieldValues): Promise<Buffer> {
+  const shown = (Array.isArray(envelope.fields) ? envelope.fields : []).filter((f) => f && f.id in visible);
+  if (shown.length === 0) return original;
+  try {
+    const bytes = await stampFields(new Uint8Array(original), shown, visible);
+    return Buffer.from(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+  } catch (err) {
+    // The unstamped agreement is still the agreement; the page overlays the values itself.
+    console.error("[signing] could not stamp preview", err instanceof Error ? err.message : err);
+    return original;
   }
-  const out = Buffer.from(bytes.buffer, bytes.byteOffset, bytes.byteLength);
-  return { bytes: out, filename: documentFilename(ctx.envelope, ctx.file, ""), contentType: "application/pdf", sha256: original.sha256 };
 }
 
 /** The sealed PDF, for any signer of a completed envelope, from their own link. */
 export async function getSignedCopy(secret: unknown, meta?: RequestMeta): Promise<DocumentDownload> {
-  await limitPublic("copy", secret, meta, 30, 300, 300);
-  const resolved = await resolveLink(secret);
+  const resolved = await openLink("copy", secret, meta, 30, 300, 300);
   if (!resolved) throw stateError("unknown", "");
   const { db, signer, ctx } = resolved;
   const state = signingState(ctx.envelope, signer);
   if (state !== "completed" || !ctx.envelope.finalBlobId) {
     if (state === "voided" || state === "declined" || state === "expired") throw stateError(state, ctx.org.name);
-    throw new ServiceError("not_ready", "The signed copy is not ready yet. It is emailed to you as soon as everyone has signed.");
+    throw new ServiceError("not_ready", "The signed copy is not ready yet. It can be downloaded from this link as soon as everyone has signed.");
   }
   const blob = await getBlobUnscopedForSigningLink(ctx.envelope.finalBlobId, db);
   if (!blob || blob.orgId !== ctx.org.id) {
@@ -717,24 +833,53 @@ export interface SigningResult {
   message: string;
 }
 
-export function resultFor(ctx: EnvelopeContext): SigningResult {
+/**
+ * What to tell someone who has just signed. Every sentence is something that is
+ * true right now: an email is only mentioned when one was actually sent, and the
+ * download is promised from the link, which works whether or not email does.
+ */
+export function resultFor(ctx: EnvelopeContext, facts: { copyEmailedTo?: string | null } = {}): SigningResult {
   if (ctx.envelope.status === "completed") {
-    return { status: "signed", completed: true, next: "completed", message: "The agreement is signed and complete. A copy has been emailed to you, and you can download it from this page." };
+    const emailed = cleanText(facts.copyEmailedTo, 254);
+    return {
+      status: "signed",
+      completed: true,
+      next: "completed",
+      message: emailed
+        ? `The agreement is signed and complete. A copy has been emailed to ${emailed}, and you can download it from this page.`
+        : "The agreement is signed and complete. Download your copy now from this page.",
+    };
   }
   if (ctx.signers.some((s) => s.status !== "signed")) {
     return {
       status: "signed",
       completed: false,
       next: "awaiting_countersignature",
-      message: `Your signature is recorded. ${ctx.org.name} will now countersign, and you will be emailed the completed copy.`,
+      message: `Your signature is recorded. ${ctx.org.name} will now countersign. Keep this link: the completed copy can be downloaded from it as soon as they have.`,
     };
   }
   return {
     status: "signed",
     completed: false,
     next: "finalizing",
-    message: "Your signature is recorded. The final copy is being prepared and will be emailed to you shortly.",
+    message: "Your signature is recorded. The final copy is being prepared and will be ready to download here shortly.",
   };
+}
+
+/** resultFor, with the email claim checked against what was really sent to this person. */
+export async function resultForRecipient(db: DbOrTx, ctx: EnvelopeContext, email: string | null | undefined): Promise<SigningResult> {
+  const address = normalizeEmail(email);
+  if (ctx.envelope.status !== "completed" || !address) return resultFor(ctx);
+  try {
+    const [row] = await db
+      .select({ id: emailLog.id })
+      .from(emailLog)
+      .where(and(eq(emailLog.envelopeId, ctx.envelope.id), eq(emailLog.kind, "completed"), eq(emailLog.status, "sent"), sql`lower(${emailLog.to}) = ${address}`))
+      .limit(1);
+    return resultFor(ctx, { copyEmailedTo: row ? address : null });
+  } catch {
+    return resultFor(ctx);
+  }
 }
 
 interface RecordSignatureInput {
@@ -768,13 +913,19 @@ export async function recordSignature(input: RecordSignatureInput): Promise<Reco
   const isClient = signer.role === "client";
   const company = ctx.org.legalName || ctx.org.name;
 
-  return db.transaction(async (tx) => {
-    // Updating the envelope row first takes its row lock, which serializes this
-    // against void, expiry, decline and any concurrent submit.
+  return inTransaction(db, async (tx) => {
+    await lockFile(tx, ctx.org.id, ctx.file.id);
+    // The envelope row lock serializes this against void, expiry, decline and any concurrent submit.
     const [envelope] = isClient
       ? await tx
           .update(envelopes)
-          .set({ status: "client_signed", updatedAt: now })
+          .set({
+            status: "client_signed",
+            // A link shared by hand never had a delivered email to set this.
+            sentAt: sql`coalesce(${envelopes.sentAt}, ${now.toISOString()}::timestamptz)`,
+            nextReminderAt: null,
+            updatedAt: now,
+          })
           .where(
             and(
               eq(envelopes.id, ctx.envelope.id),
@@ -785,7 +936,7 @@ export async function recordSignature(input: RecordSignatureInput): Promise<Reco
           .returning({ id: envelopes.id })
       : await tx
           .update(envelopes)
-          .set({ updatedAt: now })
+          .set({ nextReminderAt: null, updatedAt: now })
           .where(and(eq(envelopes.id, ctx.envelope.id), eq(envelopes.status, "client_signed"), isNull(envelopes.finalBlobId)))
           .returning({ id: envelopes.id });
     if (!envelope) throw new Raced();
@@ -827,43 +978,91 @@ export async function recordSignature(input: RecordSignatureInput): Promise<Reco
         "agreement.signed",
         webhookPayload(ctx, "client_signed", { signedAt: now.toISOString(), signer: { role: "client", name: signed.name, email: signed.email } }),
       );
-      const next = pending.find((s) => s.status === "waiting" && s.role === "company");
-      if (next) {
+      const waiting = pending.find((s) => s.status === "waiting" && s.role === "company");
+      if (waiting) {
+        // A file that already holds a completed agreement stays cleared while a replacement is in progress.
         await tx
           .update(files)
           .set({ agreementStatus: "awaiting_countersign", updatedAt: now })
-          .where(and(eq(files.id, ctx.file.id), eq(files.orgId, ctx.org.id)));
+          .where(and(eq(files.id, ctx.file.id), eq(files.orgId, ctx.org.id), ne(files.agreementStatus, "signed")));
 
-        const [org] = await tx.select().from(orgs).where(eq(orgs.id, ctx.org.id)).limit(1);
-        let auto: FieldValues | null = null;
-        let autoUser: User | undefined;
-        if (org && resolveSettings(org).countersignMode === "auto" && next.userId) {
-          [autoUser] = await tx.select().from(users).where(and(eq(users.id, next.userId), eq(users.orgId, ctx.org.id), isNull(users.disabledAt))).limit(1);
-          if (autoUser) auto = autoCountersignValues(fieldsFor(ctx.envelope, "company"), autoUser, org, input.dateLabel);
+        const [storedOrg] = await tx.select().from(orgs).where(eq(orgs.id, ctx.org.id)).limit(1);
+        const org = storedOrg ?? ctx.org;
+        const settings = resolveSettings(org);
+        const team = await tx.select().from(users).where(eq(users.orgId, ctx.org.id)).orderBy(asc(users.createdAt));
+
+        // The countersigner was fixed when the agreement was sent. If that person has
+        // since been turned off, the request goes to whoever countersigns for the company now.
+        let next = waiting;
+        let assignee = waiting.userId ? team.find((u) => u.id === waiting.userId && !u.disabledAt) : undefined;
+        if (!assignee) {
+          const members = team.map((u) => ({ id: u.id, disabled: u.disabledAt !== null, hasSignature: Boolean(u.savedSignature), role: u.role, user: u }));
+          const pick = resolveCountersigner(settings, members).member ?? resolveCountersigner({ ...settings, countersignerUserId: undefined }, members).member;
+          if (pick) {
+            const token = mintSigningToken(waiting.id);
+            const [moved] = await tx
+              .update(signers)
+              .set({ name: pick.user.name, email: pick.user.email, userId: pick.user.id, tokenNonce: token.tokenNonce, tokenHash: token.tokenHash })
+              .where(and(eq(signers.id, waiting.id), eq(signers.status, "waiting")))
+              .returning();
+            if (!moved) throw new Raced();
+            next = moved;
+            assignee = pick.user;
+            await recordEvent(tx, {
+              ...base,
+              type: "signer.updated",
+              actor: systemActor(ctx.org.id),
+              data: { signerId: waiting.id, role: "company", name: pick.user.name, email: pick.user.email, previousEmail: waiting.email, previousName: waiting.name, reason: "The original countersigner is no longer active" },
+            });
+          }
         }
 
-        if (auto && autoUser) {
-          const [applied] = await tx
-            .update(signers)
-            .set({ status: "signed", values: auto, signedAt: now, name: autoUser.name, email: autoUser.email })
-            .where(and(eq(signers.id, next.id), eq(signers.status, "waiting")))
-            .returning({ id: signers.id });
-          if (!applied) throw new Raced();
+        if (!assignee) {
+          await tx
+            .update(files)
+            .set({ agreementStatus: "needs_attention", updatedAt: now })
+            .where(and(eq(files.id, ctx.file.id), eq(files.orgId, ctx.org.id), ne(files.agreementStatus, "signed")));
           await recordEvent(tx, {
             ...base,
-            type: "envelope.countersigned",
+            type: "countersign.unassigned",
             actor: systemActor(ctx.org.id),
-            data: { signerId: next.id, role: "company", method: "auto", auto: true, name: autoUser.name, email: autoUser.email, company, dateSigned: input.dateLabel },
+            data: { signerId: waiting.id, reason: "Nobody on the team is available to countersign. Choose a countersigner in Settings" },
           });
-          pending.splice(pending.indexOf(next), 1);
         } else {
-          const [asked] = await tx
-            .update(signers)
-            .set({ status: "sent" })
-            .where(and(eq(signers.id, next.id), eq(signers.status, "waiting")))
-            .returning();
-          if (!asked) throw new Raced();
-          notify = asked;
+          let auto: FieldValues | null = null;
+          const zone = orgTimeZone(org);
+          // The company's date is the company's calendar day when it has told us its zone.
+          const companyDate = zone ? longDate(now, zone) : input.dateLabel;
+          if (settings.countersignMode === "auto") auto = autoCountersignValues(fieldsFor(ctx.envelope, "company"), assignee, org, companyDate);
+
+          if (auto) {
+            const [applied] = await tx
+              .update(signers)
+              .set({ status: "signed", values: auto, signedAt: now, name: assignee.name, email: assignee.email })
+              .where(and(eq(signers.id, next.id), eq(signers.status, "waiting")))
+              .returning({ id: signers.id });
+            if (!applied) throw new Raced();
+            await recordEvent(tx, {
+              ...base,
+              type: "envelope.countersigned",
+              actor: systemActor(ctx.org.id),
+              data: { signerId: next.id, role: "company", method: "auto", auto: true, name: assignee.name, email: assignee.email, company, dateSigned: companyDate },
+            });
+            pending.splice(pending.indexOf(waiting), 1);
+          } else {
+            const [asked] = await tx
+              .update(signers)
+              .set({ status: "sent" })
+              .where(and(eq(signers.id, next.id), eq(signers.status, "waiting")))
+              .returning();
+            if (!asked) throw new Raced();
+            notify = asked;
+            // From here the reminder schedule chases the countersigner instead of the client.
+            await tx
+              .update(envelopes)
+              .set({ reminderCount: 0, lastReminderAt: null, nextReminderAt: new Date(now.getTime() + countersignCadenceDays(settings.reminderEveryDays) * 86_400_000) })
+              .where(eq(envelopes.id, ctx.envelope.id));
+          }
         }
       }
     }
@@ -872,8 +1071,14 @@ export async function recordSignature(input: RecordSignatureInput): Promise<Reco
   });
 }
 
+/** Days between nudges to the countersigner: the company's reminder cadence, or a default when that is off. */
+export function countersignCadenceDays(reminderEveryDays: unknown): number {
+  const n = Math.floor(Number(reminderEveryDays));
+  return Number.isFinite(n) && n >= 1 ? Math.min(n, 365) : COUNTERSIGN_REMINDER_DAYS;
+}
+
 /** Ask the countersigner to sign. Recorded on the trail either way, so a failed email is visible on the file. */
-export async function emailCountersigner(ctx: EnvelopeContext, signer: Signer): Promise<SendOutcome> {
+export async function emailCountersigner(ctx: EnvelopeContext, signer: Signer, opts: { reminderNumber?: number } = {}): Promise<SendOutcome> {
   const content = countersignRequestEmail({
     brand: brandOf(ctx.org),
     signerName: signer.name,
@@ -893,8 +1098,8 @@ export async function emailCountersigner(ctx: EnvelopeContext, signer: Signer): 
       actor: systemActor(ctx.org.id),
       data:
         result.status === "sent"
-          ? { email: signer.email, name: signer.name }
-          : { email: signer.email, error: result.error ?? "Email is not set up, so the countersigner was not emailed. Countersign from the file page." },
+          ? { email: signer.email, name: signer.name, ...(opts.reminderNumber ? { reminder: opts.reminderNumber } : {}) }
+          : { email: signer.email, kind: "countersign_request", error: result.error ?? "Email is not set up, so the countersigner was not emailed. Countersign from the file page." },
     });
   } catch (err) {
     console.error("[signing] could not record countersign request", err instanceof Error ? err.message : err);
@@ -914,16 +1119,15 @@ export interface SubmitSigningInput {
  * success and writes nothing.
  */
 export async function submitSigning(secret: unknown, input: SubmitSigningInput, meta?: RequestMeta): Promise<SigningResult> {
-  await limitPublic("submit", secret, meta, 20, 200, 600);
-  const resolved = await resolveLink(secret);
+  const resolved = await openLink("submit", secret, meta, 20, 200, 600);
   if (!resolved) throw stateError("unknown", "");
-  const { db, signer, ctx } = resolved;
+  const { db, signer, ctx, user } = resolved;
   const now = new Date();
 
   const state = signingState(ctx.envelope, signer, now);
   if (state === "signed" || state === "completed") {
     // A signer who never signed cannot reach "completed"; either way nothing is written.
-    if (signer.status === "signed") return resultFor(ctx);
+    if (signer.status === "signed") return resultForRecipient(db, ctx, signer.email);
     throw stateError(state, ctx.org.name);
   }
   if (state !== "ready") throw stateError(state, ctx.org.name);
@@ -935,10 +1139,6 @@ export async function submitSigning(secret: unknown, input: SubmitSigningInput, 
     });
   }
 
-  let user: Pick<User, "title"> | null = null;
-  if (signer.role === "company" && signer.userId) {
-    [user] = await db.select({ title: users.title }).from(users).where(and(eq(users.id, signer.userId), eq(users.orgId, ctx.org.id))).limit(1);
-  }
   const own = fieldsFor(ctx.envelope, signer.role);
   const dateLabel = signedDateLabel(now, body.timezone, body.signedDateLabel);
   const checked = validateSignerValues(own, body.values, defaultValues(own, signerDefaultsFor(ctx, signer, user)), dateLabel);
@@ -955,15 +1155,15 @@ export async function submitSigning(secret: unknown, input: SubmitSigningInput, 
     // success if it was this signer signing, otherwise why the link stopped working.
     const after = await resolveLink(secret);
     if (!after) throw stateError("unknown", "");
-    if (after.signer.status === "signed") return resultFor(after.ctx);
+    if (after.signer.status === "signed") return resultForRecipient(db, after.ctx, after.signer.email);
     throw stateError(signingState(after.ctx.envelope, after.signer), after.ctx.org.name);
   }
 
-  return afterSignature(ctx.envelope.id, outcome);
+  return afterSignature(ctx.envelope.id, outcome, signer.email);
 }
 
 /** Follow-up work once a signature is committed. Nothing here can undo or fail the signature. */
-export async function afterSignature(envelopeId: string, outcome: RecordSignatureOutcome): Promise<SigningResult> {
+export async function afterSignature(envelopeId: string, outcome: RecordSignatureOutcome, recipientEmail?: string | null): Promise<SigningResult> {
   const db = await getDb();
   if (outcome.notify) {
     const ctx = await loadEnvelopeContext(db, envelopeId);
@@ -972,9 +1172,9 @@ export async function afterSignature(envelopeId: string, outcome: RecordSignatur
   if (outcome.allSigned) await finalizeEnvelope(envelopeId);
   const ctx = await loadEnvelopeContext(db, envelopeId);
   if (!ctx) {
-    return { status: "signed", completed: false, next: "finalizing", message: "Your signature is recorded. The final copy will be emailed to you." };
+    return { status: "signed", completed: false, next: "finalizing", message: "Your signature is recorded. The final copy is being prepared." };
   }
-  return resultFor(ctx);
+  return resultForRecipient(db, ctx, recipientEmail);
 }
 
 // ---------------------------------------------------------------------------
@@ -982,8 +1182,7 @@ export async function afterSignature(envelopeId: string, outcome: RecordSignatur
 // ---------------------------------------------------------------------------
 
 export async function declineSigning(secret: unknown, reason: unknown, meta?: RequestMeta): Promise<{ status: "declined" }> {
-  await limitPublic("decline", secret, meta, 10, 100, 600);
-  const resolved = await resolveLink(secret);
+  const resolved = await openLink("decline", secret, meta, 10, 100, 600);
   if (!resolved) throw stateError("unknown", "");
   const { db, signer, ctx } = resolved;
   const now = new Date();
@@ -999,7 +1198,8 @@ export async function declineSigning(secret: unknown, reason: unknown, meta?: Re
   const isClient = signer.role === "client";
 
   try {
-    await db.transaction(async (tx) => {
+    await inTransaction(db, async (tx) => {
+      await lockFile(tx, ctx.org.id, ctx.file.id);
       const [envelope] = await tx
         .update(envelopes)
         .set({ status: "declined", declineReason: why || null, nextReminderAt: null, updatedAt: now })
@@ -1070,9 +1270,9 @@ export async function declineSigning(secret: unknown, reason: unknown, meta?: Re
     if (client) {
       await safeSend(ctx.org, {
         envelopeId: ctx.envelope.id,
-        kind: "voided",
+        kind: "not_completed",
         to: client.email,
-        ...voidedEmail({ brand, signerName: client.name, agreementName: ctx.envelope.templateName, reason: `${ctx.org.name} did not countersign this agreement, so it was not completed.` }),
+        ...linkDeadEmail("not_completed", { brand, signerName: client.name, agreementName: ctx.envelope.templateName }),
       });
     }
   }
@@ -1097,7 +1297,8 @@ const METHOD_TEXT: Record<string, string> = {
 async function recordFinalizeFailure(ctx: EnvelopeContext, error: string): Promise<void> {
   try {
     const db = await getDb();
-    await db.transaction(async (tx) => {
+    await inTransaction(db, async (tx) => {
+      await lockFile(tx, ctx.org.id, ctx.file.id);
       await recordEvent(tx, {
         orgId: ctx.org.id,
         fileId: ctx.file.id,
@@ -1186,7 +1387,8 @@ export async function finalizeEnvelope(envelopeId: string): Promise<FinalizeResu
     const current = ctx;
     let won = false;
     try {
-      await db.transaction(async (tx) => {
+      await inTransaction(db, async (tx) => {
+        await lockFile(tx, current.org.id, current.file.id);
         const blob = await putBlob(tx, {
           orgId: current.org.id,
           bytes: sealed.pdf,
@@ -1236,7 +1438,18 @@ export async function finalizeEnvelope(envelopeId: string): Promise<FinalizeResu
   }
 }
 
-async function sendCompletedEmails(ctx: EnvelopeContext, pdf: Uint8Array): Promise<void> {
+export interface CompletedEmailOutcome {
+  to: string;
+  status: SendOutcome["status"];
+}
+
+/**
+ * Email the sealed copy to every signer and to the team. Returns what happened per
+ * recipient; a message the provider refused is written to the file's timeline, so
+ * a client who never got their copy is visible to the sender.
+ */
+async function sendCompletedEmails(ctx: EnvelopeContext, pdf: Uint8Array): Promise<CompletedEmailOutcome[]> {
+  const outcomes: CompletedEmailOutcome[] = [];
   try {
     const db = await getDb();
     const content = Buffer.from(pdf.buffer, pdf.byteOffset, pdf.byteLength);
@@ -1254,7 +1467,7 @@ async function sendCompletedEmails(ctx: EnvelopeContext, pdf: Uint8Array): Promi
     if (team) add(team.name, team.email, fileUrl(ctx.file.id));
 
     for (const r of recipients) {
-      await safeSend(ctx.org, {
+      const result = await safeSend(ctx.org, {
         envelopeId: ctx.envelope.id,
         kind: "completed",
         to: r.email,
@@ -1268,15 +1481,53 @@ async function sendCompletedEmails(ctx: EnvelopeContext, pdf: Uint8Array): Promi
         }),
         attachments: attached ? attachments : undefined,
       });
+      outcomes.push({ to: r.email, status: result.status });
+      if (result.status === "failed") {
+        await recordEvent(db, {
+          orgId: ctx.org.id,
+          fileId: ctx.file.id,
+          envelopeId: ctx.envelope.id,
+          type: "envelope.delivery_failed",
+          actor: systemActor(ctx.org.id),
+          data: { email: r.email, kind: "completed", error: cleanText(result.error, 300) || "The email provider did not accept the completed copy" },
+        }).catch(() => undefined);
+      }
     }
   } catch (err) {
     console.error("[signing] could not send completed emails", err instanceof Error ? err.message : err);
   }
+  return outcomes;
 }
 
-/** Envelopes that are fully signed but not sealed, oldest first, skipping ones that have failed too often. */
-export async function listUnsealedEnvelopeIds(limit: number): Promise<string[]> {
+/**
+ * Send the completed-copy emails for an envelope that is already sealed. Used by the
+ * scheduler when the request that sealed it died before its emails went out.
+ */
+export async function resendCompletedEmails(envelopeId: string): Promise<CompletedEmailOutcome[]> {
   const db = await getDb();
+  const ctx = await loadEnvelopeContext(db, envelopeId);
+  if (!ctx || ctx.envelope.status !== "completed" || !ctx.envelope.finalBlobId) return [];
+  const blob = await getBlob(ctx.org.id, ctx.envelope.finalBlobId, db);
+  if (!blob) return [];
+  return sendCompletedEmails(ctx, new Uint8Array(blob.bytes));
+}
+
+/**
+ * Envelopes that are fully signed but not sealed, oldest first. After a failure an
+ * envelope waits before it is tried again: 5 minutes, then double each time, up to
+ * 6 hours. It is never given up on, because the cause (a bad deploy, storage that
+ * was briefly down) is usually nothing to do with the document.
+ */
+export async function listUnsealedEnvelopeIds(limit: number, now: Date = new Date()): Promise<string[]> {
+  const db = await getDb();
+  const at = now instanceof Date && !Number.isNaN(now.getTime()) ? now : new Date();
+  const backingOff = sql`exists (
+    select 1 from ${eventsTable}
+    where ${eventsTable.envelopeId} = ${envelopes.id} and ${eventsTable.type} = ${FINALIZE_FAILED_EVENT}
+    having max(${eventsTable.createdAt})
+      + least(power(2::float8, least(count(*) - 1, 20)) * ${FINALIZE_RETRY_BASE_MS}::float8, ${FINALIZE_RETRY_MAX_MS}::float8) * interval '1 millisecond'
+      > ${at.toISOString()}::timestamptz
+  )`;
   const rows = await db
     .select({ id: envelopes.id })
     .from(envelopes)
@@ -1286,12 +1537,62 @@ export async function listUnsealedEnvelopeIds(limit: number): Promise<string[]> 
         isNull(envelopes.finalBlobId),
         sql`not exists (select 1 from ${signers} where ${signers.envelopeId} = ${envelopes.id} and ${signers.status} <> 'signed')`,
         sql`exists (select 1 from ${signers} where ${signers.envelopeId} = ${envelopes.id})`,
-        sql`(select count(*) from ${eventsTable} where ${eventsTable.envelopeId} = ${envelopes.id} and ${eventsTable.type} = ${FINALIZE_FAILED_EVENT}) < ${MAX_FINALIZE_ATTEMPTS}`,
+        sql`not ${backingOff}`,
       ),
     )
     .orderBy(asc(envelopes.updatedAt))
     .limit(Math.max(1, Math.min(100, Math.floor(limit) || 10)));
   return rows.map((r) => r.id);
+}
+
+/** True when every signer has signed but the sealed copy does not exist yet. */
+export function awaitingSeal(ctx: EnvelopeContext): boolean {
+  return ctx.envelope.status === "client_signed" && !ctx.envelope.finalBlobId && ctx.signers.length > 0 && ctx.signers.every((s) => s.status === "signed");
+}
+
+// ---------------------------------------------------------------------------
+// Emails about a link that stopped working
+// ---------------------------------------------------------------------------
+
+export type LinkDeadKind = "voided" | "expired" | "not_completed";
+
+/**
+ * What a signer is told when their link dies. The wording follows what happened:
+ * the company cancelling, the link running out of time, and the company not
+ * countersigning are three different things to the person reading.
+ */
+export function linkDeadEmail(
+  kind: LinkDeadKind,
+  input: { brand: Brand; signerName: string; agreementName: string; reason?: string | null; expiredOn?: string | null },
+): EmailContent {
+  if (kind === "voided") return voidedEmail(input);
+  const org = cleanText(input.brand.orgName, 120) || "Your service provider";
+  const agreement = cleanText(input.agreementName, 200) || "the agreement";
+  const name = cleanText(input.signerName, 120);
+  const on = cleanText(input.expiredOn, 40);
+  const subject = kind === "expired" ? `Your signing link for ${agreement} has expired` : `${agreement} with ${org} was not completed`;
+  const paragraphs =
+    kind === "expired"
+      ? [
+          name ? `Hi ${name},` : "Hello,",
+          `The link ${org} sent you to sign ${agreement} expired${on ? ` on ${on}` : ""} before the agreement was signed, so it no longer works.`,
+          `If you still want to sign, contact ${org} and ask them to send the agreement again. You will get a new link.`,
+        ]
+      : [
+          name ? `Hi ${name},` : "Hello,",
+          `You signed ${agreement}, but ${org} did not countersign it, so the agreement was not completed and is not in effect.`,
+          `The link you were sent no longer works. Contact ${org} if you were expecting the agreement to go ahead.`,
+        ];
+  const footer = `Sent by ${org} through ${PRODUCT_NAME}, the service ${org} uses to get agreements signed.`;
+  const font = "font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif;";
+  const html =
+    `<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><title>${escapeHtml(subject)}</title></head>` +
+    `<body style="margin:0;padding:24px;background-color:#ffffff;">` +
+    `<p style="${font}font-size:18px;font-weight:bold;color:#111827;margin:0 0 16px;">${escapeHtml(org)}</p>` +
+    paragraphs.map((text) => `<p style="${font}font-size:16px;line-height:24px;color:#1f2937;margin:0 0 16px;">${escapeHtml(text)}</p>`).join("") +
+    `<p style="${font}font-size:12px;line-height:18px;color:#6b7280;margin:24px 0 0;">${escapeHtml(footer)}</p>` +
+    `</body></html>`;
+  return { subject, html, text: [...paragraphs, "--", footer].join("\n\n") + "\n" };
 }
 
 // ---------------------------------------------------------------------------
@@ -1320,10 +1621,10 @@ export type VerifyResult =
  */
 export async function verifyDocument(input: { sha256?: unknown } | null | undefined, meta?: RequestMeta): Promise<VerifyResult> {
   const ip = cleanText(meta?.ip, 64);
-  if (ip) {
-    const limit = await rateLimit(`verify:ip:${ip}`, 60, 60);
-    if (!limit.ok) throw new ServiceError("rate_limited", `Too many checks. Try again ${describeWait(limit.retryAfterSeconds)}.`);
-  }
+  // Callers whose address the route could not determine share one counter, so a
+  // missing header can never mean "no limit".
+  const limit = ip ? await rateLimit(`verify:ip:${ip}`, 60, 60) : await rateLimit("verify:ip:unknown", 300, 60);
+  if (!limit.ok) throw new ServiceError("rate_limited", `Too many checks. Try again ${describeWait(limit.retryAfterSeconds)}.`);
   const raw = typeof input?.sha256 === "string" ? input.sha256.trim().toLowerCase() : "";
   if (!/^[0-9a-f]{64}$/.test(raw)) return { found: false };
   const db = await getDb();

@@ -15,6 +15,7 @@ import {
   archiveTemplate,
   createTemplateFromPageImages,
   createTemplateFromText,
+  createTemplateFromCompletedUpload,
   createTemplateFromUpload,
   disableIntakeLink,
   duplicateTemplate,
@@ -30,10 +31,13 @@ import {
   renameTemplate,
   replaceTemplateDocument,
   setDefaultTemplate,
+  resolveCountersigner,
   templateReadiness,
   updateTemplateFields,
   type ReadinessMember,
 } from "@/lib/services/templates";
+import { beginUpload, putChunk } from "@/lib/services/uploads";
+import { uploadChunks } from "@/lib/db/schema";
 
 // ---------------------------------------------------------------------------
 // Fixtures (test data only)
@@ -145,7 +149,7 @@ async function readyTemplate(actor: Actor, name?: string): Promise<Template> {
   return updateTemplateFields(actor, created.id, [field()], created.version);
 }
 
-async function addEnvelope(orgId: string, template: Template, status: "draft" | "sent" | "completed", sent: boolean): Promise<string> {
+async function addEnvelope(orgId: string, template: Template, status: "draft" | "sent" | "completed" | "voided", sent: boolean): Promise<string> {
   const db = await getDb();
   const fileId = newId("file");
   await db.insert(files).values({ id: fileId, orgId, reference: fileId, clientName: "Jordan Sample", clientEmail: "jordan.sample@example.test" });
@@ -387,7 +391,10 @@ describe("reading templates", () => {
     const a = await readyTemplate(w.owner, "A");
     const b = await readyTemplate(w.owner, "B");
     const theirs = await readyTemplate(other.owner, "Theirs");
+    // A draft has a working link (shared by hand when email is off), so it counts as sent...
     await addEnvelope(w.orgId, a, "draft", false);
+    // ...unless it was voided before it ever reached the client.
+    await addEnvelope(w.orgId, a, "voided", false);
     await addEnvelope(w.orgId, a, "sent", true);
     await addEnvelope(w.orgId, a, "completed", true);
     await addEnvelope(w.orgId, a, "completed", true);
@@ -395,7 +402,7 @@ describe("reading templates", () => {
 
     const list = await listTemplates(w.owner);
     expect(list).toHaveLength(2);
-    expect(list.find((t) => t.id === a.id)).toMatchObject({ sentCount: 3, signedCount: 2 });
+    expect(list.find((t) => t.id === a.id)).toMatchObject({ sentCount: 4, signedCount: 2 });
     expect(list.find((t) => t.id === b.id)).toMatchObject({ sentCount: 0, signedCount: 0 });
     expect(list.every((t) => t.orgId === w.orgId && t.readiness.ready)).toBe(true);
     expect((await listTemplates(other.owner)).map((t) => [t.id, t.sentCount, t.signedCount])).toEqual([[theirs.id, 1, 1]]);
@@ -635,7 +642,10 @@ describe("updateTemplateFields", () => {
     const { template: active } = await activateTemplate(w.owner, t.id);
     await expectError(updateTemplateFields(w.owner, active.id, [], active.version), "not_ready", /in use.*nowhere for the client to sign/);
     await expectError(updateTemplateFields(w.owner, active.id, [field({ required: false })], active.version), "not_ready", /optional/);
-    await expectError(updateTemplateFields(w.owner, active.id, [field(), field({ role: "company", y: 0.8 })], active.version), "not_ready", /countersign/);
+    // Company fields are fine (the owner countersigns when nobody is chosen) unless countersigning could not happen.
+    await setSettings(w.orgId, { countersignMode: "auto" });
+    await expectError(updateTemplateFields(w.owner, active.id, [field(), field({ role: "company", y: 0.8 })], active.version), "not_ready", /saved signature/);
+    await setSettings(w.orgId, {});
     expect((await getTemplate(w.owner, active.id)).version).toBe(active.version);
     const ok = await updateTemplateFields(w.owner, active.id, [field(), field({ type: "date_signed", y: 0.8, label: "Date" })], active.version);
     expect(ok.fields).toHaveLength(2);
@@ -669,7 +679,16 @@ describe("templateReadiness", () => {
 
   it("needs a countersigner when the company signs, and a saved signature only in auto mode", () => {
     const fields = [field(), field({ id: "co", role: "company", y: 0.8 })];
+    // Nobody chosen and no owner in sight: there is nobody to countersign.
     expect(codes(templateReadiness({ fields, pages }, { settings: {} }, people))).toEqual(["no_countersigner"]);
+    // Nobody chosen: the active owner countersigns, by the same rule sending uses.
+    const withOwner: ReadinessMember[] = [...people, { id: "usr_old_owner", disabled: true, hasSignature: true, role: "owner" }, { id: "usr_owner", disabled: false, hasSignature: false, role: "owner" }];
+    expect(templateReadiness({ fields, pages }, { settings: {} }, withOwner).ready).toBe(true);
+    expect(resolveCountersigner({}, withOwner).member?.id).toBe("usr_owner");
+    expect(codes(templateReadiness({ fields, pages }, { settings: { countersignMode: "auto" } }, withOwner))).toEqual(["countersigner_no_signature"]);
+    // A chosen person who has left is a problem to fix, never silently swapped for the owner.
+    expect(resolveCountersigner({ countersignerUserId: "usr_gone" }, withOwner)).toMatchObject({ member: null, problem: { code: "countersigner_unavailable" } });
+    expect(resolveCountersigner(null, null)).toMatchObject({ member: null, problem: { code: "no_countersigner" } });
     expect(codes(templateReadiness({ fields, pages }, { settings: { countersignerUserId: "usr_missing" } }, people))).toEqual(["countersigner_unavailable"]);
     expect(codes(templateReadiness({ fields, pages }, { settings: { countersignerUserId: "usr_gone" } }, people))).toEqual(["countersigner_unavailable"]);
     expect(templateReadiness({ fields, pages }, { settings: { countersignerUserId: "usr_nosig" } }, people).ready).toBe(true);
@@ -733,8 +752,15 @@ describe("activating, default and archiving", () => {
     expect(err.fields).toHaveProperty("no_client_signature");
     expect((await getTemplate(w.owner, t.id)).status).toBe("draft");
 
-    const withCompany = await updateTemplateFields(w.owner, t.id, [field(), field({ role: "company", y: 0.8 })], empty.version);
-    await expectError(activateTemplate(w.owner, withCompany.id), "not_ready", /nobody is chosen to countersign/);
+  });
+
+  it("activates an agreement with company fields straight after sign-up: the owner countersigns until someone is chosen", async () => {
+    const w = await makeWorld();
+    const t = await createPdfTemplate(w.owner);
+    const withCompany = await updateTemplateFields(w.owner, t.id, [field(), field({ role: "company", y: 0.8 })], t.version);
+    expect((await getTemplateReadiness(w.owner, withCompany.id)).ready).toBe(true);
+    expect((await activateTemplate(w.owner, withCompany.id)).template.status).toBe("active");
+    expect((await listTemplates(w.owner)).find((x) => x.id === t.id)?.readiness.ready).toBe(true);
   });
 
   it("activates once a countersigner is set, and in auto mode once they have a saved signature", async () => {
@@ -1156,5 +1182,66 @@ describe("previewTemplatePdf", () => {
     await db.update(templates).set({ fields: junk }).where(eq(templates.id, t.id));
     expect((await previewTemplatePdf(w.owner, t.id)).byteLength).toBeGreaterThan(0);
     expect((await listTemplates(w.owner))[0].readiness.ready).toBe(false);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Regression: an upload survives whatever happens while the agreement is made from it
+// ---------------------------------------------------------------------------
+
+describe("createTemplateFromCompletedUpload", () => {
+  async function upload(actor: Actor, bytes: Uint8Array, filename = "Engagement Letter.pdf") {
+    const begun = await beginUpload(actor, { filename, size: bytes.length, mimeType: "application/pdf" });
+    for (let i = 0; i < begun.chunkCount; i++) {
+      await putChunk(actor, begun.uploadId, i, bytes.subarray(i * begun.chunkSize, Math.min(bytes.length, (i + 1) * begun.chunkSize)));
+    }
+    return begun.uploadId;
+  }
+  async function partsLeft(orgId: string): Promise<number> {
+    const db = await getDb();
+    return (await db.select({ idx: uploadChunks.idx }).from(uploadChunks).where(eq(uploadChunks.orgId, orgId))).length;
+  }
+
+  it("creates the agreement and only then removes the uploaded parts", async () => {
+    const w = await makeWorld();
+    const uploadId = await upload(w.owner, await agreementPdf());
+    const template = await createTemplateFromCompletedUpload(w.owner, uploadId, { name: "Engagement letter" });
+    expect(template).toMatchObject({ orgId: w.orgId, status: "draft", name: "Engagement letter" });
+    expect(hasRequiredClientSignature(template.fields)).toBe(true);
+    expect(await partsLeft(w.orgId)).toBe(0);
+    // The response was lost and the browser asks again: it is told where to look, not to upload 25 MB again blind.
+    await expectError(createTemplateFromCompletedUpload(w.owner, uploadId), "not_found", /check your list of agreements/);
+    expect(await listTemplates(w.owner)).toHaveLength(1);
+  });
+
+  it("keeps the parts when the document cannot be used, so the same upload can be tried again", async () => {
+    const w = await makeWorld();
+    const uploadId = await upload(w.owner, await encryptedPdf(), "Locked.pdf");
+    await expectDocumentError(createTemplateFromCompletedUpload(w.owner, uploadId), "password_protected");
+    expect(await partsLeft(w.orgId)).toBe(1);
+    // Not locked out by the failed attempt: the retry gets the same answer straight away, not "already being processed".
+    await expectDocumentError(createTemplateFromCompletedUpload(w.owner, uploadId), "password_protected");
+    expect(await listTemplates(w.owner)).toHaveLength(0);
+  });
+
+  it("a double click creates one agreement", async () => {
+    const w = await makeWorld();
+    const uploadId = await upload(w.owner, await agreementPdf());
+    const results = await Promise.allSettled([createTemplateFromCompletedUpload(w.owner, uploadId), createTemplateFromCompletedUpload(w.owner, uploadId)]);
+    expect(results.filter((r) => r.status === "fulfilled")).toHaveLength(1);
+    const lost = results.find((r) => r.status === "rejected") as PromiseRejectedResult;
+    expect(lost.reason).toBeInstanceOf(ServiceError);
+    expect(["conflict", "not_found"]).toContain((lost.reason as ServiceError).code);
+    expect(await listTemplates(w.owner)).toHaveLength(1);
+  });
+
+  it("is refused for another company and for a member who may not upload", async () => {
+    const w = await makeWorld();
+    const other = await makeWorld("Other Test Co");
+    const member = await addUser(w.orgId, "member");
+    const uploadId = await upload(w.owner, await agreementPdf());
+    await expectError(createTemplateFromCompletedUpload(other.owner, uploadId), "not_found");
+    await expectError(createTemplateFromCompletedUpload(member, uploadId), "forbidden");
+    expect(await partsLeft(w.orgId)).toBe(1);
   });
 });

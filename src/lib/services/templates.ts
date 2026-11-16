@@ -7,7 +7,7 @@
  * change what a client was shown.
  */
 import { deflateSync } from "node:zlib";
-import { and, eq, isNull, ne, sql } from "drizzle-orm";
+import { and, asc, eq, isNull, ne, sql } from "drizzle-orm";
 import { getDb, type DbOrTx, type Tx } from "@/lib/db";
 import { envelopes, orgs, templates, users, type Org, type Template } from "@/lib/db/schema";
 import { env } from "@/lib/env";
@@ -22,6 +22,8 @@ import { resolveSettings } from "./accounts";
 import { deleteBlob, getBlob, putBlob } from "./blobs";
 import { ServiceError, type Actor, type RequestMeta } from "./context";
 import { recordEvent } from "./events";
+import { clearRateLimit, rateLimit } from "./rate-limit";
+import { completeUpload, discardUpload } from "./uploads";
 
 // ---------------------------------------------------------------------------
 // Public shapes
@@ -97,6 +99,8 @@ export interface ReadinessMember {
   id: string;
   disabled: boolean;
   hasSignature: boolean;
+  /** Needed to find the owner who countersigns when nobody has been chosen. */
+  role?: "owner" | "admin" | "member";
 }
 
 export interface TemplateSummary extends Template {
@@ -198,10 +202,12 @@ async function loadTemplate(db: DbOrTx, orgId: string, id: unknown): Promise<Tem
 async function loadReadinessMembers(db: DbOrTx, orgId: string): Promise<ReadinessMember[]> {
   // The signature image itself can be hundreds of kilobytes per person; only ask whether it exists.
   const rows = await db
-    .select({ id: users.id, disabledAt: users.disabledAt, hasSignature: sql<boolean>`${users.savedSignature} is not null` })
+    .select({ id: users.id, role: users.role, disabledAt: users.disabledAt, hasSignature: sql<boolean>`${users.savedSignature} is not null` })
     .from(users)
-    .where(eq(users.orgId, orgId));
-  return rows.map((r) => ({ id: r.id, disabled: r.disabledAt !== null, hasSignature: Boolean(r.hasSignature) }));
+    .where(eq(users.orgId, orgId))
+    // Oldest first, so "the owner" is the same person every time when there are several.
+    .orderBy(asc(users.createdAt), asc(users.id));
+  return rows.map((r) => ({ id: r.id, role: r.role, disabled: r.disabledAt !== null, hasSignature: Boolean(r.hasSignature) }));
 }
 
 function companyNameOf(org: Org): string {
@@ -385,6 +391,37 @@ export async function createTemplateFromUpload(
   return insertTemplate(actor, org, prepared, name, { bytes, contentType: mimeType, filename }, prepared.ingested.sourceKind, meta);
 }
 
+/**
+ * Finish a chunked upload and create the draft agreement from it, as one step that
+ * is safe to repeat. The uploaded parts are only removed after the agreement is
+ * stored, so if this times out or its response is lost the same call works again
+ * without a new upload. A second call while the first is still working is turned
+ * away, so a double click cannot create two agreements.
+ */
+export async function createTemplateFromCompletedUpload(actor: Actor, uploadId: unknown, input: { name?: unknown } = {}, meta?: RequestMeta): Promise<Template> {
+  const upload = await completeUpload(actor, uploadId);
+  const claimKey = `upload:finish:${upload.id}`;
+  const claim = await rateLimit(claimKey, 1, 120);
+  if (!claim.ok) {
+    throw new ServiceError("conflict", "This upload is already being turned into an agreement. Wait a moment, then check your list of agreements.");
+  }
+  let template: Template;
+  try {
+    template = await createTemplateFromUpload(actor, { bytes: upload.bytes, filename: upload.filename, mimeType: upload.mimeType, name: asRecord(input).name }, meta);
+  } catch (err) {
+    // The parts are still there, so the person can try again straight away (for example as page images).
+    await clearRateLimit(claimKey);
+    throw err;
+  }
+  try {
+    await discardUpload(actor, uploadId);
+  } catch (err) {
+    // The agreement exists; leftover parts are removed by the scheduler.
+    console.error("[templates] could not discard a finished upload", err instanceof Error ? err.message : err);
+  }
+  return template;
+}
+
 /** Create a draft agreement from text someone pasted in. */
 export async function createTemplateFromText(actor: Actor, input: { text: unknown; name?: unknown }, meta?: RequestMeta): Promise<Template> {
   const db = await getDb();
@@ -450,7 +487,9 @@ export async function listTemplates(actor: Actor): Promise<TemplateSummary[]> {
   const counts = await db
     .select({
       templateId: envelopes.templateId,
-      sent: sql<number>`(count(*) filter (where ${envelopes.sentAt} is not null))::int`,
+      // An envelope has a working link from the moment it exists, emailed or shared by hand.
+      // One that was voided before it ever reached the client does not count as sent.
+      sent: sql<number>`(count(*) filter (where ${envelopes.sentAt} is not null or ${envelopes.status} <> 'voided'))::int`,
       signed: sql<number>`(count(*) filter (where ${envelopes.status} = 'completed'))::int`,
     })
     .from(envelopes)
@@ -648,6 +687,56 @@ function listLabels(fields: Field[]): string {
 }
 
 /**
+ * Who signs for the company, by the one rule every path uses (activation, the
+ * readiness badge, sending from the app, the API, imports and the intake link):
+ * the person chosen in Settings, or the company's owner when nobody is chosen.
+ * A chosen person who is no longer active is a problem to fix, never a silent swap.
+ */
+export function resolveCountersigner<M extends ReadinessMember>(
+  settings: Pick<OrgSettings, "countersignerUserId" | "countersignMode"> | null | undefined,
+  members: readonly M[] | null | undefined,
+): { member: M | null; problem: ReadinessProblem | null } {
+  const team = (members ?? []).filter((m): m is M => Boolean(m) && typeof m === "object");
+  const chosenId = typeof settings?.countersignerUserId === "string" ? settings.countersignerUserId : "";
+  let member: M | null = null;
+  if (chosenId) {
+    member = team.find((m) => m.id === chosenId && !m.disabled) ?? null;
+    if (!member) {
+      return {
+        member: null,
+        problem: {
+          code: "countersigner_unavailable",
+          message: "The person chosen to countersign is no longer an active member of your team. Choose another countersigner in Settings.",
+        },
+      };
+    }
+  } else {
+    member = team.find((m) => m.role === "owner" && !m.disabled) ?? null;
+    if (!member) {
+      return {
+        member: null,
+        problem: {
+          code: "no_countersigner",
+          message: "This agreement has fields for your company to sign, but nobody is chosen to countersign. Choose a countersigner in Settings, or remove the company fields.",
+        },
+      };
+    }
+  }
+  if (settings?.countersignMode === "auto" && !member.hasSignature) {
+    return {
+      member,
+      problem: {
+        code: "countersigner_no_signature",
+        message: chosenId
+          ? "Countersigning is set to automatic, but the countersigner has no saved signature. Have them save a signature in their profile, or switch countersigning to manual in Settings."
+          : "Countersigning is set to automatic, but the owner, who countersigns when nobody else is chosen, has no saved signature. Save a signature in the owner's profile, choose a countersigner in Settings, or switch countersigning to manual.",
+      },
+    };
+  }
+  return { member, problem: null };
+}
+
+/**
  * Whether an agreement can be sent right now, and if not, what to fix. Checked before
  * activation and again before every send, because team and settings changes after
  * activation (the countersigner leaving, a signature being cleared) can break it.
@@ -702,25 +791,8 @@ export function templateReadiness(
   }
 
   if (fields.some((f) => f.role === "company")) {
-    const settings = resolveSettings(org);
-    const countersignerId = typeof settings.countersignerUserId === "string" ? settings.countersignerUserId : "";
-    const person = countersignerId ? (members ?? []).find((m) => m && m.id === countersignerId) : undefined;
-    if (!countersignerId) {
-      problems.push({
-        code: "no_countersigner",
-        message: "This agreement has fields for your company to sign, but nobody is chosen to countersign. Choose a countersigner in Settings, or remove the company fields.",
-      });
-    } else if (!person || person.disabled) {
-      problems.push({
-        code: "countersigner_unavailable",
-        message: "The person chosen to countersign is no longer an active member of your team. Choose another countersigner in Settings.",
-      });
-    } else if (settings.countersignMode === "auto" && !person.hasSignature) {
-      problems.push({
-        code: "countersigner_no_signature",
-        message: "Countersigning is set to automatic, but the countersigner has no saved signature. Have them save a signature in their profile, or switch countersigning to manual in Settings.",
-      });
-    }
+    const { problem } = resolveCountersigner(resolveSettings(org), members);
+    if (problem) problems.push(problem);
   }
 
   return { ready: problems.length === 0, problems };

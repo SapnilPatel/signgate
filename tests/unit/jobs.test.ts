@@ -17,13 +17,13 @@ vi.mock("@/lib/pdf", async (importOriginal) => {
 });
 
 import { getDb } from "@/lib/db";
-import { authTokens, envelopes, events, files, orgs, rateLimits, sessions, signers, templates, uploadChunks, users, webhookDeliveries, webhooks, type Envelope, type FileRow, type Org, type Signer, type Template, type User } from "@/lib/db/schema";
+import { authTokens, emailLog, envelopes, events, files, orgs, rateLimits, sessions, signers, templates, uploadChunks, users, webhookDeliveries, webhooks, type Envelope, type FileRow, type Org, type Signer, type Template, type User } from "@/lib/db/schema";
 import { newId } from "@/lib/ids";
 import type { Field, OrgSettings } from "@/lib/types";
 import { ServiceError, type Actor } from "@/lib/services/context";
 import { putBlob } from "@/lib/services/blobs";
 import { clearTestOutbox, getTestOutbox, setTestEmailFailure, setTestEmailUnconfigured } from "@/lib/services/email";
-import { countersign, sendAgreementForFile, voidEnvelope } from "@/lib/services/envelopes";
+import { countersign, getEnvelope, sendAgreementForFile, voidEnvelope } from "@/lib/services/envelopes";
 import { declineSigning, getSignedCopy, getSigningSession, submitSigning } from "@/lib/services/signing";
 import { runScheduledJobs } from "@/lib/services/jobs";
 
@@ -230,6 +230,7 @@ beforeEach(async () => {
 
 const DAY = 86_400_000;
 const inDays = (days: number) => new Date(Date.now() + days * DAY + 60_000);
+const inMinutes = (minutes: number) => new Date(Date.now() + minutes * 60_000);
 
 describe("reminders", () => {
   it("reminds a client who has not signed, on schedule, and stops at the cap", async () => {
@@ -281,7 +282,8 @@ describe("reminders", () => {
     const summary = await runScheduledJobs(inDays(3));
     expect(summary.reminders.sent).toBe(1);
     expect(getTestOutbox().filter((m) => m.kind === "reminder").map((m) => m.to)).toEqual([viewed.file.clientEmail]);
-    expect((await envelopeRow(signed.envelopeId)).reminderCount).toBe(0);
+    // The client who signed is never reminded; from then on the schedule chases the countersigner instead.
+    expect(mailTo(signed.file.clientEmail, "reminder")).toHaveLength(0);
 
     // Signing between two runs stops the reminders that were scheduled.
     await sign(viewed.secret);
@@ -430,12 +432,14 @@ describe("finalization retry", () => {
     expect((await envelopeRow(envelopeId)).status).toBe("client_signed");
     expect((await signerRows(envelopeId)).map((s) => s.status)).toEqual(["signed", "signed"]);
 
-    const failed = await runScheduledJobs();
+    // Straight after a failure the scheduler waits; five minutes later it tries again.
+    expect((await runScheduledJobs()).finalized).toEqual({ completed: 0, failed: 0 });
+    const failed = await runScheduledJobs(inMinutes(6));
     expect(failed.finalized).toEqual({ completed: 0, failed: 1 });
     expect((await fileRow(file.id)).agreementStatus).toBe("needs_attention");
 
     seal.fail = false;
-    const runs = await Promise.all([runScheduledJobs(), runScheduledJobs()]);
+    const runs = await Promise.all([runScheduledJobs(inMinutes(30)), runScheduledJobs(inMinutes(30))]);
     expect(runs.reduce((n, r) => n + r.finalized.completed, 0)).toBe(1);
     const envelope = await envelopeRow(envelopeId);
     expect(envelope.status).toBe("completed");
@@ -516,5 +520,191 @@ describe("housekeeping", () => {
       expect(summary.errors).toEqual([]);
     }
     expect((await db.select().from(webhookDeliveries).where(eq(webhookDeliveries.webhookId, hookId)))[0].status).not.toBe("pending");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Regression tests for review findings
+// ---------------------------------------------------------------------------
+
+describe("chasing the countersigner", () => {
+  it("reminds the countersigner on the company's cadence, then flags the file, and never expires the agreement", async () => {
+    const world = await makeWorld({ company: true, settings: { reminderEveryDays: 2, maxReminders: 2, expireAfterDays: 5 } });
+    const admin = await addUser(world.org.id, "admin");
+    await setSettings(world.org.id, { reminderEveryDays: 2, maxReminders: 2, expireAfterDays: 5, countersignerUserId: admin.id });
+    const { envelopeId, secret, file } = await sendOne(world);
+    await sign(secret);
+    expect(mailTo(admin.email, "countersign_request")).toHaveLength(1);
+    expect(await envelopeRow(envelopeId)).toMatchObject({ status: "client_signed", reminderCount: 0 });
+    expect((await envelopeRow(envelopeId)).nextReminderAt).toBeInstanceOf(Date);
+
+    // Not yet due.
+    expect((await runScheduledJobs(inDays(1))).countersign).toEqual({ reminded: 0, failed: 0, escalated: 0 });
+
+    // Due: reminded once even with two runners.
+    const runs = await Promise.all([runScheduledJobs(inDays(2)), runScheduledJobs(inDays(2))]);
+    expect(runs.reduce((n, r) => n + r.countersign.reminded, 0)).toBe(1);
+    expect(mailTo(admin.email, "countersign_request")).toHaveLength(2);
+    expect((await envelopeRow(envelopeId)).reminderCount).toBe(1);
+    expect((await runScheduledJobs(inDays(3))).countersign.reminded).toBe(0);
+
+    expect((await runScheduledJobs(inDays(4))).countersign.reminded).toBe(1);
+    expect(mailTo(admin.email, "countersign_request")).toHaveLength(3);
+    // The client is never chased for the company's delay.
+    expect(mailTo(file.clientEmail, "reminder")).toHaveLength(0);
+
+    // Reminders used up: the file is flagged for the team, once.
+    const escalated = await runScheduledJobs(inDays(6));
+    expect(escalated.countersign).toEqual({ reminded: 0, failed: 0, escalated: 1 });
+    expect(escalated.expired).toBe(0);
+    expect((await fileRow(file.id)).agreementStatus).toBe("needs_attention");
+    expect(count(await eventTypes(envelopeId), "countersign.overdue")).toBe(1);
+    const trail = (await getEnvelope(world.actor, envelopeId)).events;
+    expect(String(trail.find((e) => e.type === "countersign.overdue")?.data.reason)).toMatch(/has not countersigned after 2 reminders/);
+    const later = await runScheduledJobs(inDays(45));
+    expect(later.countersign).toEqual({ reminded: 0, failed: 0, escalated: 0 });
+    expect(later.expired).toBe(0);
+    expect(mailTo(admin.email, "countersign_request")).toHaveLength(3);
+    expect((await envelopeRow(envelopeId)).status).toBe("client_signed");
+
+    // It can still be finished, which clears the flag.
+    expect((await countersign(world.actor, envelopeId, { signature: SIGNATURE })).completed).toBe(true);
+    expect((await fileRow(file.id)).agreementStatus).toBe("signed");
+    expect((await runScheduledJobs(inDays(60))).countersign).toEqual({ reminded: 0, failed: 0, escalated: 0 });
+  });
+
+  it("still chases when client reminders are switched off, and stops as soon as it is countersigned", async () => {
+    const world = await makeWorld({ company: true, settings: { reminderEveryDays: 0, expireAfterDays: 0 } });
+    const { envelopeId, secret } = await sendOne(world);
+    expect((await envelopeRow(envelopeId)).nextReminderAt).toBeNull();
+    await sign(secret);
+    clearTestOutbox();
+    expect((await runScheduledJobs(inDays(2))).countersign.reminded).toBe(1);
+    expect(mailTo(world.owner.email, "countersign_request")).toHaveLength(1);
+    await countersign(world.actor, envelopeId, { signature: SIGNATURE });
+    clearTestOutbox();
+    expect((await runScheduledJobs(inDays(30))).countersign).toEqual({ reminded: 0, failed: 0, escalated: 0 });
+    expect(getTestOutbox().filter((m) => m.kind === "countersign_request")).toHaveLength(0);
+  });
+
+  it("flags the file straight away when the countersigner can no longer sign", async () => {
+    const world = await makeWorld({ company: true, settings: { expireAfterDays: 0 } });
+    const admin = await addUser(world.org.id, "admin");
+    await setSettings(world.org.id, { expireAfterDays: 0, countersignerUserId: admin.id });
+    const { envelopeId, secret, file } = await sendOne(world);
+    await sign(secret);
+    const db = await getDb();
+    await db.update(users).set({ disabledAt: new Date() }).where(eq(users.id, admin.id));
+    clearTestOutbox();
+    const summary = await runScheduledJobs(inDays(2));
+    expect(summary.countersign).toEqual({ reminded: 0, failed: 0, escalated: 1 });
+    expect(mailTo(admin.email)).toHaveLength(0);
+    expect((await fileRow(file.id)).agreementStatus).toBe("needs_attention");
+    expect(await eventTypes(envelopeId)).toContain("countersign.overdue");
+  });
+
+  it("counts a reminder that could not be delivered and records it on the file", async () => {
+    const world = await makeWorld({ company: true, settings: { expireAfterDays: 0 } });
+    const { envelopeId, secret } = await sendOne(world);
+    await sign(secret);
+    setTestEmailFailure("Mailbox full", world.owner.email);
+    const summary = await runScheduledJobs(inDays(2));
+    expect(summary.countersign).toEqual({ reminded: 0, failed: 1, escalated: 0 });
+    expect(summary.errors).toEqual([]);
+    expect(await eventTypes(envelopeId)).toContain("envelope.delivery_failed");
+  });
+});
+
+describe("emails owed by a request that died", () => {
+  /** Puts an envelope in the state a killed function leaves behind: committed, but no trace of the email step. */
+  async function forgetEmails(envelopeId: string, kinds: string[], eventTypesToDrop: string[]): Promise<void> {
+    const db = await getDb();
+    for (const kind of kinds) await db.delete(emailLog).where(and(eq(emailLog.envelopeId, envelopeId), eq(emailLog.kind, kind)));
+    for (const type of eventTypesToDrop) await db.delete(events).where(and(eq(events.envelopeId, envelopeId), eq(events.type, type)));
+  }
+
+  it("sends the signing request of a draft that was never attempted, once", async () => {
+    const world = await makeWorld({ settings: { expireAfterDays: 0, reminderEveryDays: 0 } });
+    const { envelopeId, file } = await sendOne(world);
+    const db = await getDb();
+    await forgetEmails(envelopeId, ["signing_request"], ["envelope.sent"]);
+    await db.update(envelopes).set({ status: "draft", sentAt: null }).where(eq(envelopes.id, envelopeId));
+    clearTestOutbox();
+
+    // Too fresh: the original request may still be working on it.
+    expect((await runScheduledJobs()).recovered.requests).toBe(0);
+    expect(mailTo(file.clientEmail)).toHaveLength(0);
+
+    const runs = await Promise.all([runScheduledJobs(inMinutes(10)), runScheduledJobs(inMinutes(10))]);
+    expect(runs.reduce((n, r) => n + r.recovered.requests, 0)).toBe(1);
+    expect(runs.flatMap((r) => r.errors)).toEqual([]);
+    expect(mailTo(file.clientEmail, "signing_request")).toHaveLength(1);
+    const envelope = await envelopeRow(envelopeId);
+    expect(envelope.status).toBe("sent");
+    expect(envelope.sentAt).toBeInstanceOf(Date);
+    expect(count(await eventTypes(envelopeId), "envelope.sent")).toBe(1);
+    expect((await runScheduledJobs(inMinutes(40))).recovered.requests).toBe(0);
+    expect(mailTo(file.clientEmail, "signing_request")).toHaveLength(1);
+  });
+
+  it("leaves alone a draft whose delivery was attempted and failed, or whose link is shared by hand", async () => {
+    const world = await makeWorld({ settings: { expireAfterDays: 0, reminderEveryDays: 0 } });
+    const bounced = await makeFile(world.org.id);
+    setTestEmailFailure("Bounced", bounced.clientEmail);
+    await sendAgreementForFile(world.actor, bounced.id);
+    setTestEmailFailure(null);
+    setTestEmailUnconfigured(true);
+    await sendOne(world);
+    setTestEmailUnconfigured(false);
+    clearTestOutbox();
+    const summary = await runScheduledJobs(inMinutes(10));
+    expect(summary.recovered).toEqual({ requests: 0, completed: 0, countersign: 0 });
+    expect(getTestOutbox()).toHaveLength(0);
+  });
+
+  it("sends the completed copies of an agreement that was sealed but never emailed, once", async () => {
+    const world = await makeWorld({ settings: { expireAfterDays: 0 } });
+    const { envelopeId, secret, file } = await sendOne(world);
+    await sign(secret);
+    expect((await envelopeRow(envelopeId)).status).toBe("completed");
+    await forgetEmails(envelopeId, ["completed"], []);
+    clearTestOutbox();
+
+    expect((await runScheduledJobs()).recovered.completed).toBe(0);
+    const summary = await runScheduledJobs(inMinutes(10));
+    expect(summary.recovered.completed).toBe(1);
+    const copies = getTestOutbox().filter((m) => m.kind === "completed");
+    expect(copies.map((m) => m.to).sort()).toEqual([file.clientEmail, world.owner.email].sort());
+    expect(copies[0].attachments).toHaveLength(1);
+    expect((await runScheduledJobs(inMinutes(40))).recovered.completed).toBe(0);
+    expect(getTestOutbox().filter((m) => m.kind === "completed")).toHaveLength(2);
+  });
+
+  it("asks the countersigner who was never asked", async () => {
+    const world = await makeWorld({ company: true, settings: { expireAfterDays: 0 } });
+    const { envelopeId, secret } = await sendOne(world);
+    await sign(secret);
+    await forgetEmails(envelopeId, ["countersign_request"], ["countersign.requested"]);
+    clearTestOutbox();
+    expect((await runScheduledJobs()).recovered.countersign).toBe(0);
+    expect((await runScheduledJobs(inMinutes(10))).recovered.countersign).toBe(1);
+    expect(mailTo(world.owner.email, "countersign_request")).toHaveLength(1);
+    expect((await runScheduledJobs(inMinutes(40))).recovered.countersign).toBe(0);
+    expect(mailTo(world.owner.email, "countersign_request")).toHaveLength(1);
+  });
+});
+
+describe("what the client hears about an expiry", () => {
+  it("is told the link expired and how to get a new one, not that the company cancelled", async () => {
+    const world = await makeWorld({ settings: { expireAfterDays: 7 } });
+    const { file } = await sendOne(world);
+    clearTestOutbox();
+    expect((await runScheduledJobs(inDays(7))).expired).toBe(1);
+    const [toClient] = mailTo(file.clientEmail);
+    expect(toClient.kind).toBe("link_expired");
+    expect(toClient.subject).toMatch(/Your signing link for Client Services Agreement has expired/);
+    expect(`${toClient.subject} ${toClient.text}`).not.toMatch(/cancel/i);
+    expect(toClient.text).toMatch(/ask them to send the agreement again/);
+    expect(mailTo(file.clientEmail, "voided")).toHaveLength(0);
   });
 });

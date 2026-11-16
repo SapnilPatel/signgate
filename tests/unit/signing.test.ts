@@ -17,14 +17,14 @@ vi.mock("@/lib/pdf", async (importOriginal) => {
 });
 
 import { getDb } from "@/lib/db";
-import { envelopes, events, files, orgs, signers, templates, users, webhookDeliveries, webhooks, type Envelope, type FileRow, type Org, type Signer, type Template, type User } from "@/lib/db/schema";
+import { envelopes, events, files, orgs, rateLimits, signers, templates, users, webhookDeliveries, webhooks, type Envelope, type FileRow, type Org, type Signer, type Template, type User } from "@/lib/db/schema";
 import { newId, sha256Hex } from "@/lib/ids";
 import type { Field, OrgSettings } from "@/lib/types";
 import { ServiceError, type Actor } from "@/lib/services/context";
 import { putBlob } from "@/lib/services/blobs";
 import { clearTestOutbox, getTestOutbox } from "@/lib/services/email";
 import { sendAgreementForFile, voidEnvelope } from "@/lib/services/envelopes";
-import { FINALIZE_FAILED_EVENT, MAX_FINALIZE_ATTEMPTS, declineSigning, finalizeEnvelope, getSignedCopy, getSigningDocument, getSigningSession, longDate, maskEmail, signedDateLabel, submitSigning, validateSignerValues, verifyDocument } from "@/lib/services/signing";
+import { FINALIZE_FAILED_EVENT, calendarParts, inTransaction, isRetryableTxError, linkDeadEmail, orgTimeZone, declineSigning, finalizeEnvelope, getSignedCopy, getSigningDocument, getSigningSession, listUnsealedEnvelopeIds, longDate, maskEmail, signedDateLabel, submitSigning, validateSignerValues, verifyDocument } from "@/lib/services/signing";
 import { findSignerBySecret, hashSigningSecret, signingSecret, signingUrl } from "@/lib/services/tokens";
 import { runScheduledJobs } from "@/lib/services/jobs";
 
@@ -593,7 +593,12 @@ describe("links that can no longer be signed", () => {
     await declineSigning(secretOf(signingUrl(company)), "Terms changed");
     expect((await envelopeRow(envelopeId)).status).toBe("declined");
     expect((await fileRow(file.id)).agreementStatus).toBe("declined");
-    expect(mailTo(file.clientEmail, "voided")).toHaveLength(1);
+    // The client is told what happened in those words, not that the company "cancelled a signing request".
+    expect(mailTo(file.clientEmail, "voided")).toHaveLength(0);
+    const [notice] = mailTo(file.clientEmail, "not_completed");
+    expect(notice.subject).toMatch(/was not completed/);
+    expect(notice.subject).not.toMatch(/cancelled/);
+    expect(notice.text).toMatch(/did not countersign/);
     // The client's own link now says so too.
     expect((await getSigningSession(secret)).state).toBe("declined");
     await expectServiceError(declineSigning(secret, "me too"), "gone");
@@ -767,7 +772,7 @@ describe("when sealing fails", () => {
     expect(count(await eventTypes(envelopeId), "signer.signed")).toBe(1);
 
     seal.fail = false;
-    const summary = await runScheduledJobs();
+    const summary = await runScheduledJobs(new Date(Date.now() + 6 * 60_000));
     expect(summary.finalized).toEqual({ completed: 1, failed: 0 });
     expect(summary.errors).toEqual([]);
     envelope = await envelopeRow(envelopeId);
@@ -779,17 +784,37 @@ describe("when sealing fails", () => {
     expect((await runScheduledJobs()).finalized).toEqual({ completed: 0, failed: 0 });
   });
 
-  it("stops retrying after a fixed number of failures", async () => {
+  it("backs off between attempts but never gives up: it seals once the cause is fixed, however many times it failed", async () => {
     const world = await makeWorld();
-    const { envelopeId, secret } = await sendOne(world);
+    const { envelopeId, secret, file } = await sendOne(world);
     seal.fail = true;
-    await sign(secret);
-    for (let i = 0; i < MAX_FINALIZE_ATTEMPTS + 2; i++) await runScheduledJobs();
-    expect(count(await eventTypes(envelopeId), FINALIZE_FAILED_EVENT)).toBe(MAX_FINALIZE_ATTEMPTS);
-    const calls = seal.calls;
-    await runScheduledJobs();
+    await sign(secret); // the inline attempt is failure 1
+    const at = (minutes: number) => new Date(Date.now() + minutes * 60_000);
+
+    // Inside the wait nothing is attempted, so a broken deploy is not hammered every few minutes.
+    let calls = seal.calls;
+    await runScheduledJobs(at(4));
     expect(seal.calls).toBe(calls);
+    expect(await listUnsealedEnvelopeIds(10, at(4))).toEqual([]);
+
+    // Each failure doubles the wait since the last one: 5, 10, 20 ... minutes, then 6 hours at most.
+    // (Failures are stamped by the database clock, so every wait here is measured from about now.)
+    for (const wait of [5, 10, 20, 40, 80, 160, 320, 360, 360]) {
+      calls = seal.calls;
+      await runScheduledJobs(at(wait - 1));
+      expect(seal.calls, `no attempt before ${wait} minutes have passed`).toBe(calls);
+      expect((await runScheduledJobs(at(wait + 1))).finalized).toEqual({ completed: 0, failed: 1 });
+    }
+    expect(count(await eventTypes(envelopeId), FINALIZE_FAILED_EVENT)).toBe(10);
+    expect((await envelopeRow(envelopeId)).status).toBe("client_signed");
     expect((await signerRows(envelopeId))[0].status).toBe("signed");
+
+    // Ten failures later the cause is fixed, and the next due run finishes the job.
+    seal.fail = false;
+    expect((await runScheduledJobs(at(361))).finalized).toEqual({ completed: 1, failed: 0 });
+    expect((await envelopeRow(envelopeId)).status).toBe("completed");
+    expect((await fileRow(file.id)).agreementStatus).toBe("signed");
+    expect(mailTo(file.clientEmail, "completed")).toHaveLength(1);
   });
 });
 
@@ -845,5 +870,245 @@ describe("public rate limits and verification", () => {
     expect(Object.keys(ok).sort()).toEqual(["agreementName", "completedAt", "found", "organization", "signers"]);
     expect(maskEmail("casey@client.test")).toBe("c***@client.test");
     expect(maskEmail("nonsense")).toBe("***");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Regression tests for review findings
+// ---------------------------------------------------------------------------
+
+describe("a countersign link is only as good as the account behind it", () => {
+  async function disable(userId: string): Promise<void> {
+    const db = await getDb();
+    await db.update(users).set({ disabledAt: new Date() }).where(eq(users.id, userId));
+  }
+
+  it("stops working the moment the countersigner is turned off, for every action", async () => {
+    const world = await makeWorld({ company: true });
+    const admin = await addUser(world.org.id, "admin");
+    await setSettings(world.org.id, { countersignerUserId: admin.id });
+    const { envelopeId, secret } = await sendOne(world);
+    await sign(secret);
+    const [, company] = await signerRows(envelopeId);
+    const companySecret = secretOf(signingUrl(company));
+    expect(mailTo(admin.email, "countersign_request")).toHaveLength(1);
+    expect((await getSigningSession(companySecret)).state).toBe("ready");
+
+    await disable(admin.id);
+    expect((await getSigningSession(companySecret)).state).toBe("unknown");
+    await expectServiceError(submitSigning(companySecret, { consent: true, values: { k_sig: SIGNATURE } }), "not_found");
+    await expectServiceError(declineSigning(companySecret, "no"), "not_found");
+    await expectServiceError(getSigningDocument(companySecret), "not_found");
+    await expectServiceError(getSignedCopy(companySecret), "not_found");
+    expect((await envelopeRow(envelopeId)).status).toBe("client_signed");
+    expect((await signerRows(envelopeId))[1].status).not.toBe("signed");
+
+    // Turning the account back on is the owner's decision to let them sign again.
+    const db = await getDb();
+    await db.update(users).set({ disabledAt: null }).where(eq(users.id, admin.id));
+    expect((await getSigningSession(companySecret)).state).toBe("ready");
+  });
+
+  it("a company signer with no account behind it cannot sign at all", async () => {
+    const world = await makeWorld({ company: true });
+    const { envelopeId, secret } = await sendOne(world);
+    await sign(secret);
+    const [, company] = await signerRows(envelopeId);
+    const db = await getDb();
+    await db.update(signers).set({ userId: null, email: "mallory@outside.test" }).where(eq(signers.id, company.id));
+    await expectServiceError(submitSigning(secretOf(signingUrl(company)), { consent: true, values: { k_sig: SIGNATURE } }), "not_found");
+    expect((await envelopeRow(envelopeId)).status).toBe("client_signed");
+  });
+
+  it("when the client signs after the countersigner left, the request goes to whoever countersigns now, with a new link", async () => {
+    const world = await makeWorld({ company: true });
+    const admin = await addUser(world.org.id, "admin");
+    await setSettings(world.org.id, { countersignerUserId: admin.id });
+    const { envelopeId, secret, file } = await sendOne(world);
+    const [, assigned] = await signerRows(envelopeId);
+    expect(assigned.userId).toBe(admin.id);
+    const oldSecret = secretOf(signingUrl(assigned));
+
+    // Turned off before the client signs. (The settings still name them, as after a direct edit;
+    // the rule falls back to the owner either way.)
+    await disable(admin.id);
+    clearTestOutbox();
+    const result = await sign(secret);
+    expect(result.next).toBe("awaiting_countersignature");
+
+    const [, company] = await signerRows(envelopeId);
+    expect(company).toMatchObject({ userId: world.owner.id, email: world.owner.email, name: world.owner.name, status: "sent" });
+    expect(mailTo(admin.email)).toHaveLength(0);
+    expect(mailTo(world.owner.email, "countersign_request")).toHaveLength(1);
+    expect(await findSignerBySecret(oldSecret)).toBeNull();
+    expect(mailTo(world.owner.email, "countersign_request")[0].text).toContain(signingUrl(company));
+    expect(await eventTypes(envelopeId)).toContain("signer.updated");
+    expect((await fileRow(file.id)).agreementStatus).toBe("awaiting_countersign");
+    expect((await submitSigning(secretOf(signingUrl(company)), { consent: true, values: { k_sig: SIGNATURE } })).completed).toBe(true);
+  });
+
+  it("in automatic mode a countersigner who left is never signed for: it falls to the owner", async () => {
+    const world = await makeWorld({ company: true });
+    const admin = await addUser(world.org.id, "admin", { savedSignature: SIGNATURE });
+    await setSettings(world.org.id, { countersignerUserId: admin.id, countersignMode: "auto" });
+    const { envelopeId, secret } = await sendOne(world);
+    await disable(admin.id);
+    // The owner has no saved signature, so nothing can be applied automatically.
+    const result = await sign(secret);
+    expect(result).toMatchObject({ completed: false, next: "awaiting_countersignature" });
+    expect((await signerRows(envelopeId))[1]).toMatchObject({ userId: world.owner.id, status: "sent" });
+  });
+});
+
+describe("public limits cannot be sidestepped or used to fill the table", () => {
+  async function limitRows(prefix: string): Promise<string[]> {
+    const db = await getDb();
+    return (await db.select({ key: rateLimits.key }).from(rateLimits)).map((r) => r.key).filter((k) => k.startsWith(prefix));
+  }
+
+  it("junk links never get a counter of their own, whatever their shape", async () => {
+    const db = await getDb();
+    await db.delete(rateLimits);
+    const wellFormed = (i: number) => `${"Q".repeat(40)}${String(i).padStart(3, "0")}`;
+    for (let i = 0; i < 25; i++) {
+      expect((await getSigningSession(i % 2 ? wellFormed(i) : `junk-${i}`, { ip: "198.51.100.200" })).state).toBe("unknown");
+      expect((await getSigningSession(i % 2 ? wellFormed(i) : { not: "a string" }, undefined)).state).toBe("unknown");
+    }
+    expect(await limitRows("sign:view:link:")).toEqual([]);
+    expect((await limitRows("sign:view:")).sort()).toEqual(["sign:view:ip:198.51.100.200", "sign:view:ip:unknown"]);
+  });
+
+  it("with no caller address, junk requests share one limit instead of having none", async () => {
+    const db = await getDb();
+    await db.delete(rateLimits);
+    let limited: ServiceError | null = null;
+    for (let i = 0; i < 130 && !limited; i++) {
+      try {
+        await declineSigning(`nope-${i}`, "x");
+      } catch (err) {
+        if (err instanceof ServiceError && err.code === "rate_limited") limited = err;
+        else expect((err as ServiceError).code).toBe("not_found");
+      }
+    }
+    expect(limited?.status).toBe(429);
+    // A real link is not caught by the junk counter.
+    const world = await makeWorld();
+    const { secret } = await sendOne(world);
+    expect(await declineSigning(secret, "changed my mind")).toEqual({ status: "declined" });
+  });
+
+  it("limits document checks that arrive without an address", async () => {
+    const db = await getDb();
+    await db.delete(rateLimits);
+    let limited = false;
+    for (let i = 0; i < 320 && !limited; i++) {
+      try {
+        await verifyDocument({ sha256: "a".repeat(64) });
+      } catch (err) {
+        limited = err instanceof ServiceError && err.code === "rate_limited";
+      }
+    }
+    expect(limited).toBe(true);
+    // A caller with an address has their own allowance.
+    expect(await verifyDocument({ sha256: "a".repeat(64) }, { ip: "198.51.100.201" })).toEqual({ found: false });
+  });
+});
+
+describe("transactions survive being chosen as a deadlock victim", () => {
+  const deadlock = () => Object.assign(new Error("Failed query"), { cause: Object.assign(new Error("deadlock detected"), { code: "40P01" }) });
+
+  it("recognises deadlock and serialization errors however deeply the driver wraps them", () => {
+    expect(isRetryableTxError(deadlock())).toBe(true);
+    expect(isRetryableTxError({ code: "40001" })).toBe(true);
+    expect(isRetryableTxError({ cause: { cause: { code: "40P01" } } })).toBe(true);
+    for (const other of [null, undefined, "40P01", new Error("x"), { code: "23505" }, new ServiceError("conflict", "A conflict that is not a deadlock.")]) {
+      expect(isRetryableTxError(other)).toBe(false);
+    }
+  });
+
+  it("runs the work once more after a deadlock, and only once", async () => {
+    const db = await getDb();
+    let attempts = 0;
+    const result = await inTransaction(db, async () => {
+      attempts++;
+      if (attempts === 1) throw deadlock();
+      return "done";
+    });
+    expect(result).toBe("done");
+    expect(attempts).toBe(2);
+
+    attempts = 0;
+    await expect(
+      inTransaction(db, async () => {
+        attempts++;
+        throw deadlock();
+      }),
+    ).rejects.toThrow();
+    expect(attempts).toBe(2);
+
+    // Anything else is not retried: a ServiceError must reach the caller as it is.
+    attempts = 0;
+    await expectServiceError(
+      inTransaction(db, async () => {
+        attempts++;
+        throw new ServiceError("conflict", "Something else changed this agreement.");
+      }),
+      "conflict",
+    );
+    expect(attempts).toBe(1);
+  });
+
+  it("signing, viewing and declining all take the file's lock before the envelope's (same order as sending)", async () => {
+    // Deadlocks cannot happen on the single-connection test database, so this pins the
+    // mechanism instead: each of these must still work while holding to one lock order,
+    // and concurrent pairs on one file must leave a consistent result.
+    const world = await makeWorld({ company: true });
+    const { envelopeId, secret, file } = await sendOne(world);
+    const results = await Promise.allSettled([getSigningSession(secret), sign(secret), sendAgreementForFile(world.actor, file.id, { replace: true })]);
+    expect(results.every((r) => r.status === "fulfilled" || r.reason instanceof ServiceError)).toBe(true);
+    const first = await envelopeRow(envelopeId);
+    expect(["client_signed", "voided"]).toContain(first.status);
+    const open = (await getDb().then((db) => db.select().from(envelopes).where(eq(envelopes.fileId, file.id)))).filter((e) => ["draft", "sent", "viewed", "client_signed"].includes(e.status));
+    expect(open).toHaveLength(1);
+  });
+});
+
+describe("company time zone helpers", () => {
+  it("reads a real IANA zone from settings and ignores anything else", () => {
+    expect(orgTimeZone({ settings: { timeZone: "America/Chicago" } })).toBe("America/Chicago");
+    expect(orgTimeZone({ settings: { timezone: "Europe/London" } })).toBe("Europe/London");
+    for (const bad of [null, undefined, {}, { settings: null }, { settings: "x" }, { settings: { timeZone: "Mars/Olympus" } }, { settings: { timeZone: 5 } }, { settings: { timeZone: "'; drop table" } }]) {
+      expect(orgTimeZone(bad as never)).toBeNull();
+    }
+  });
+
+  it("splits an instant into the calendar day of a zone, and never throws on a bad zone", () => {
+    const at = new Date("2027-01-01T03:00:00Z");
+    expect(calendarParts(at, "America/New_York")).toEqual({ day: 31, month: "December", year: 2026 });
+    expect(calendarParts(at, null)).toEqual({ day: 1, month: "January", year: 2027 });
+    expect(calendarParts(at, "Not/Real")).toEqual({ day: 1, month: "January", year: 2027 });
+  });
+});
+
+describe("what a signer is told when a link dies", () => {
+  const brand = { orgName: "Pier <Test> Co", brandColor: "#1f3a5f" };
+
+  it("says expired for an expiry and not completed for a missing countersignature, never cancelled", () => {
+    const expired = linkDeadEmail("expired", { brand, signerName: "Fay Client", agreementName: "Engagement letter", expiredOn: "3 December 2026" });
+    expect(expired.subject).toBe("Your signing link for Engagement letter has expired");
+    expect(expired.text).toMatch(/expired on 3 December 2026 before the agreement was signed/);
+    expect(expired.text).toMatch(/ask them to send the agreement again/);
+    const notCompleted = linkDeadEmail("not_completed", { brand, signerName: "Fay Client", agreementName: "Engagement letter" });
+    expect(notCompleted.text).toMatch(/did not countersign it, so the agreement was not completed/);
+    for (const email of [expired, notCompleted]) {
+      expect(`${email.subject} ${email.text}`).not.toMatch(/cancel/i);
+      // Names are escaped on their way into HTML.
+      expect(email.html).toContain("Pier &lt;Test&gt; Co");
+      expect(email.html).not.toContain("<Test>");
+    }
+    expect(linkDeadEmail("voided", { brand, signerName: "Fay", agreementName: "Engagement letter", reason: "Wrong version" }).subject).toMatch(/cancelled/);
+    // Missing details never produce "undefined" in a sentence.
+    const bare = linkDeadEmail("expired", { brand: { orgName: "" }, signerName: "", agreementName: "" });
+    expect(`${bare.subject} ${bare.text}`).not.toMatch(/undefined|null/);
   });
 });

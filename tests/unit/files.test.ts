@@ -3,7 +3,8 @@ import { and, eq } from "drizzle-orm";
 
 // The envelope service is written by another engineer; only its contract is used here.
 const { sendMock, voidMock } = vi.hoisted(() => ({ sendMock: vi.fn(), voidMock: vi.fn() }));
-vi.mock("@/lib/services/envelopes", () => ({
+vi.mock("@/lib/services/envelopes", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("@/lib/services/envelopes")>()),
   sendAgreementForFile: sendMock,
   voidOpenEnvelopesForFile: voidMock,
 }));
@@ -23,6 +24,7 @@ import {
   getFile,
   importFiles,
   listFiles,
+  sendAgreementsForFiles,
   summarizeImport,
   toPublicFile,
   unarchiveFile,
@@ -565,9 +567,10 @@ describe("dashboardStats", () => {
     const oldestEnv = await addEnvelope(orgId, out1.id, { status: "viewed", sentAt: hoursAgo(24 * 9 + 2) });
     await addEnvelope(orgId, out2.id, { status: "client_signed", sentAt: hoursAgo(24 * 2) });
     await addEnvelope(orgId, declined.id, { status: "declined", sentAt: hoursAgo(24 * 4) });
-    // Ignored: voided, never sent, and far too old for the 90-day window.
+    // Ignored: voided, and far too old for the 90-day window.
     await addEnvelope(orgId, out1.id, { status: "voided", sentAt: hoursAgo(24 * 20) });
-    await addEnvelope(orgId, out2.id, { status: "draft", sentAt: null });
+    // A link shared by hand (never emailed, so no sent_at) still counts as out, from when it was created.
+    await addEnvelope(orgId, out2.id, { status: "draft", sentAt: null, createdAt: hoursAgo(24) });
     await addEnvelope(orgId, s1.id, { status: "completed", sentAt: hoursAgo(24 * 200), completedAt: hoursAgo(24 * 150) });
 
     // Another org's activity must not move these numbers.
@@ -581,8 +584,8 @@ describe("dashboardStats", () => {
     expect(stats.signedThisMonth).toBe(3);
     expect(stats.medianSecondsToSign).toBe(3 * 3600);
     expect(stats.oldestOutstanding).toMatchObject({ fileId: out1.id, envelopeId: oldestEnv, reference: out1.reference, status: "viewed", daysOutstanding: 9 });
-    // 4 completed of 7 sent in the window, voided excluded.
-    expect(stats.completionRate).toBeCloseTo(4 / 7, 5);
+    // 4 completed of 8 out in the window, voided excluded.
+    expect(stats.completionRate).toBeCloseTo(4 / 8, 5);
   });
 
   it("leaves archived files out of the oldest outstanding", async () => {
@@ -630,11 +633,11 @@ describe("updateFile", () => {
 
     const other = await updateFile(actor, file.id, { description: "x" });
     expect(other.reissueSuggested).toBe(false);
-    expect(other.outstandingEnvelope).toEqual({ id: envId, status: "viewed" });
+    expect(other.outstandingEnvelope).toEqual({ id: envId, status: "viewed", clientSignerId: null });
 
     const email = await updateFile(actor, file.id, { clientEmail: "new.address@example.com" });
     expect(email.reissueSuggested).toBe(true);
-    expect(email.outstandingEnvelope).toEqual({ id: envId, status: "viewed" });
+    expect(email.outstandingEnvelope).toEqual({ id: envId, status: "viewed", clientSignerId: null });
     expect((await updateFile(actor, file.id, { clientName: "Jane Q. Doe" })).reissueSuggested).toBe(true);
     // updateFile never touches the envelope itself.
     expect(sendMock).not.toHaveBeenCalled();
@@ -770,7 +773,7 @@ describe("importFiles", () => {
     const created = results.filter((r) => r.status === "created");
     expect(created.every((r) => r.fileId && r.reference && r.agreementSent)).toBe(true);
     expect(sendMock).toHaveBeenCalledTimes(4);
-    expect(summarizeImport(results)).toEqual({ created: 4, skipped: 5, errors: 4, agreementsSent: 4 });
+    expect(summarizeImport(results)).toEqual({ created: 4, skipped: 5, errors: 4, notProcessed: 0, agreementsSent: 4 });
 
     const first = await getFile(actor, created[0].fileId!);
     expect(first.file).toMatchObject({ source: "csv", reference: "NEW-1", data: { region: "North" } });
@@ -873,5 +876,218 @@ describe("toPublicFile", () => {
     expect(toPublicFile({ ...file, agreementStatus: "signed" }).clearedToStart).toBe(true);
     expect(toPublicFile(file)).not.toHaveProperty("orgId");
     expect(typeof toPublicFile(file).createdAt).toBe("string");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Regression tests for review findings
+// ---------------------------------------------------------------------------
+
+describe("importing the same spreadsheet again", () => {
+  const sheet = () => [
+    { row: 2, clientName: "Ann Able", clientEmail: "ann.able@example.com" },
+    { row: 3, clientName: "Bo Best", clientEmail: "bo.best@example.com", clientCompany: "Best & Co", data: { Region: "North" } },
+    { row: 4, clientName: "Cy Cole", clientEmail: "cy.cole@example.com", description: "Loft conversion" },
+  ];
+
+  it("skips rows that were imported in the last day, so a retry or double click creates and emails nothing twice", async () => {
+    const { actor, orgId } = await newOrg();
+    const first = await importFiles(actor, sheet() as never, { send: true });
+    expect(first.map((r) => r.status)).toEqual(["created", "created", "created"]);
+    expect(sendMock).toHaveBeenCalledTimes(3);
+    sendMock.mockClear();
+
+    const second = await importFiles(actor, sheet() as never, { send: true });
+    expect(second.map((r) => r.status)).toEqual(["skipped", "skipped", "skipped"]);
+    expect(second[0].message).toMatch(/identical file \(F-\d{4}-0001\) was imported in the last day/);
+    expect(second[0].message).toMatch(/give the row its own reference, or import again and allow repeats/);
+    expect(second[0].reference).toBe(first[0].reference);
+    expect(sendMock).not.toHaveBeenCalled();
+    const db = await getDb();
+    expect(await db.select({ id: files.id }).from(files).where(eq(files.orgId, orgId))).toHaveLength(3);
+
+    // Case, spacing and column order do not make a row new.
+    const reshaped = await importFiles(actor, [{ row: 9, clientEmail: " BO.BEST@example.com ", clientName: "bo  best", data: { region: "north" }, clientCompany: "best & co" }] as never);
+    expect(reshaped[0].status).toBe("skipped");
+    // A genuinely different row for the same client is a new file.
+    const different = await importFiles(actor, [{ row: 9, clientName: "Bo Best", clientEmail: "bo.best@example.com", clientCompany: "Best & Co", description: "Second job" }] as never);
+    expect(different[0].status).toBe("created");
+  });
+
+  it("imports repeats when asked to, and does not treat old, archived, hand-made or another company's files as repeats", async () => {
+    const { actor, orgId } = await newOrg();
+    const other = await newOrg();
+    await importFiles(other.actor, sheet() as never, { send: false });
+    await createFile(actor, client({ clientName: "Ann Able", clientEmail: "ann.able@example.com", send: false }));
+    expect((await importFiles(actor, sheet() as never, { send: false })).map((r) => r.status)).toEqual(["created", "created", "created"]);
+    expect((await importFiles(actor, sheet() as never, { send: false, allowRepeats: true })).map((r) => r.status)).toEqual(["created", "created", "created"]);
+
+    const db = await getDb();
+    // Yesterday's import is history, not a retry.
+    await db.update(files).set({ createdAt: new Date(Date.now() - 25 * 3_600_000) }).where(and(eq(files.orgId, orgId), eq(files.clientEmail, "bo.best@example.com")));
+    await db.update(files).set({ archivedAt: new Date() }).where(and(eq(files.orgId, orgId), eq(files.clientEmail, "cy.cole@example.com")));
+    expect((await importFiles(actor, sheet() as never, { send: false })).map((r) => r.status)).toEqual(["skipped", "created", "created"]);
+  });
+
+  it("stops creating when its time is up, says so per row, and a second run finishes without duplicates", async () => {
+    const { actor, orgId } = await newOrg();
+    const rows = Array.from({ length: 6 }, (_, i) => ({ row: i + 2, clientName: `Person ${i}`, clientEmail: `person${i}@example.com` }));
+    const first = await importFiles(actor, rows as never, { send: true, budgetMs: 0 });
+    // One row is always attempted, so repeated runs always get somewhere.
+    expect(first.map((r) => r.status)).toEqual(["created", "not_processed", "not_processed", "not_processed", "not_processed", "not_processed"]);
+    expect(first[1].message).toMatch(/ran out of time.*Import the same spreadsheet again/);
+    expect(first[0].message).toMatch(/not sent because the import ran out of time/);
+    expect(summarizeImport(first)).toEqual({ created: 1, skipped: 0, errors: 0, notProcessed: 5, agreementsSent: 0 });
+    expect(sendMock).not.toHaveBeenCalled();
+
+    const second = await importFiles(actor, rows as never, { send: false });
+    expect(second.map((r) => r.status)).toEqual(["skipped", "created", "created", "created", "created", "created"]);
+    const db = await getDb();
+    expect(await db.select({ id: files.id }).from(files).where(eq(files.orgId, orgId))).toHaveLength(6);
+  });
+});
+
+describe("sendAgreementsForFiles", () => {
+  it("sends for each file, reports each outcome, and hands back what it did not get to", async () => {
+    const { actor } = await newOrg();
+    const made = [];
+    for (let i = 0; i < 4; i++) made.push((await createFile(actor, client({ send: false }))).file.id);
+    sendMock.mockClear();
+    sendMock.mockImplementationOnce(async () => ({ envelopeId: "env_one", delivery: "emailed", signingUrl: "https://app.test/sign/one" }));
+    sendMock.mockImplementationOnce(async () => {
+      throw new ServiceError("conflict", "An agreement is already out for signature on this file.");
+    });
+    sendMock.mockImplementationOnce(async () => ({ envelopeId: "env_three", delivery: "email_failed", signingUrl: "https://app.test/sign/three" }));
+
+    const all = await sendAgreementsForFiles(actor, [...made.slice(0, 3), made[0], 7, null, ""]);
+    expect(all.remaining).toEqual([]);
+    expect(all.blocked).toBeUndefined();
+    expect(all.results).toEqual([
+      { fileId: made[0], sent: true, envelopeId: "env_one", delivery: "emailed" },
+      { fileId: made[1], sent: false, reason: "An agreement is already out for signature on this file." },
+      { fileId: made[2], sent: true, envelopeId: "env_three", delivery: "email_failed" },
+    ]);
+    // The link is not echoed back in bulk.
+    expect(JSON.stringify(all)).not.toContain("/sign/");
+
+    sendMock.mockClear();
+    const timed = await sendAgreementsForFiles(actor, made, { budgetMs: 0 });
+    expect(timed.results).toHaveLength(1);
+    expect(timed.remaining).toEqual(made.slice(1));
+    expect(sendMock).toHaveBeenCalledTimes(1);
+  });
+
+  it("stops at a problem that applies to every file, and refuses a list it cannot use", async () => {
+    const { actor } = await newOrg();
+    const made = [];
+    for (let i = 0; i < 3; i++) made.push((await createFile(actor, client({ send: false }))).file.id);
+    sendMock.mockReset();
+    sendMock.mockRejectedValue(new ServiceError("rate_limited", "Your company has reached its limit of 30 signing requests an hour.", { scope: "org" }));
+    const blocked = await sendAgreementsForFiles(actor, made);
+    expect(blocked.results).toHaveLength(1);
+    expect(blocked.remaining).toEqual(made.slice(1));
+    expect(blocked.blocked).toMatch(/limit of 30 signing requests/);
+    expect(sendMock).toHaveBeenCalledTimes(1);
+
+    await expectServiceError(sendAgreementsForFiles(actor, "file_1" as never), "invalid");
+    await expectServiceError(sendAgreementsForFiles(actor, Array.from({ length: FILE_LIMITS.importMaxRows + 1 }, () => "file_x")), "invalid", /at most 1000 files/);
+    expect(await sendAgreementsForFiles(actor, [])).toEqual({ results: [], remaining: [] });
+  });
+
+  it("an import stops sending when the company's sending limit is reached, and says why on every remaining row", async () => {
+    const { actor } = await newOrg();
+    sendMock.mockReset();
+    sendMock.mockRejectedValue(new ServiceError("rate_limited", "Your company has reached its limit of 30 signing requests an hour.", { scope: "org" }));
+    const results = await importFiles(actor, [1, 2, 3].map((i) => ({ row: i + 1, clientName: `Limit ${i}`, clientEmail: `limit${i}@example.com` })) as never, { send: true });
+    expect(results.map((r) => r.status)).toEqual(["created", "created", "created"]);
+    expect(sendMock).toHaveBeenCalledTimes(1);
+    for (const r of results) expect(r.message).toMatch(/Agreement not sent: Your company has reached its limit/);
+  });
+});
+
+describe("references that differ only in letter case", () => {
+  it("cannot both be created, even at the same moment", async () => {
+    const { actor, orgId } = await newOrg();
+    const results = await Promise.allSettled([
+      createFile(actor, client({ reference: "job-77", send: false })),
+      createFile(actor, client({ reference: "JOB-77", send: false })),
+      createFile(actor, client({ reference: "Job-77", send: false })),
+    ]);
+    expect(results.filter((r) => r.status === "fulfilled")).toHaveLength(1);
+    for (const r of results) {
+      if (r.status === "rejected") {
+        expect(r.reason).toBeInstanceOf(ServiceError);
+        expect((r.reason as ServiceError).code).toBe("conflict");
+        expect((r.reason as ServiceError).fields?.reference).toBeTruthy();
+      }
+    }
+    const db = await getDb();
+    expect(await db.select({ id: files.id }).from(files).where(eq(files.orgId, orgId))).toHaveLength(1);
+  });
+
+  it("a rename cannot slip in beside a create either", async () => {
+    const { actor } = await newOrg();
+    const { file } = await createFile(actor, client({ reference: "ALPHA-1", send: false }));
+    const results = await Promise.allSettled([updateFile(actor, file.id, { reference: "beta-2" }), createFile(actor, client({ reference: "BETA-2", send: false }))]);
+    expect(results.filter((r) => r.status === "fulfilled")).toHaveLength(1);
+  });
+});
+
+describe("the file page and the envelope page agree", () => {
+  it("getFile returns signers and events in the same shape as getEnvelope, with links only for those who may have them", async () => {
+    const { actor, orgId } = await newOrg();
+    const db = await getDb();
+    const memberId = newId("usr");
+    await db.insert(users).values({ id: memberId, orgId, email: `member${++seq}@example.com`, name: "Mo Member", passwordHash: "x", role: "member" });
+    const member: Actor = { type: "user", orgId, userId: memberId, role: "member", label: "Mo Member" };
+
+    const { file } = await createFile(actor, client({ send: false }));
+    const envelopeId = await addEnvelope(orgId, file.id, { status: "client_signed" });
+    const { mintSigningToken } = await import("@/lib/services/tokens");
+    const clientId = newId("sgn");
+    const companyId = newId("sgn");
+    const companyToken = mintSigningToken(companyId);
+    const clientToken = mintSigningToken(clientId);
+    await db.insert(signers).values([
+      { id: clientId, envelopeId, orgId, role: "client", order: 1, name: "Jane Doe", email: "jane@example.com", tokenNonce: clientToken.tokenNonce, tokenHash: clientToken.tokenHash, status: "signed", signedAt: new Date(), ip: "203.0.113.9" },
+      { id: companyId, envelopeId, orgId, role: "company", order: 2, name: "Olive Owner", email: "olive@example.com", tokenNonce: companyToken.tokenNonce, tokenHash: companyToken.tokenHash, status: "sent", userId: actor.type === "user" ? actor.userId : null },
+    ]);
+
+    const asOwner = await getFile(actor, file.id);
+    expect(asOwner.events.every((e) => typeof e.description === "string" && e.description.length > 0)).toBe(true);
+    expect(asOwner.events[0].description).toMatch(/^File .* created/);
+    const [envelope] = asOwner.envelopes;
+    expect(envelope.canCountersign).toBe(true);
+    expect(envelope.signers.map((s) => [s.role, s.isTurn, Boolean(s.signingUrl)])).toEqual([
+      ["client", false, false],
+      ["company", true, true],
+    ]);
+    expect(envelope.signers[1].signingUrl).toContain(companyToken.secret);
+
+    const asMember = await getFile(member, file.id);
+    expect(asMember.envelopes[0].canCountersign).toBe(false);
+    expect(asMember.envelopes[0].signers[1]).toMatchObject({ isTurn: true, signingUrl: null });
+    expect(JSON.stringify(asMember)).not.toContain(companyToken.secret);
+    const asApi = await getFile({ type: "api", orgId, keyId: "key_test000000000000", label: "API key" }, file.id);
+    expect(JSON.stringify(asApi)).not.toContain(companyToken.secret);
+  });
+});
+
+describe("agreements that were never emailed still show on the dashboard", () => {
+  it("counts a link shared by hand as outstanding, and its completion in the median and the rate", async () => {
+    const { actor, orgId } = await newOrg();
+    const now = new Date();
+    const hoursAgo = (h: number) => new Date(now.getTime() - h * 3_600_000);
+    const open = (await createFile(actor, client({ send: false }))).file;
+    const done = (await createFile(actor, client({ send: false }))).file;
+    const openEnv = await addEnvelope(orgId, open.id, { status: "draft", sentAt: null, createdAt: hoursAgo(24 * 3 + 1) });
+    await addEnvelope(orgId, done.id, { status: "completed", sentAt: null, createdAt: hoursAgo(4), completedAt: now });
+
+    const stats = await dashboardStats(actor, now);
+    expect(stats.signedThisMonth).toBe(1);
+    expect(stats.medianSecondsToSign).toBe(4 * 3600);
+    expect(stats.oldestOutstanding).toMatchObject({ fileId: open.id, envelopeId: openEnv, status: "draft", daysOutstanding: 3 });
+    expect(stats.oldestOutstanding?.sentAt).toBeInstanceOf(Date);
+    expect(stats.completionRate).toBeCloseTo(0.5, 5);
   });
 });

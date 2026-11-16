@@ -10,6 +10,7 @@ import {
   UPLOAD_TTL_MS,
   beginUpload,
   completeUpload,
+  discardUpload,
   purgeStaleUploads,
   putChunk,
 } from "@/lib/services/uploads";
@@ -126,7 +127,7 @@ describe("beginUpload", () => {
 });
 
 describe("putChunk and completeUpload", () => {
-  it("joins a multi-part upload in order whatever order the parts arrive in, then removes the parts", async () => {
+  it("joins a multi-part upload in order whatever order the parts arrive in, and keeps the parts until told to discard them", async () => {
     const { orgId, actor } = await makeOrg();
     const bytes = pattern(CHUNK * 2 + 1234);
     const begun = await beginUpload(actor, { filename: "Client Agreement.pdf", size: bytes.length, mimeType: "Application/PDF" });
@@ -142,7 +143,17 @@ describe("putChunk and completeUpload", () => {
     expect(done.mimeType).toBe("application/pdf");
     expect(done.bytes).toBeInstanceOf(Uint8Array);
     expect(Buffer.from(done.bytes).equals(Buffer.from(bytes))).toBe(true);
+    expect(done.id).toMatch(/^upl_/);
+
+    // Whatever is made from the file may fail or time out, or the response may be lost:
+    // finishing again must hand over the same bytes without a new upload.
+    expect(await chunkRows(orgId)).toHaveLength(3);
+    const again = await completeUpload(actor, begun.uploadId);
+    expect(Buffer.from(again.bytes).equals(Buffer.from(bytes))).toBe(true);
+
+    expect(await discardUpload(actor, begun.uploadId)).toBe(3);
     expect(await chunkRows(orgId)).toHaveLength(0);
+    expect(await discardUpload(actor, begun.uploadId)).toBe(0);
   });
 
   it("is idempotent: the same part sent twice is stored once, and a resend replaces the first copy", async () => {
@@ -207,23 +218,25 @@ describe("putChunk and completeUpload", () => {
     expect(Buffer.from(done.bytes).equals(Buffer.from(bytes))).toBe(true);
   });
 
-  it("hands the file over once: finishing again, or finishing with nothing sent, says to start again", async () => {
+  it("finishing with nothing sent, or after the upload was discarded, says what to check and to start again", async () => {
     const { actor } = await makeOrg();
     const begun = await beginUpload(actor, { filename: "a.bin", size: 2 });
-    await expectError(completeUpload(actor, begun.uploadId), "not_found", /Start the upload again/);
+    await expectError(completeUpload(actor, begun.uploadId), "not_found", /start the upload again/);
     await putChunk(actor, begun.uploadId, 0, new Uint8Array([1, 2]));
     await completeUpload(actor, begun.uploadId);
-    await expectError(completeUpload(actor, begun.uploadId), "not_found", /Start the upload again/);
+    await discardUpload(actor, begun.uploadId);
+    await expectError(completeUpload(actor, begun.uploadId), "not_found", /check your list of agreements/);
   });
 
-  it("gives the file to exactly one of two simultaneous finish calls", async () => {
-    const { actor } = await makeOrg();
-    const begun = await beginUpload(actor, { filename: "a.bin", size: 2 });
-    await putChunk(actor, begun.uploadId, 0, new Uint8Array([1, 2]));
-    const results = await Promise.allSettled([completeUpload(actor, begun.uploadId), completeUpload(actor, begun.uploadId)]);
-    expect(results.filter((r) => r.status === "fulfilled")).toHaveLength(1);
-    const failed = results.find((r) => r.status === "rejected") as PromiseRejectedResult;
-    expect(failed.reason).toBeInstanceOf(ServiceError);
+  it("only discards the caller's own company's upload, and never throws on a bad id", async () => {
+    const mine = await makeOrg();
+    const theirs = await makeOrg();
+    const begun = await beginUpload(mine.actor, { filename: "a.bin", size: 2 });
+    await putChunk(mine.actor, begun.uploadId, 0, new Uint8Array([1, 2]));
+    expect(await discardUpload(theirs.actor, begun.uploadId)).toBe(0);
+    for (const bad of [undefined, null, "", "nonsense", 7, {}]) expect(await discardUpload(mine.actor, bad)).toBe(0);
+    expect(await chunkRows(mine.orgId)).toHaveLength(1);
+    await expectError(discardUpload({ ...mine.actor, userId: "usr_nobody0000000000" }, begun.uploadId), "forbidden");
   });
 
   it("detects stored parts that no longer add up to the declared size", async () => {

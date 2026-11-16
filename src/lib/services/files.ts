@@ -6,14 +6,15 @@
  */
 import { and, asc, desc, eq, gte, ilike, inArray, isNotNull, isNull, ne, or, sql, type SQL } from "drizzle-orm";
 import { getDb, type Db, type DbOrTx } from "@/lib/db";
-import { envelopes, files, orgs, signers, type Envelope, type EventRow, type FileRow, type Org, type Signer } from "@/lib/db/schema";
+import { envelopes, files, orgs, signers, type Envelope, type FileRow, type Org, type Signer } from "@/lib/db/schema";
 import { newId, randomString } from "@/lib/ids";
 import { LIMITS, ORG_SETTING_DEFAULTS } from "@/lib/types";
 import { cleanMultilineText, cleanText, isValidEmail, normalizeEmail } from "@/lib/validation";
 import { ServiceError, type Actor, type RequestMeta } from "./context";
 import { normalizeDataKey, type ImportRow } from "./csv";
-import { sendAgreementForFile, voidOpenEnvelopesForFile } from "./envelopes";
+import { canCountersignNow, describeEvents, sendAgreementForFile, signerView, viewerOf, voidOpenEnvelopesForFile, type DescribedEvent, type SignerView } from "./envelopes";
 import { listEvents, recordEvent } from "./events";
+import { calendarParts, orgTimeZone } from "./signing";
 import { enqueueWebhookEvent } from "./webhooks";
 
 // ---------------------------------------------------------------------------
@@ -90,24 +91,33 @@ export interface UpdateFileResult {
   file: FileRow;
   /** Plain names of what changed, e.g. ["client email", "description"]. Empty when nothing did. */
   changed: string[];
-  /** The agreement the client has not signed yet, if there is one. */
-  outstandingEnvelope: { id: string; status: Envelope["status"] } | null;
+  /** The agreement the client has not signed yet, if there is one, with the id of its client
+   *  signer: pass that to updateSigner to move the live link to the corrected name or address. */
+  outstandingEnvelope: { id: string; status: Envelope["status"]; clientSignerId: string | null } | null;
   /** True when the client's name or email changed while an agreement is waiting for them:
    *  the link already sent still carries the old details, so offer to reissue it. */
   reissueSuggested: boolean;
 }
 
-/** An envelope without its document snapshot (pages, fields, prefill), which a file page never needs. */
-export type EnvelopeSummary = Omit<Envelope, "pages" | "fields" | "prefill"> & { signers: SignerSummary[] };
+/**
+ * An envelope on the file page: no document snapshot (pages, fields, prefill), and
+ * its signers in the same shape getEnvelope returns, with the links the person
+ * asking is allowed to have.
+ */
+export type FileEnvelope = Omit<Envelope, "pages" | "fields" | "prefill"> & {
+  signers: SignerView[];
+  /** True when the person asking may countersign this envelope right now. */
+  canCountersign: boolean;
+};
 /** A signer without link secrets or captured values (signature images can be hundreds of kilobytes). */
 export type SignerSummary = Omit<Signer, "tokenNonce" | "tokenHash" | "values">;
 
 export interface FileDetail {
   file: FileRow;
   /** Newest first. */
-  envelopes: EnvelopeSummary[];
-  /** Oldest first; the most recent 500. */
-  events: EventRow[];
+  envelopes: FileEnvelope[];
+  /** Oldest first; the most recent 500. Each has a plain-language `description`, as on the envelope page. */
+  events: DescribedEvent[];
 }
 
 export interface ListFilesOptions {
@@ -136,7 +146,7 @@ export interface DashboardStats {
   notSent: number;
   /** Current files whose agreement was declined, expired or could not be delivered. */
   needsAttention: number;
-  /** Agreements completed since the first of this month (UTC). */
+  /** Agreements completed since the first of this month, in the company's time zone (UTC when none is set). */
   signedThisMonth: number;
   /** Median time from sending to completion over the last 90 days, or null with no completions. */
   medianSecondsToSign: number | null;
@@ -156,7 +166,8 @@ export interface DashboardStats {
 export interface ImportRowResult {
   /** Spreadsheet row number when the row carried one, otherwise its position in the batch plus one. */
   row: number;
-  status: "created" | "skipped" | "error";
+  /** "not_processed": the import ran out of time before reaching this row; importing again picks it up. */
+  status: "created" | "skipped" | "error" | "not_processed";
   message: string;
   fileId?: string;
   reference?: string;
@@ -369,6 +380,10 @@ async function referenceTaken(db: DbOrTx, orgId: string, reference: string, exce
   return Boolean(row);
 }
 
+async function lockReferences(tx: DbOrTx, orgId: string): Promise<void> {
+  await tx.execute(sql`select pg_advisory_xact_lock(hashtextextended(${`file-reference:${orgId}`}, 0))`);
+}
+
 function referenceConflict(reference: string): ServiceError {
   const message = `Another file already uses the reference ${reference}. Choose a different reference, or leave it blank to have one generated.`;
   return new ServiceError("conflict", message, { reference: message });
@@ -384,8 +399,10 @@ async function trySend(actor: Actor, id: string, meta?: RequestMeta): Promise<Ag
     return { sent: true, envelopeId: result.envelopeId, delivery: result.delivery, signingUrl: result.signingUrl };
   } catch (err) {
     if (err instanceof ServiceError) {
-      // not_ready describes the org's setup (no agreement, no countersigner), so it applies to every file alike.
-      return { sent: false, reason: err.message || GENERIC_SEND_FAILURE, orgWide: err.code === "not_ready" };
+      // not_ready describes the org's setup (no agreement, no countersigner) and the company's
+      // sending limit is the company's, so both apply to every file alike.
+      const orgWide = err.code === "not_ready" || (err.code === "rate_limited" && err.fields?.scope === "org");
+      return { sent: false, reason: err.message || GENERIC_SEND_FAILURE, orgWide };
     }
     console.error("[files] sending the agreement failed", { fileId: id, error: err instanceof Error ? err.message : String(err) });
     return { sent: false, reason: GENERIC_SEND_FAILURE };
@@ -399,17 +416,21 @@ async function trySend(actor: Actor, id: string, meta?: RequestMeta): Promise<Ag
 const CREATE_ATTEMPTS = 8;
 
 async function insertFile(db: Db, actor: Actor, org: Org, values: CleanFileValues, source: FileSource, meta?: RequestMeta): Promise<{ file: FileRow; created: boolean }> {
-  const year = new Date().getUTCFullYear();
+  // The year people expect on a file opened on New Year's Eve is their own, not UTC's.
+  const year = calendarParts(new Date(), orgTimeZone(org)).year;
   const stem = `${referencePrefix(org)}-${year}-`;
 
   for (let attempt = 0; attempt < CREATE_ATTEMPTS; attempt++) {
     try {
       const file = await db.transaction(async (tx) => {
         let reference = values.reference;
-        if (!reference) {
-          // Serialises numbering per org so twenty simultaneous creates get twenty consecutive
-          // numbers instead of racing for the same one. Released when the transaction ends.
-          await tx.execute(sql`select pg_advisory_xact_lock(hashtextextended(${`file-reference:${org.id}`}, 0))`);
+        // Serialises references per org: twenty simultaneous creates get twenty consecutive
+        // numbers, and two typed references that differ only in letter case cannot both pass
+        // the check below (the unique index alone is case-sensitive). Released when the transaction ends.
+        await lockReferences(tx, org.id);
+        if (reference) {
+          if (await referenceTaken(tx, org.id, reference)) throw referenceConflict(reference);
+        } else {
           const seq = await nextSequence(tx, org.id, stem);
           reference = `${stem}${String(seq).padStart(4, "0")}`;
           // Only reachable if hand-typed references keep landing on the generated number.
@@ -446,6 +467,7 @@ async function insertFile(db: Db, actor: Actor, org: Org, values: CleanFileValue
       });
       return { file, created: true };
     } catch (err) {
+      if (err instanceof ServiceError) throw err;
       const violation = uniqueViolation(err);
       if (!violation) throw err;
       if (values.externalId && (violation.constraint.includes("external") || !violation.constraint.includes("reference"))) {
@@ -509,6 +531,8 @@ export async function getFile(actor: Actor, id: unknown): Promise<FileDetail> {
   const db = await getDb();
   const file = await findFile(db, actor.orgId, fileId(id));
   if (!file) throw new ServiceError("not_found", NOT_FOUND);
+  const org = await loadOrg(db, actor.orgId);
+  const viewer = await viewerOf(db, actor);
 
   const envelopeRows = await db
     .select()
@@ -523,14 +547,19 @@ export async function getFile(actor: Actor, id: unknown): Promise<FileDetail> {
         .orderBy(asc(signers.order), asc(signers.createdAt))
     : [];
 
-  const summaries: EnvelopeSummary[] = envelopeRows.map((envelope) => ({
-    ...omit(envelope, ["pages", "fields", "prefill"]),
-    signers: signerRows.filter((s) => s.envelopeId === envelope.id).map((signer) => omit(signer, ["tokenNonce", "tokenHash", "values"])),
-  }));
+  const now = new Date();
+  const summaries: FileEnvelope[] = envelopeRows.map((envelope) => {
+    const ctx = { envelope, org, file, signers: signerRows.filter((s) => s.envelopeId === envelope.id) };
+    return {
+      ...omit(envelope, ["pages", "fields", "prefill"]),
+      signers: ctx.signers.map((signer) => signerView(ctx, signer, now, viewer)),
+      canCountersign: canCountersignNow(ctx, viewer, now),
+    };
+  });
 
   // Asked for newest first so a very long history keeps its latest entries, then put back in reading order.
   const recent = await listEvents(actor.orgId, { fileId: file.id, limit: 500, newestFirst: true }, db);
-  return { file, envelopes: summaries, events: recent.reverse() };
+  return { file, envelopes: summaries, events: describeEvents(recent.reverse()) };
 }
 
 function omit<T extends object, K extends keyof T>(row: T, keys: readonly K[]): Omit<T, K> {
@@ -619,11 +648,31 @@ export async function fileCounts(actor: Actor): Promise<FileCounts> {
 
 const DAY_MS = 24 * 60 * 60 * 1000;
 
+/** The instant the current month began in `timeZone` (UTC when there is none). */
+function startOfMonth(now: Date, timeZone: string | null): Date {
+  const utc = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), 1));
+  if (!timeZone) return utc;
+  try {
+    const parts = new Intl.DateTimeFormat("en-CA", { timeZone, year: "numeric", month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit", second: "2-digit", hourCycle: "h23" }).formatToParts(now);
+    const n = (type: string) => Number(parts.find((p) => p.type === type)?.value);
+    const wallClock = Date.UTC(n("year"), n("month") - 1, n("day"), n("hour"), n("minute"), n("second"));
+    // The zone's offset right now; a daylight-saving change inside the month moves the line by an hour at most.
+    const offset = wallClock - Math.floor(now.getTime() / 1000) * 1000;
+    const start = new Date(Date.UTC(n("year"), n("month") - 1, 1) - offset);
+    return Number.isNaN(start.getTime()) ? utc : start;
+  } catch {
+    return utc;
+  }
+}
+
 export async function dashboardStats(actor: Actor, now: Date = new Date()): Promise<DashboardStats> {
   assertActor(actor);
   const db = await getDb();
   const counts = await fileCounts(actor);
-  const monthStart = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), 1));
+  const monthStart = startOfMonth(now, orgTimeZone(await loadOrg(db, actor.orgId)));
+  // An agreement is out from the moment its link exists: an emailed request sets sent_at,
+  // and a link shared by hand counts from when the envelope was created.
+  const outSince = sql<Date>`coalesce(${envelopes.sentAt}, ${envelopes.createdAt})`;
   const windowStart = new Date(now.getTime() - 90 * DAY_MS);
 
   const [signed] = await db
@@ -633,14 +682,13 @@ export async function dashboardStats(actor: Actor, now: Date = new Date()): Prom
 
   const [median] = await db
     .select({
-      seconds: sql<number | null>`percentile_cont(0.5) within group (order by extract(epoch from (${envelopes.completedAt} - ${envelopes.sentAt})))`,
+      seconds: sql<number | null>`percentile_cont(0.5) within group (order by extract(epoch from (${envelopes.completedAt} - ${outSince})))`,
     })
     .from(envelopes)
     .where(
       and(
         eq(envelopes.orgId, actor.orgId),
         eq(envelopes.status, "completed"),
-        isNotNull(envelopes.sentAt),
         isNotNull(envelopes.completedAt),
         gte(envelopes.completedAt, windowStart),
       ),
@@ -653,19 +701,18 @@ export async function dashboardStats(actor: Actor, now: Date = new Date()): Prom
       reference: files.reference,
       clientName: files.clientName,
       status: envelopes.status,
-      sentAt: envelopes.sentAt,
+      sentAt: outSince.mapWith(envelopes.createdAt),
     })
     .from(envelopes)
     .innerJoin(files, and(eq(files.id, envelopes.fileId), eq(files.orgId, envelopes.orgId)))
     .where(
       and(
         eq(envelopes.orgId, actor.orgId),
-        inArray(envelopes.status, ["sent", "viewed", "client_signed"]),
-        isNotNull(envelopes.sentAt),
+        inArray(envelopes.status, ["draft", "sent", "viewed", "client_signed"]),
         isNull(files.archivedAt),
       ),
     )
-    .orderBy(asc(envelopes.sentAt), asc(envelopes.id))
+    .orderBy(asc(outSince), asc(envelopes.id))
     .limit(1);
 
   const [rate] = await db
@@ -674,7 +721,7 @@ export async function dashboardStats(actor: Actor, now: Date = new Date()): Prom
       completed: sql<number>`(count(*) filter (where ${envelopes.status} = 'completed'))::int`,
     })
     .from(envelopes)
-    .where(and(eq(envelopes.orgId, actor.orgId), isNotNull(envelopes.sentAt), ne(envelopes.status, "voided"), gte(envelopes.sentAt, windowStart)));
+    .where(and(eq(envelopes.orgId, actor.orgId), ne(envelopes.status, "voided"), gte(outSince, windowStart)));
 
   const medianSeconds = median?.seconds == null ? null : Number(median.seconds);
   return {
@@ -770,11 +817,22 @@ export async function updateFile(actor: Actor, id: unknown, patch: UpdateFilePat
         .where(and(eq(envelopes.orgId, actor.orgId), eq(envelopes.fileId, targetId), inArray(envelopes.status, WAITING_ON_CLIENT)))
         .orderBy(desc(envelopes.createdAt))
         .limit(1);
-      const outstandingEnvelope = outstanding ?? null;
+      const [clientSigner] = outstanding
+        ? await tx
+            .select({ id: signers.id })
+            .from(signers)
+            .where(and(eq(signers.envelopeId, outstanding.id), eq(signers.orgId, actor.orgId), eq(signers.role, "client")))
+            .limit(1)
+        : [];
+      const outstandingEnvelope = outstanding ? { ...outstanding, clientSignerId: clientSigner?.id ?? null } : null;
 
       if (changed.length === 0) return { file: current, changed, outstandingEnvelope, reissueSuggested: false };
 
-      if (changes.reference && (await referenceTaken(tx, actor.orgId, changes.reference, targetId))) throw referenceConflict(changes.reference);
+      if (changes.reference) {
+        // Same lock as creating a file, so a rename cannot race a create into a case-only duplicate.
+        await lockReferences(tx, actor.orgId);
+        if (await referenceTaken(tx, actor.orgId, changes.reference, targetId)) throw referenceConflict(changes.reference);
+      }
 
       const [file] = await tx
         .update(files)
@@ -859,9 +917,21 @@ export interface ImportOptions {
    *  to be sent from each file. Files are always all created first. Default 40 seconds,
    *  chosen to finish inside a serverless request. */
   sendBudgetMs?: number;
+  /** How long the whole import (creating files, then sending) may run before it stops and
+   *  reports the remaining rows as "not_processed". Default 45 seconds. Importing the same
+   *  spreadsheet again continues where it stopped: rows already imported are skipped. */
+  budgetMs?: number;
+  /** Import rows even when an identical file was imported in the last day. Off by default,
+   *  so that importing a spreadsheet twice (a double click, a retry after a timeout) does
+   *  not create every file, and email every client, a second time. */
+  allowRepeats?: boolean;
 }
 
 const DEFAULT_SEND_BUDGET_MS = 40_000;
+const DEFAULT_IMPORT_BUDGET_MS = 45_000;
+/** How far back an identical imported row counts as a repeat of the same import. */
+const REPEAT_WINDOW_MS = 24 * 60 * 60 * 1000;
+const REPEAT_LOOKUP_MAX = 5000;
 const LOOKUP_CHUNK = 500;
 
 function importSignature(row: Record<string, unknown>): string {
@@ -873,6 +943,31 @@ function importSignature(row: Record<string, unknown>): string {
         .join("&")
     : "";
   return [normalizeEmail(row.clientEmail), part(row.clientName), part(row.clientCompany), part(row.clientTitle), part(row.clientPhone), part(row.description), data].join("\u0001");
+}
+
+/**
+ * Signatures of the files imported from a spreadsheet in the last day, for rows that
+ * carry no reference or external ID to recognise them by.
+ */
+async function recentImportSignatures(db: Db, orgId: string, now: Date): Promise<Map<string, string>> {
+  const rows = await db
+    .select({
+      reference: files.reference,
+      clientName: files.clientName,
+      clientEmail: files.clientEmail,
+      clientCompany: files.clientCompany,
+      clientTitle: files.clientTitle,
+      clientPhone: files.clientPhone,
+      description: files.description,
+      data: files.data,
+    })
+    .from(files)
+    .where(and(eq(files.orgId, orgId), eq(files.source, "csv"), isNull(files.archivedAt), gte(files.createdAt, new Date(now.getTime() - REPEAT_WINDOW_MS))))
+    .orderBy(desc(files.createdAt))
+    .limit(REPEAT_LOOKUP_MAX);
+  const found = new Map<string, string>();
+  for (const row of rows) found.set(importSignature(row), row.reference);
+  return found;
 }
 
 async function existingKeys(db: Db, orgId: string, references: string[], externalIds: string[]): Promise<{ references: Set<string>; externalIds: Set<string> }> {
@@ -899,7 +994,10 @@ async function existingKeys(db: Db, orgId: string, references: string[], externa
 /**
  * Creates one file per row. One bad row never stops the rest: every row gets its
  * own result. A row is skipped when its reference or external ID already exists
- * (in this batch or in the account), or when it repeats an earlier row exactly.
+ * (in this batch or in the account), when it repeats an earlier row exactly, or
+ * when it has neither and an identical file was imported within the last day
+ * (unless `allowRepeats`), which is what makes importing a spreadsheet again safe.
+ * Rows the time budget did not reach come back as "not_processed".
  *
  * Throws only when the batch as a whole is unusable (not a list, over 1000 rows).
  */
@@ -935,6 +1033,11 @@ export async function importFiles(actor: Actor, rows: ImportRow[], opts: ImportO
     if (ext) externalIds.add(ext);
   }
   const existing = await existingKeys(db, org.id, [...references], [...externalIds]);
+  const anonymous = rows.some((row) => isRecord(row) && !key(row.reference, FILE_LIMITS.referenceMax) && !key(row.externalId, FILE_LIMITS.externalIdMax));
+  const recent = anonymous && options.allowRepeats !== true ? await recentImportSignatures(db, org.id, new Date()) : new Map<string, string>();
+
+  const requestedTotal = Number(options.budgetMs);
+  const overallDeadline = Date.now() + (Number.isFinite(requestedTotal) && requestedTotal >= 0 ? requestedTotal : DEFAULT_IMPORT_BUDGET_MS);
 
   const results: ImportRowResult[] = [];
   const created: { result: ImportRowResult; fileId: string }[] = [];
@@ -945,6 +1048,11 @@ export async function importFiles(actor: Actor, rows: ImportRow[], opts: ImportO
   for (let i = 0; i < rows.length; i++) {
     const row = rows[i];
     const number = rowNumber(row, i);
+    // At least one row is always attempted, so a retry always makes progress.
+    if (i > 0 && Date.now() >= overallDeadline) {
+      results.push({ row: number, status: "not_processed", message: "Not imported: the import ran out of time before reaching this row. Import the same spreadsheet again; the rows already imported are skipped." });
+      continue;
+    }
     if (!isRecord(row)) {
       results.push({ row: number, status: "error", message: "This row could not be read." });
       continue;
@@ -975,6 +1083,16 @@ export async function importFiles(actor: Actor, rows: ImportRow[], opts: ImportO
       const first = seenRows.get(signature);
       if (first !== undefined) {
         results.push({ row: number, status: "skipped", message: `Skipped: this row is identical to row ${first}.` });
+        continue;
+      }
+      const earlier = recent.get(signature);
+      if (earlier !== undefined) {
+        results.push({
+          row: number,
+          status: "skipped",
+          message: `Skipped: an identical file (${earlier}) was imported in the last day. If this is a second file for the same client, give the row its own reference, or import again and allow repeats.`,
+          reference: earlier,
+        });
         continue;
       }
       seenRows.set(signature, number);
@@ -1018,7 +1136,7 @@ export async function importFiles(actor: Actor, rows: ImportRow[], opts: ImportO
   // here costs a click per unsent file, never a lost row.
   const requestedBudget = Number(options.sendBudgetMs);
   const budget = Number.isFinite(requestedBudget) && requestedBudget >= 0 ? requestedBudget : DEFAULT_SEND_BUDGET_MS;
-  const deadline = Date.now() + budget;
+  const deadline = Math.min(Date.now() + budget, overallDeadline);
   let blocked: string | null = null;
   for (const { result, fileId: createdId } of created) {
     if (blocked) {
@@ -1026,7 +1144,7 @@ export async function importFiles(actor: Actor, rows: ImportRow[], opts: ImportO
       continue;
     }
     if (Date.now() >= deadline) {
-      result.message = `Created file ${result.reference}. The agreement was not sent because the import ran out of time; send it from the file.`;
+      result.message = `Created file ${result.reference}. The agreement was not sent because the import ran out of time; send it from the file, or send all that are left in one go.`;
       continue;
     }
     const outcome = await trySend(actor, createdId, meta);
@@ -1046,12 +1164,57 @@ export async function importFiles(actor: Actor, rows: ImportRow[], opts: ImportO
   return results;
 }
 
+export interface BulkSendResult {
+  results: { fileId: string; sent: boolean; envelopeId?: string; delivery?: AgreementOutcome["delivery"]; reason?: string }[];
+  /** Files not attempted because time ran out or sending is blocked for the whole company. Pass them to the next call. */
+  remaining: string[];
+  /** Present when sending stopped for a reason that applies to every file (no active agreement, the sending limit). */
+  blocked?: string;
+}
+
+/**
+ * Send the company's agreement for many files, for as long as the time budget
+ * allows (default 40 seconds, sized to fit a serverless request). What is left is
+ * returned in `remaining`, so a page can keep calling until it is empty. This is
+ * how the agreements of a large import get sent without opening files one by one.
+ */
+export async function sendAgreementsForFiles(actor: Actor, fileIds: unknown, opts: { budgetMs?: number } = {}, meta?: RequestMeta): Promise<BulkSendResult> {
+  assertActor(actor);
+  if (!Array.isArray(fileIds)) throw new ServiceError("invalid", "No files were chosen. Select the files to send the agreement for.");
+  if (fileIds.length > FILE_LIMITS.importMaxRows) {
+    throw new ServiceError("invalid", `Agreements can be sent for at most ${FILE_LIMITS.importMaxRows} files at a time and ${fileIds.length} were chosen. Send them in smaller groups.`);
+  }
+  const ids = [...new Set(fileIds.filter((id): id is string => typeof id === "string" && id.length > 0 && id.length <= 64))];
+  const requested = Number(isRecord(opts) ? opts.budgetMs : undefined);
+  const deadline = Date.now() + (Number.isFinite(requested) && requested >= 0 ? requested : DEFAULT_SEND_BUDGET_MS);
+
+  const out: BulkSendResult = { results: [], remaining: [] };
+  for (let i = 0; i < ids.length; i++) {
+    // At least one file is always attempted, so repeated calls always finish.
+    if (out.blocked || (i > 0 && Date.now() >= deadline)) {
+      out.remaining.push(ids[i]);
+      continue;
+    }
+    const outcome = await trySend(actor, ids[i], meta);
+    out.results.push({
+      fileId: ids[i],
+      sent: outcome.sent,
+      ...(outcome.envelopeId ? { envelopeId: outcome.envelopeId } : {}),
+      ...(outcome.delivery ? { delivery: outcome.delivery } : {}),
+      ...(outcome.reason ? { reason: outcome.reason } : {}),
+    });
+    if (!outcome.sent && outcome.orgWide) out.blocked = outcome.reason ?? GENERIC_SEND_FAILURE;
+  }
+  return out;
+}
+
 /** Totals for the line above an import's row-by-row results. */
-export function summarizeImport(results: readonly ImportRowResult[]): { created: number; skipped: number; errors: number; agreementsSent: number } {
-  const summary = { created: 0, skipped: 0, errors: 0, agreementsSent: 0 };
+export function summarizeImport(results: readonly ImportRowResult[]): { created: number; skipped: number; errors: number; notProcessed: number; agreementsSent: number } {
+  const summary = { created: 0, skipped: 0, errors: 0, notProcessed: 0, agreementsSent: 0 };
   for (const r of results) {
     if (r.status === "created") summary.created++;
     else if (r.status === "skipped") summary.skipped++;
+    else if (r.status === "not_processed") summary.notProcessed++;
     else summary.errors++;
     if (r.agreementSent) summary.agreementsSent++;
   }

@@ -5,7 +5,7 @@
  * Every function takes an Actor and scopes every query by actor.orgId. An id that
  * belongs to another company behaves exactly like an id that does not exist.
  */
-import { and, desc, eq, inArray, isNull, sql, type SQL } from "drizzle-orm";
+import { and, asc, desc, eq, inArray, isNull, sql, type SQL } from "drizzle-orm";
 import { getDb, type Db, type DbOrTx } from "@/lib/db";
 import {
   blobs,
@@ -25,7 +25,7 @@ import {
   type Template,
   type User,
 } from "@/lib/db/schema";
-import { newId } from "@/lib/ids";
+import { newId, sha256Hex } from "@/lib/ids";
 import { IMAGE_FIELD_TYPES, LIMITS, type Field, type FieldValues } from "@/lib/types";
 import { parseImageDataUrl } from "@/lib/pdf/stamp";
 import { cleanMultilineText, cleanText, isValidEmail, normalizeEmail } from "@/lib/validation";
@@ -34,33 +34,48 @@ import { resolveSettings, type ResolvedOrgSettings } from "./accounts";
 import { getBlob } from "./blobs";
 import { describeEvent, listEvents, recordEvent } from "./events";
 import { enqueueWebhookEvent } from "./webhooks";
-import { deliveryFailedEmail, reminderEmail, signingRequestEmail, voidedEmail } from "./email-templates";
+import { deliveryFailedEmail, reminderEmail, signingRequestEmail } from "./email-templates";
 import { describeWait, rateLimit } from "./rate-limit";
+import { resolveCountersigner, templateReadiness } from "./templates";
 import { mintSigningToken, signingUrl, tokenIsCurrent } from "./tokens";
 import {
   AWAITING_CLIENT_STATUSES,
   OPEN_STATUSES,
   Raced,
   afterSignature,
+  allValues,
+  awaitingSeal,
   brandOf,
+  calendarParts,
   defaultValues,
   documentFilename,
   emailCountersigner,
   fieldsFor,
   fileUrl,
+  finalizeEnvelope,
+  inTransaction,
+  linkDeadEmail,
   loadEnvelopeContext,
+  lockFile,
   longDate,
+  orgTimeZone,
+  readOnlyValues,
   recordSignature,
-  resultFor,
+  resultForRecipient,
   safeSend,
   settleFileStatus,
   signedDateLabel,
   signingState,
+  stampVisible,
   teamRecipient,
   validateSignerValues,
+  valuesVisibleTo,
   webhookPayload,
   type DocumentDownload,
   type EnvelopeContext,
+  type FinalizeResult,
+  type LinkDeadKind,
+  type ReadOnlyValue,
   type SendOutcome,
   type SigningResult,
 } from "./signing";
@@ -76,6 +91,14 @@ export interface SendOptions {
   templateId?: unknown;
   /** Void whatever is still out for signature on the file (and allow sending again after a completed one). */
   replace?: unknown;
+  /**
+   * With `replace`: the id of the open envelope the caller was looking at. It makes
+   * a repeated request (a double click, a retry after a timeout) return the
+   * replacement the first request created instead of replacing it again.
+   */
+  replaceEnvelopeId?: unknown;
+  /** With `replace`: also discard an agreement the client has already signed and that is waiting for the countersignature. */
+  replaceSigned?: unknown;
 }
 
 export interface SendResult {
@@ -83,11 +106,17 @@ export interface SendResult {
   delivery: Delivery;
   /** The client's signing link. Always returned so it can be shared by hand. */
   signingUrl: string;
+  /** True when this request repeated an earlier one and its envelope was returned; nothing new was sent. */
+  duplicate?: boolean;
 }
 
 /** A signer as the sender sees it: no link material and no signature images. */
 export type SignerView = Omit<Signer, "tokenNonce" | "tokenHash" | "values"> & {
-  /** Present while this signer can still sign (or will be able to once it is their turn). */
+  /**
+   * Present while this signer can still sign (or will be able to once it is their turn).
+   * The company signer's link signs for the company, so it is only given to people
+   * who may countersign: that signer, the chosen countersigner, owners and admins.
+   */
   signingUrl: string | null;
   /** True when the envelope is waiting on this signer right now. */
   isTurn: boolean;
@@ -99,8 +128,12 @@ export interface EnvelopeDetail {
   envelope: Envelope;
   file: Pick<FileRow, "id" | "reference" | "clientName" | "clientEmail" | "agreementStatus">;
   signers: SignerView[];
-  events: (EventRow & { description: string })[];
+  events: DescribedEvent[];
+  /** True when the person asking may countersign this envelope right now. */
+  canCountersign: boolean;
 }
+
+export type DescribedEvent = EventRow & { description: string };
 
 export interface EnvelopeListItem extends EnvelopeSummary {
   signers: Pick<Signer, "id" | "role" | "order" | "name" | "email" | "status" | "signedAt" | "viewedAt">[];
@@ -108,8 +141,30 @@ export interface EnvelopeListItem extends EnvelopeSummary {
 
 export interface DeliveryResult {
   delivery: Delivery;
-  signingUrl: string;
+  /** Null when the link is the company signer's and the caller is not someone who may countersign. */
+  signingUrl: string | null;
 }
+
+/**
+ * Ceilings on signing requests, so an account cannot be used to flood inboxes
+ * through the platform's sending address. A company in its first days gets a much
+ * lower ceiling: that is when an account made for abuse does its damage, and a
+ * genuine new customer rarely needs more.
+ */
+export const SEND_LIMITS = {
+  newOrgDays: 7,
+  newOrgPerHour: 30,
+  newOrgPerDay: 100,
+  perHour: 1500,
+  perDay: 5000,
+  /** Requests to one address in a day, counted across every company. */
+  perRecipientPerDay: 10,
+  /** Sends (including replacements) for one file in an hour. */
+  perFilePerHour: 6,
+} as const;
+
+/** Recorded as the void reason of an envelope that a newer one replaced. */
+export const REPLACED_REASON = "Replaced by a new signing request";
 
 const NOT_FOUND = "That agreement was not found. It may belong to a different account or the link may be wrong.";
 const SIGNER_NOT_FOUND = "That signer was not found. Reload the file and try again.";
@@ -221,9 +276,13 @@ const TRUTHY = new Set(["true", "yes", "y", "1", "x", "on", "checked"]);
 export function resolvePrefill(
   fields: readonly Field[],
   file: Pick<FileRow, "clientName" | "clientEmail" | "clientCompany" | "clientTitle" | "clientPhone" | "reference" | "description" | "data">,
-  org: Pick<Org, "name" | "legalName">,
+  org: Pick<Org, "name" | "legalName"> & { settings?: unknown },
   now: Date = new Date(),
+  /** IANA zone the dates are calendar days in. Defaults to the company's own zone, then UTC. */
+  timeZone: string | null = orgTimeZone(org),
 ): FieldValues {
+  const zone = timeZone || "UTC";
+  const today = calendarParts(now, zone);
   const data: Record<string, unknown> = file.data && typeof file.data === "object" && !Array.isArray(file.data) ? file.data : {};
   const lookup = (key: string): unknown => {
     switch (key) {
@@ -244,7 +303,7 @@ export function resolvePrefill(
       case "company_name":
         return org.legalName || org.name;
       case "today":
-        return longDate(now);
+        return longDate(now, zone);
     }
     if (!key.startsWith("custom:")) return undefined;
     const custom = key.slice("custom:".length);
@@ -252,13 +311,13 @@ export function resolvePrefill(
     // The detector binds "this ___ day of ___, 20__" blanks to these; they come from the send date.
     switch (custom) {
       case "today_day":
-        return ordinal(now.getUTCDate());
+        return ordinal(today.day);
       case "today_month":
-        return new Intl.DateTimeFormat("en-GB", { month: "long", timeZone: "UTC" }).format(now);
+        return today.month;
       case "today_year":
-        return String(now.getUTCFullYear());
+        return String(today.year);
       case "today_year_short":
-        return String(now.getUTCFullYear() % 100).padStart(2, "0");
+        return String(today.year % 100).padStart(2, "0");
     }
     return undefined;
   };
@@ -280,7 +339,7 @@ export function resolvePrefill(
 }
 
 // ---------------------------------------------------------------------------
-// Readiness (local copy of the rule; see the note on unifying it with templateReadiness)
+// Readiness and who may act for the company
 // ---------------------------------------------------------------------------
 
 function snapshotFields(template: Pick<Template, "fields">): Field[] {
@@ -288,47 +347,47 @@ function snapshotFields(template: Pick<Template, "fields">): Field[] {
   return all.filter((f): f is Field => Boolean(f) && typeof f === "object" && typeof f.id === "string" && f.id.length > 0);
 }
 
-interface Countersigner {
-  user: User;
+/**
+ * Decides whether this agreement can be sent right now and who countersigns, by
+ * the same rule the agreements list and activation use (templateReadiness), so the
+ * badge, the send button, the API and the intake link can never disagree.
+ * Throws not_ready with the first thing to fix.
+ */
+function checkReady(template: Template, org: Org, team: User[]): User | null {
+  const members = team.map((u) => ({ id: u.id, role: u.role, disabled: u.disabledAt !== null, hasSignature: parseImageDataUrl(u.savedSignature).ok, user: u }));
+  const readiness = templateReadiness(template, org, members);
+  if (!readiness.ready) {
+    const fields: Record<string, string> = {};
+    for (const p of readiness.problems) if (!(p.code in fields)) fields[p.code] = p.message;
+    throw new ServiceError("not_ready", `"${template.name}" cannot be sent yet. ${readiness.problems[0]?.message ?? ""} Then send again.`.replace(/\s+/g, " "), fields);
+  }
+  if (!snapshotFields(template).some((f) => f.role === "company")) return null;
+  return resolveCountersigner(resolveSettings(org), members).member?.user ?? null;
 }
 
 /**
- * Decides whether this agreement can be sent right now and who countersigns.
- * Throws not_ready with the first thing to fix.
+ * The company signer's link signs on the company's behalf, so only the people who
+ * may countersign are ever shown it: the signer themselves, the chosen
+ * countersigner, owners and admins. API keys and the system never are.
  */
-function checkReady(template: Template, fields: Field[], settings: ResolvedOrgSettings, team: User[], sender: User | null): Countersigner | null {
-  const pages = Array.isArray(template.pages) ? template.pages : [];
-  if (pages.length === 0) {
-    throw new ServiceError("not_ready", `"${template.name}" has no pages. Replace the document with a new upload, then send again.`);
-  }
-  if (!fields.some((f) => f.role === "client" && f.type === "signature" && f.required === true)) {
-    throw new ServiceError(
-      "not_ready",
-      `"${template.name}" has no required signature field for the client, so there is nothing for them to sign. Add a client signature field to the agreement, then send again.`,
-    );
-  }
-  if (!fields.some((f) => f.role === "company")) return null;
+function mayActForCompany(viewer: User | null, signer: Pick<Signer, "userId">, org: Org): boolean {
+  if (!viewer || viewer.disabledAt) return false;
+  return signer.userId === viewer.id || resolveSettings(org).countersignerUserId === viewer.id || viewer.role === "owner" || viewer.role === "admin";
+}
 
-  const active = team.filter((u) => !u.disabledAt);
-  const chosenId = typeof settings.countersignerUserId === "string" ? settings.countersignerUserId : "";
-  const chosen = chosenId ? active.find((u) => u.id === chosenId) : undefined;
-  // With nobody chosen (or the chosen person gone), the person sending signs for the company.
-  const user = chosen ?? (sender && !sender.disabledAt ? sender : undefined);
-  if (!user) {
-    throw new ServiceError(
-      "not_ready",
-      chosenId
-        ? "The person chosen to countersign is no longer an active member of your team. Choose another countersigner in Settings, then send again."
-        : "This agreement has fields for your company to sign, but nobody is chosen to countersign. Choose a countersigner in Settings, or remove the company fields.",
-    );
-  }
-  if (settings.countersignMode === "auto" && !parseImageDataUrl(user.savedSignature).ok) {
-    throw new ServiceError(
-      "not_ready",
-      `Countersigning is set to automatic, but ${user.name} has no saved signature. Have them save a signature in their profile, or switch countersigning to manual in Settings.`,
-    );
-  }
-  return { user };
+function maySeeLink(viewer: User | null, signer: Pick<Signer, "userId" | "role">, org: Org): boolean {
+  return signer.role !== "company" || mayActForCompany(viewer, signer, org);
+}
+
+/** The stored row of a signed-in actor, or null for an API key, the system, or an account that is gone. Never throws. */
+export async function viewerOf(db: DbOrTx, actor: Actor): Promise<User | null> {
+  if (!actor || actor.type !== "user" || typeof actor.userId !== "string") return null;
+  const [user] = await db
+    .select()
+    .from(users)
+    .where(and(eq(users.id, actor.userId), eq(users.orgId, actor.orgId)))
+    .limit(1);
+  return user && !user.disabledAt ? user : null;
 }
 
 async function pickTemplate(db: Db, orgId: string, templateId: unknown): Promise<Template> {
@@ -406,11 +465,12 @@ function failureReason(outcome: SendOutcome): string {
  */
 async function recordClientDelivery(db: Db, ctx: EnvelopeContext, signer: Signer, outcome: SendOutcome, actor: Actor, meta: RequestMeta | undefined, now: Date): Promise<void> {
   const base = { orgId: ctx.org.id, fileId: ctx.file.id, envelopeId: ctx.envelope.id };
-  await db.transaction(async (tx) => {
+  await inTransaction(db, async (tx) => {
+    await lockFile(tx, ctx.org.id, ctx.file.id);
     if (outcome.status === "sent") {
       await tx
         .update(envelopes)
-        .set({ status: "sent", sentAt: now, updatedAt: now })
+        .set({ status: "sent", sentAt: sql`coalesce(${envelopes.sentAt}, ${now.toISOString()}::timestamptz)`, updatedAt: now })
         .where(and(eq(envelopes.id, ctx.envelope.id), eq(envelopes.status, "draft")));
       await tx
         .update(files)
@@ -476,12 +536,25 @@ async function deliverTo(db: Db, ctx: EnvelopeContext, signer: Signer, actor: Ac
 // Voiding (shared by void, replace and archive)
 // ---------------------------------------------------------------------------
 
-/** Guarded void inside the caller's transaction. Returns false when the envelope was no longer open. */
-async function voidInTx(tx: DbOrTx, actor: Actor, ctx: Pick<EnvelopeContext, "envelope" | "file">, reason: string, meta: RequestMeta | undefined, now: Date): Promise<boolean> {
+/**
+ * Guarded void inside the caller's transaction, which must already hold the file's
+ * lock. Only an envelope whose status is one of `allowed` is voided, so a caller who
+ * meant to cancel an unsigned request cannot cancel one the client has just signed.
+ * Returns false when nothing was voided.
+ */
+async function voidInTx(
+  tx: DbOrTx,
+  actor: Actor,
+  ctx: Pick<EnvelopeContext, "envelope" | "file"> & { signers?: Signer[] },
+  reason: string,
+  meta: RequestMeta | undefined,
+  now: Date,
+  allowed: EnvelopeStatus[],
+): Promise<boolean> {
   const [voided] = await tx
     .update(envelopes)
     .set({ status: "voided", voidReason: reason || null, nextReminderAt: null, updatedAt: now })
-    .where(and(eq(envelopes.id, ctx.envelope.id), eq(envelopes.orgId, actor.orgId), inArray(envelopes.status, OPEN_STATUSES)))
+    .where(and(eq(envelopes.id, ctx.envelope.id), eq(envelopes.orgId, actor.orgId), inArray(envelopes.status, allowed)))
     .returning({ id: envelopes.id });
   if (!voided) return false;
   await recordEvent(tx, {
@@ -498,11 +571,17 @@ async function voidInTx(tx: DbOrTx, actor: Actor, ctx: Pick<EnvelopeContext, "en
 }
 
 /**
- * Tell signers the link they hold is dead. Only people who actually have it are
- * told: someone the request reached by email, or who opened or signed it. A signer
- * whose email never went out would only be confused by a cancellation.
+ * Tell signers the link they hold is dead, in words that match what happened
+ * (`kind`). Only people who actually have it are told: someone the request reached
+ * by email, or who opened or signed it. A signer whose email never went out would
+ * only be confused by the news.
  */
-export async function notifySignersLinkDead(db: Db, ctx: EnvelopeContext, reason: string, actor?: Actor): Promise<void> {
+export async function notifySignersLinkDead(
+  db: Db,
+  ctx: EnvelopeContext,
+  opts: { kind?: LinkDeadKind; reason?: string; expiredOn?: string | null; actor?: Actor } = {},
+): Promise<void> {
+  const kind: LinkDeadKind = opts.kind ?? "voided";
   try {
     const delivered = await db
       .select({ to: emailLog.to })
@@ -514,18 +593,19 @@ export async function notifySignersLinkDead(db: Db, ctx: EnvelopeContext, reason
       const address = normalizeEmail(signer.email);
       if (signer.status === "waiting" || told.has(address)) continue;
       // The person voiding it does not need an email saying so.
-      if (actor?.type === "user" && signer.userId === actor.userId) continue;
+      if (opts.actor?.type === "user" && signer.userId === opts.actor.userId) continue;
       if (!reached.has(address) && !signer.viewedAt && signer.status !== "signed") continue;
       told.add(address);
       await safeSend(ctx.org, {
         envelopeId: ctx.envelope.id,
-        kind: "voided",
+        // Logged under what it says, so the email history of a file reads truthfully too.
+        kind: kind === "expired" ? "link_expired" : kind,
         to: signer.email,
-        ...voidedEmail({ brand: brandOf(ctx.org), signerName: signer.name, agreementName: ctx.envelope.templateName, reason }),
+        ...linkDeadEmail(kind, { brand: brandOf(ctx.org), signerName: signer.name, agreementName: ctx.envelope.templateName, reason: opts.reason, expiredOn: opts.expiredOn }),
       });
     }
   } catch (err) {
-    console.error("[envelopes] could not notify signers of a void", err instanceof Error ? err.message : err);
+    console.error("[envelopes] could not notify signers of a dead link", err instanceof Error ? err.message : err);
   }
 }
 
@@ -536,6 +616,47 @@ function cleanReason(reason: unknown): string {
 // ---------------------------------------------------------------------------
 // Sending
 // ---------------------------------------------------------------------------
+
+async function limitSender(key: string, limit: number, windowSeconds: number, what: string, scope?: "org"): Promise<void> {
+  const result = await rateLimit(key, limit, windowSeconds);
+  if (!result.ok) {
+    throw new ServiceError(
+      "rate_limited",
+      `${what} Try again ${describeWait(result.retryAfterSeconds)}, or copy the signing link and send it yourself.`,
+      scope ? { scope } : undefined,
+    );
+  }
+}
+
+/** Counts one new signing request against the file, the recipient and the company. Throws rate_limited. */
+async function limitNewRequest(org: Org, fileId: string, recipient: string, now: Date): Promise<void> {
+  const hold = (what: string, retryAfterSeconds: number, scope?: "org") =>
+    new ServiceError("rate_limited", `${what} The file is saved; send the agreement from it ${describeWait(retryAfterSeconds)}.`, scope ? { scope } : undefined);
+
+  const perFile = await rateLimit(`send:file:${fileId}`, SEND_LIMITS.perFilePerHour, 3600);
+  if (!perFile.ok) throw hold("The agreement for this file has been sent several times in the last hour.", perFile.retryAfterSeconds);
+
+  // Hashed so the counter is shared by every company without an address sitting in a key.
+  const perRecipient = await rateLimit(`send:to:${sha256Hex(recipient).slice(0, 32)}`, SEND_LIMITS.perRecipientPerDay, 86_400);
+  if (!perRecipient.ok) throw hold(`${recipient} has been sent the most signing requests one address can receive in a day.`, perRecipient.retryAfterSeconds);
+
+  const isNew = now.getTime() - org.createdAt.getTime() < SEND_LIMITS.newOrgDays * DAY_MS;
+  const hourly = isNew ? SEND_LIMITS.newOrgPerHour : SEND_LIMITS.perHour;
+  const daily = isNew ? SEND_LIMITS.newOrgPerDay : SEND_LIMITS.perDay;
+  const firstWeek = isNew ? ` Accounts in their first ${SEND_LIMITS.newOrgDays} days have a lower limit.` : "";
+  const perHour = await rateLimit(`send:org:${org.id}:hour`, hourly, 3600);
+  if (!perHour.ok) throw hold(`Your company has reached its limit of ${hourly} signing requests an hour.${firstWeek}`, perHour.retryAfterSeconds, "org");
+  const perDay = await rateLimit(`send:org:${org.id}:day`, daily, 86_400);
+  if (!perDay.ok) throw hold(`Your company has reached its limit of ${daily} signing requests a day.${firstWeek}`, perDay.retryAfterSeconds, "org");
+}
+
+/** How the request for an envelope that already exists went out, read back from what was recorded. */
+async function deliveryOfExisting(db: Db, envelope: Envelope): Promise<Delivery> {
+  if (envelope.sentAt) return "emailed";
+  const trail = await listEvents(envelope.orgId, { envelopeId: envelope.id, limit: 50 }, db);
+  const failed = trail.find((e) => e.type === "envelope.delivery_failed");
+  return failed && (failed.data as Record<string, unknown> | null)?.configured === false ? "email_not_configured" : "email_failed";
+}
 
 /**
  * Send the company's agreement for one file. The envelope snapshots the agreement
@@ -550,6 +671,8 @@ export async function sendAgreementForFile(actor: Actor, fileId: unknown, opts: 
   const targetId = idOf(fileId, FILE_NOT_FOUND);
   const options: SendOptions = opts && typeof opts === "object" ? opts : {};
   const replace = options.replace === true;
+  const replaceSigned = replace && options.replaceSigned === true;
+  const seenEnvelopeId = replace && typeof options.replaceEnvelopeId === "string" && options.replaceEnvelopeId.length <= 64 ? options.replaceEnvelopeId : null;
 
   const [file] = await db
     .select()
@@ -571,8 +694,8 @@ export async function sendAgreementForFile(actor: Actor, fileId: unknown, opts: 
 
   const template = await pickTemplate(db, actor.orgId, options.templateId);
   const fields = snapshotFields(template);
-  const team = await db.select().from(users).where(eq(users.orgId, actor.orgId));
-  const countersigner = checkReady(template, fields, settings, team, sender);
+  const team = await db.select().from(users).where(eq(users.orgId, actor.orgId)).orderBy(asc(users.createdAt), asc(users.id));
+  const countersigner = checkReady(template, org, team);
 
   // Blobs are immutable, so the envelope can point at the very bytes the agreement uses today.
   const [pdf] = await db
@@ -583,6 +706,9 @@ export async function sendAgreementForFile(actor: Actor, fileId: unknown, opts: 
   if (!pdf) throw new ServiceError("not_ready", `The document for "${template.name}" is missing from storage. Upload the agreement again, then send.`);
 
   const now = new Date();
+  // Counted only once everything about the request is known to be sendable.
+  await limitNewRequest(org, file.id, clientEmail, now);
+
   const schedule = scheduleOf(settings);
   const envelopeId = newId("env");
   const clientSignerId = newId("sgn");
@@ -591,8 +717,8 @@ export async function sendAgreementForFile(actor: Actor, fileId: unknown, opts: 
   const companyToken = mintSigningToken(companySignerId);
   const clientName = cleanText(file.clientName, 200) || clientEmail;
 
-  const replaced: EnvelopeContext[] = [];
-  await db.transaction(async (tx) => {
+  const outcome = await inTransaction(db, async (tx) => {
+    const replaced: EnvelopeContext[] = [];
     // Touching the file row takes its lock, so two sends for one file run one after the other
     // and the second sees the first one's envelope.
     const [locked] = await tx
@@ -605,7 +731,8 @@ export async function sendAgreementForFile(actor: Actor, fileId: unknown, opts: 
     const existing = await tx
       .select()
       .from(envelopes)
-      .where(and(eq(envelopes.fileId, file.id), eq(envelopes.orgId, actor.orgId)));
+      .where(and(eq(envelopes.fileId, file.id), eq(envelopes.orgId, actor.orgId)))
+      .orderBy(desc(envelopes.createdAt), desc(envelopes.id));
     const open = existing.filter((e) => OPEN_STATUSES.includes(e.status));
     const hasCompleted = existing.some((e) => e.status === "completed");
     if (!replace && open.length > 0) {
@@ -614,9 +741,27 @@ export async function sendAgreementForFile(actor: Actor, fileId: unknown, opts: 
     if (!replace && hasCompleted) {
       throw new ServiceError("conflict", "This file already has a signed agreement. To have the client sign again, send again and choose to replace it.");
     }
+    if (seenEnvelopeId) {
+      const seen = existing.find((e) => e.id === seenEnvelopeId);
+      // The envelope the caller was looking at has already been replaced: this is the
+      // same request arriving twice, and its answer is the replacement that exists.
+      if (seen && seen.status === "voided" && seen.voidReason === REPLACED_REASON && open.length > 0) {
+        return { duplicate: open[0], replaced };
+      }
+      if (open.some((e) => e.id !== seenEnvelopeId)) {
+        throw new ServiceError("conflict", "The agreement on this file changed while you were looking at it. Reload the file, then send again if it is still needed.");
+      }
+    }
+    if (!replaceSigned && open.some((e) => e.status === "client_signed")) {
+      throw new ServiceError(
+        "conflict",
+        "The client has already signed the agreement that is out on this file, and it is waiting for your company's countersignature. Countersign it, or confirm that you want to discard the signed agreement and send a new one.",
+        { confirm: "replaceSigned" },
+      );
+    }
     for (const old of open) {
       const oldSigners = await tx.select().from(signers).where(eq(signers.envelopeId, old.id));
-      if (await voidInTx(tx, actor, { envelope: old, file }, "Replaced by a new signing request", meta, now)) {
+      if (await voidInTx(tx, actor, { envelope: old, file, signers: oldSigners }, REPLACED_REASON, meta, now, replaceSigned ? OPEN_STATUSES : AWAITING_CLIENT_STATUSES)) {
         replaced.push({ envelope: old, org, file, signers: oldSigners });
       }
     }
@@ -661,11 +806,11 @@ export async function sendAgreementForFile(actor: Actor, fileId: unknown, opts: 
         orgId: actor.orgId,
         role: "company",
         order: 2,
-        name: countersigner.user.name,
-        email: countersigner.user.email,
+        name: countersigner.name,
+        email: countersigner.email,
         tokenNonce: companyToken.tokenNonce,
         tokenHash: companyToken.tokenHash,
-        userId: countersigner.user.id,
+        userId: countersigner.id,
         status: "waiting",
         createdAt: now,
       });
@@ -686,49 +831,93 @@ export async function sendAgreementForFile(actor: Actor, fileId: unknown, opts: 
       meta,
       data: { templateName: template.name, templateId: template.id, templateVersion: template.version, sha256: pdf.sha256 },
     });
-    const url = signingUrl({ id: clientSignerId, tokenNonce: clientToken.tokenNonce });
+    // The signing link is deliberately not in the payload: payloads are stored and sent to
+    // third parties, and the link is the client's credential. Integrations fetch it with getSigningLink.
     await enqueueWebhookEvent(
       tx,
       actor.orgId,
       "agreement.sent",
-      webhookPayload({ envelope: { id: envelopeId, templateName: template.name } as Envelope, file }, "sent", { sentAt: now.toISOString(), signingUrl: url }),
+      webhookPayload({ envelope: { id: envelopeId, templateName: template.name } as Envelope, file, signers: [{ role: "client", name: clientName, email: clientEmail }] }, "sent", {
+        sentAt: now.toISOString(),
+        clientSignerId,
+      }),
     );
+    return { duplicate: null, replaced };
   });
 
+  if (outcome.duplicate) {
+    const [client] = await db
+      .select()
+      .from(signers)
+      .where(and(eq(signers.envelopeId, outcome.duplicate.id), eq(signers.orgId, actor.orgId), eq(signers.role, "client")))
+      .limit(1);
+    if (!client) throw new ServiceError("conflict", "The agreement on this file changed while it was being sent. Reload the file and try again.");
+    return { envelopeId: outcome.duplicate.id, delivery: await deliveryOfExisting(db, outcome.duplicate), signingUrl: signingUrl(client), duplicate: true };
+  }
+
   // Everything below is after commit: the envelope exists whatever happens to the emails.
+  // If this request dies here, the scheduler finds the unsent draft and sends it.
   const url = signingUrl({ id: clientSignerId, tokenNonce: clientToken.tokenNonce });
   let delivery: Delivery = "email_failed";
   try {
-    for (const old of replaced) await notifySignersLinkDead(db, old, "It was replaced by a new signing request, which you will receive separately.", actor);
+    for (const old of outcome.replaced) {
+      await notifySignersLinkDead(db, old, { kind: "voided", reason: "It was replaced by a new signing request, which you will receive separately.", actor });
+    }
     const ctx = await loadEnvelopeContext(db, envelopeId);
     const client = ctx?.signers.find((s) => s.id === clientSignerId);
-    if (ctx && client) delivery = await deliverTo(db, ctx, client, actor, meta, { tellSender: true });
+    // Read again after commit: a request that was voided or replaced a moment later must not be emailed.
+    if (ctx && client && isTurn(ctx, client)) delivery = await deliverTo(db, ctx, client, actor, meta, { tellSender: true });
   } catch (err) {
     console.error("[envelopes] post-send work failed", err instanceof Error ? err.message : err);
   }
   return { envelopeId, delivery, signingUrl: url };
 }
 
+/**
+ * Send the signing request of an envelope whose first email never went out because
+ * the request that created it died in between. Does nothing unless the envelope is
+ * still an unsent draft waiting on its client. Used by the scheduler.
+ */
+export async function deliverUnsentDraft(envelopeId: string): Promise<Delivery | null> {
+  const db = await getDb();
+  const ctx = await loadEnvelopeContext(db, envelopeId);
+  if (!ctx || ctx.envelope.status !== "draft") return null;
+  const client = ctx.signers.find((s) => s.role === "client");
+  if (!client || !isTurn(ctx, client)) return null;
+  return deliverTo(db, ctx, client, { type: "system", orgId: ctx.org.id, label: "System" }, undefined, { tellSender: true });
+}
+
 // ---------------------------------------------------------------------------
 // Reading
 // ---------------------------------------------------------------------------
 
-function signerView(ctx: EnvelopeContext, signer: Signer, now: Date): SignerView {
+/** A signer as `viewer` may see it. The file page and the envelope page both build their signers with this. */
+export function signerView(ctx: EnvelopeContext, signer: Signer, now: Date, viewer: User | null): SignerView {
   const { tokenNonce, tokenHash, values, ...rest } = signer;
   void tokenHash;
   void values;
   return {
     ...rest,
     // A link derived from a different APP_SECRET would be dead; getSigningLink re-mints those.
-    signingUrl: canStillSign(ctx, signer) && tokenIsCurrent(signer) ? signingUrl({ id: signer.id, tokenNonce }) : null,
+    signingUrl: canStillSign(ctx, signer) && tokenIsCurrent(signer) && maySeeLink(viewer, signer, ctx.org) ? signingUrl({ id: signer.id, tokenNonce }) : null,
     isTurn: isTurn(ctx, signer, now),
   };
+}
+
+/** True when `viewer` may countersign this envelope and it is waiting for exactly that. */
+export function canCountersignNow(ctx: EnvelopeContext, viewer: User | null, now: Date = new Date()): boolean {
+  const company = ctx.signers.find((s) => s.role === "company");
+  return Boolean(company) && isTurn(ctx, company as Signer, now) && mayActForCompany(viewer, company as Signer, ctx.org);
+}
+
+export function describeEvents(trail: EventRow[]): DescribedEvent[] {
+  return trail.map((e) => ({ ...e, description: describeEvent(e) }));
 }
 
 /** One envelope with its signers, its audit trail and the links of signers who have not signed. */
 export async function getEnvelope(actor: Actor, id: unknown): Promise<EnvelopeDetail> {
   const db = await getDb();
-  await assertActor(db, actor);
+  const viewer = await assertActor(db, actor);
   const ctx = await loadScoped(db, actor, id);
   const now = new Date();
   const trail = await listEvents(actor.orgId, { envelopeId: ctx.envelope.id, limit: 500 }, db);
@@ -741,8 +930,39 @@ export async function getEnvelope(actor: Actor, id: unknown): Promise<EnvelopeDe
       clientEmail: ctx.file.clientEmail,
       agreementStatus: ctx.file.agreementStatus,
     },
-    signers: ctx.signers.map((s) => signerView(ctx, s, now)),
-    events: trail.map((e) => ({ ...e, description: describeEvent(e) })),
+    signers: ctx.signers.map((s) => signerView(ctx, s, now, viewer)),
+    events: describeEvents(trail),
+    canCountersign: canCountersignNow(ctx, viewer, now),
+  };
+}
+
+/**
+ * An envelope as the REST API and integrations see it: no document snapshot, no
+ * link material, no signature images, and none of the signers' IP addresses or
+ * browser details that the audit trail keeps.
+ */
+export function toPublicEnvelope(envelope: Envelope, envelopeSigners: readonly Pick<Signer, "id" | "role" | "order" | "name" | "email" | "status" | "viewedAt" | "signedAt">[] = []) {
+  const iso = (at: Date | null) => (at ? at.toISOString() : null);
+  return {
+    id: envelope.id,
+    fileId: envelope.fileId,
+    agreementId: envelope.templateId,
+    agreementName: envelope.templateName,
+    agreementVersion: envelope.templateVersion,
+    status: envelope.status,
+    sentAt: iso(envelope.sentAt),
+    completedAt: iso(envelope.completedAt),
+    expiresAt: iso(envelope.expiresAt),
+    declineReason: envelope.declineReason,
+    voidReason: envelope.voidReason,
+    originalSha256: envelope.pdfSha256,
+    signedSha256: envelope.finalSha256,
+    reminderCount: envelope.reminderCount,
+    createdAt: envelope.createdAt.toISOString(),
+    updatedAt: envelope.updatedAt.toISOString(),
+    signers: [...envelopeSigners]
+      .sort((a, b) => a.order - b.order)
+      .map((s) => ({ id: s.id, role: s.role, name: s.name, email: s.email, status: s.status, viewedAt: iso(s.viewedAt), signedAt: iso(s.signedAt) })),
   };
 }
 
@@ -808,6 +1028,13 @@ export async function listEnvelopes(actor: Actor, opts: { fileId?: unknown; stat
   });
 }
 
+function companyLinkForbidden(signer: Pick<Signer, "name">): ServiceError {
+  return new ServiceError(
+    "forbidden",
+    `This link signs on your company's behalf, so only ${signer.name}, your company's countersigner, an owner or an admin can use it. Ask one of them to countersign from the file.`,
+  );
+}
+
 /**
  * The signing link for a signer who has not signed, so the sender can pass it on by
  * hand. If the server secret changed since the link was issued, the old link is
@@ -815,8 +1042,9 @@ export async function listEnvelopes(actor: Actor, opts: { fileId?: unknown; stat
  */
 export async function getSigningLink(actor: Actor, signerId: unknown, meta?: RequestMeta): Promise<{ signingUrl: string; signer: Pick<Signer, "id" | "name" | "email" | "role" | "status"> }> {
   const db = await getDb();
-  await assertActor(db, actor);
+  const viewer = await assertActor(db, actor);
   const { ctx, signer } = await loadScopedBySigner(db, actor, signerId);
+  if (!maySeeLink(viewer, signer, ctx.org)) throw companyLinkForbidden(signer);
   if (!OPEN_STATUSES.includes(ctx.envelope.status)) throw closedError(ctx.envelope, "its signing links no longer work");
   if (signer.status === "signed" || signer.status === "declined") {
     throw new ServiceError("conflict", `${signer.name} has already ${signer.status === "signed" ? "signed" : "declined"}, so there is no link to share.`);
@@ -824,7 +1052,8 @@ export async function getSigningLink(actor: Actor, signerId: unknown, meta?: Req
   let current: Pick<Signer, "id" | "tokenNonce"> = signer;
   if (!tokenIsCurrent(signer)) {
     const token = mintSigningToken(signer.id);
-    await db.transaction(async (tx) => {
+    await inTransaction(db, async (tx) => {
+      await lockFile(tx, actor.orgId, ctx.file.id);
       await tx
         .update(signers)
         .set({ tokenNonce: token.tokenNonce, tokenHash: token.tokenHash })
@@ -836,13 +1065,19 @@ export async function getSigningLink(actor: Actor, signerId: unknown, meta?: Req
   return { signingUrl: signingUrl(current), signer: { id: signer.id, name: signer.name, email: signer.email, role: signer.role, status: signer.status } };
 }
 
-/** The unsigned agreement exactly as it was sent, or the sealed copy once everyone has signed. */
-export async function getDocument(actor: Actor, envelopeId: unknown, kind: "original" | "signed"): Promise<DocumentDownload> {
+/**
+ * The agreement as a PDF:
+ * - "original": the unsigned agreement exactly as it was sent
+ * - "in_progress": the agreement with the file's details and every signature given so far drawn in,
+ *   which is what a countersigner must see before signing
+ * - "signed": the sealed copy, once everyone has signed
+ */
+export async function getDocument(actor: Actor, envelopeId: unknown, kind: "original" | "in_progress" | "signed"): Promise<DocumentDownload> {
   const db = await getDb();
   await assertActor(db, actor);
   const ctx = await loadScoped(db, actor, envelopeId);
-  if (kind !== "original" && kind !== "signed") {
-    throw new ServiceError("invalid", 'Ask for either the "original" or the "signed" document.');
+  if (kind !== "original" && kind !== "signed" && kind !== "in_progress") {
+    throw new ServiceError("invalid", 'Ask for the "original", the "in_progress" or the "signed" document.');
   }
   if (kind === "signed") {
     if (ctx.envelope.status !== "completed" || !ctx.envelope.finalBlobId) {
@@ -854,19 +1089,75 @@ export async function getDocument(actor: Actor, envelopeId: unknown, kind: "orig
   }
   const blob = await getBlob(actor.orgId, ctx.envelope.pdfBlobId, db);
   if (!blob) throw new ServiceError("not_found", "The agreement could not be loaded from storage. Try again, and contact support if it keeps happening.");
+  if (kind === "in_progress") {
+    const bytes = await stampVisible(blob.bytes, ctx.envelope, allValues(ctx));
+    return { bytes, filename: documentFilename(ctx.envelope, ctx.file, "in progress"), contentType: "application/pdf", sha256: sha256Hex(bytes) };
+  }
   return { bytes: blob.bytes, filename: documentFilename(ctx.envelope, ctx.file, "unsigned"), contentType: "application/pdf", sha256: blob.sha256 };
+}
+
+export interface CountersignSession {
+  envelopeId: string;
+  agreementName: string;
+  fileReference: string;
+  client: { name: string; email: string; signedAt: string | null };
+  /** The company signer the envelope is assigned to. Whoever countersigns becomes the name on the certificate. */
+  signer: { id: string; name: string; email: string };
+  /** False with `reason` when the person asking cannot countersign right now. */
+  canCountersign: boolean;
+  reason: string | null;
+  pages: Envelope["pages"];
+  /** The company's own fields, to be filled in. */
+  fields: Field[];
+  /** Suggested values for those fields, from the profile of the person asking. */
+  defaults: FieldValues;
+  /** What is already on the document (file details and the client's answers), with where each value sits. */
+  readOnly: ReadOnlyValue[];
+  /** True when the person asking has a saved signature that countersign() will use if none is drawn. */
+  hasSavedSignature: boolean;
+}
+
+/**
+ * Everything the in-app countersign page needs, for a signed-in team member: the
+ * company's fields, sensible defaults, and what the client put on the document.
+ * Pair it with getDocument(actor, id, "in_progress") for the PDF itself. Unlike the
+ * emailed link, looking at this records nothing and counts against no public limit.
+ */
+export async function getCountersignSession(actor: Actor, envelopeId: unknown): Promise<CountersignSession> {
+  const db = await getDb();
+  const viewer = await assertActor(db, actor);
+  const ctx = await loadScoped(db, actor, envelopeId);
+  const signer = ctx.signers.find((s) => s.role === "company");
+  if (!signer) throw new ServiceError("conflict", "This agreement has no fields for your company to sign, so there is nothing to countersign.");
+  const client = ctx.signers.find((s) => s.role === "client");
+  const own = fieldsFor(ctx.envelope, "company");
+
+  let reason: string | null = null;
+  if (signer.status === "signed") reason = "This agreement has already been countersigned.";
+  else if (!OPEN_STATUSES.includes(ctx.envelope.status)) reason = closedError(ctx.envelope, "it cannot be countersigned").message;
+  else if (ctx.envelope.status !== "client_signed" || signer.status === "waiting") reason = "The client has not signed yet. You can countersign as soon as they have.";
+  else if (!viewer) reason = "Countersigning needs a signed-in team member. Sign in and countersign from the file.";
+  else if (!mayActForCompany(viewer, signer, ctx.org)) reason = `Only ${signer.name}, your company's countersigner, an owner or an admin can countersign this agreement.`;
+
+  return {
+    envelopeId: ctx.envelope.id,
+    agreementName: ctx.envelope.templateName,
+    fileReference: ctx.file.reference,
+    client: { name: client?.name ?? ctx.file.clientName, email: client?.email ?? ctx.file.clientEmail, signedAt: client?.signedAt ? client.signedAt.toISOString() : null },
+    signer: { id: signer.id, name: signer.name, email: signer.email },
+    canCountersign: reason === null,
+    reason,
+    pages: Array.isArray(ctx.envelope.pages) ? ctx.envelope.pages : [],
+    fields: own,
+    defaults: viewer ? defaultValues(own, { name: viewer.name, email: viewer.email, title: viewer.title, company: ctx.org.legalName || ctx.org.name }) : {},
+    readOnly: readOnlyValues(ctx.envelope, "company", valuesVisibleTo(ctx, signer)),
+    hasSavedSignature: Boolean(viewer) && parseImageDataUrl(viewer?.savedSignature).ok,
+  };
 }
 
 // ---------------------------------------------------------------------------
 // Chasing
 // ---------------------------------------------------------------------------
-
-async function limitSender(key: string, limit: number, windowSeconds: number, what: string): Promise<void> {
-  const result = await rateLimit(key, limit, windowSeconds);
-  if (!result.ok) {
-    throw new ServiceError("rate_limited", `${what} Try again ${describeWait(result.retryAfterSeconds)}, or copy the signing link and send it yourself.`);
-  }
-}
 
 function notTurnError(ctx: EnvelopeContext, signer: Signer): ServiceError {
   if (!OPEN_STATUSES.includes(ctx.envelope.status)) return closedError(ctx.envelope, "there is nothing to send");
@@ -879,13 +1170,14 @@ function notTurnError(ctx: EnvelopeContext, signer: Signer): ServiceError {
 /** Email a signer their request again. Works for the client, and for the countersigner once it is their turn. */
 export async function resendToSigner(actor: Actor, signerId: unknown, meta?: RequestMeta): Promise<DeliveryResult> {
   const db = await getDb();
-  await assertActor(db, actor);
+  const viewer = await assertActor(db, actor);
   const { ctx, signer } = await loadScopedBySigner(db, actor, signerId);
   if (!isTurn(ctx, signer)) throw notTurnError(ctx, signer);
   await limitSender(`resend:signer:${signer.id}`, 5, 3600, `This request has been sent to ${signer.name} several times in the last hour.`);
-  await limitSender(`resend:org:${actor.orgId}`, 300, 3600, "Your company has sent a lot of signing requests in the last hour.");
+  await limitSender(`resend:org:${actor.orgId}`, 300, 3600, "Your company has sent a lot of signing requests in the last hour.", "org");
   const delivery = await deliverTo(db, ctx, signer, actor, meta, { tellSender: false });
-  return { delivery, signingUrl: signingUrl(signer) };
+  // The email goes to the signer's own inbox either way; the link itself is only handed to people who may use it.
+  return { delivery, signingUrl: maySeeLink(viewer, signer, ctx.org) ? signingUrl(signer) : null };
 }
 
 /**
@@ -895,7 +1187,7 @@ export async function resendToSigner(actor: Actor, signerId: unknown, meta?: Req
  */
 export async function sendReminderNow(actor: Actor, envelopeId: unknown, meta?: RequestMeta): Promise<DeliveryResult & { to: string }> {
   const db = await getDb();
-  await assertActor(db, actor);
+  const viewer = await assertActor(db, actor);
   const ctx = await loadScoped(db, actor, envelopeId);
   if (!OPEN_STATUSES.includes(ctx.envelope.status)) throw closedError(ctx.envelope, "there is nobody to remind");
   const now = new Date();
@@ -910,13 +1202,21 @@ export async function sendReminderNow(actor: Actor, envelopeId: unknown, meta?: 
 
   if (signer.role === "company") {
     const delivery = deliveryOf(await emailCountersigner(ctx, signer));
+    return { delivery, signingUrl: maySeeLink(viewer, signer, ctx.org) ? signingUrl(signer) : null, to: signer.email };
+  }
+
+  // The first request never arrived, so this is not a reminder of anything: send the
+  // request itself, which is also what moves the envelope from draft to sent.
+  if (ctx.envelope.status === "draft") {
+    const delivery = await deliverTo(db, ctx, signer, actor, meta, { tellSender: false });
     return { delivery, signingUrl: signingUrl(signer), to: signer.email };
   }
 
   const outcome = await emailSigningRequest(ctx, signer, { reminderNumber: ctx.envelope.reminderCount + 1 });
   const every = scheduleOf(resolveSettings(ctx.org)).reminderEveryDays;
   try {
-    await db.transaction(async (tx) => {
+    await inTransaction(db, async (tx) => {
+      await lockFile(tx, actor.orgId, ctx.file.id);
       if (outcome.status === "sent") {
         await tx
           .update(envelopes)
@@ -952,16 +1252,25 @@ export async function sendReminderNow(actor: Actor, envelopeId: unknown, meta?: 
  * Change who a signing request goes to (a typo in the address, the wrong person).
  * The old link stops working at once, because whoever holds it is no longer the
  * signer; the new link is emailed if it is that signer's turn.
+ *
+ * For the client, the file's own client name and email follow in the same step, so
+ * the file, later emails, webhooks and any re-send all use the corrected details.
+ * The company signer can only be changed by an owner or admin, and only to an
+ * active member of the team: that link signs for the company.
  */
 export async function updateSigner(
   actor: Actor,
   signerId: unknown,
   patch: { name?: unknown; email?: unknown },
   meta?: RequestMeta,
-): Promise<{ signer: SignerView; delivery: Delivery | "not_their_turn"; signingUrl: string }> {
+): Promise<{ signer: SignerView; delivery: Delivery | "not_their_turn"; signingUrl: string | null }> {
   const db = await getDb();
-  await assertActor(db, actor);
+  const viewer = await assertActor(db, actor);
   const { ctx, signer } = await loadScopedBySigner(db, actor, signerId);
+  const isCompany = signer.role === "company";
+  if (isCompany && (!viewer || (viewer.role !== "owner" && viewer.role !== "admin"))) {
+    throw new ServiceError("forbidden", "Only an owner or admin can change who countersigns an agreement. Ask one of them to make this change.");
+  }
   if (!OPEN_STATUSES.includes(ctx.envelope.status)) throw closedError(ctx.envelope, "its signers cannot be changed");
   if (signer.status === "signed" || signer.status === "declined") {
     throw new ServiceError("conflict", `${signer.name} has already ${signer.status === "signed" ? "signed" : "declined"}, so their details cannot be changed.`);
@@ -971,7 +1280,8 @@ export async function updateSigner(
   const errors: Record<string, string> = {};
   let name = signer.name;
   let email = signer.email;
-  if (input.name !== undefined && input.name !== null) {
+  const nameGiven = input.name !== undefined && input.name !== null;
+  if (nameGiven) {
     if (typeof input.name !== "string") errors.name = "Enter the signer's name.";
     else {
       name = cleanText(input.name, 200);
@@ -988,17 +1298,24 @@ export async function updateSigner(
   const emailChanged = normalizeEmail(signer.email) !== email;
   const token = mintSigningToken(signer.id);
   const now = new Date();
-  let teamUser: Pick<User, "id"> | undefined;
-  if (signer.role === "company") {
+  let teamUser: Pick<User, "id" | "name"> | undefined;
+  if (isCompany) {
     [teamUser] = await db
-      .select({ id: users.id })
+      .select({ id: users.id, name: users.name })
       .from(users)
       .where(and(eq(users.orgId, actor.orgId), eq(users.email, email), isNull(users.disabledAt)))
       .limit(1);
+    if (!teamUser) {
+      const message = `${email} is not an active member of your team. The countersigner signs for your company, so invite them to the team first, or choose someone who is already on it.`;
+      throw new ServiceError("invalid", message, { email: message });
+    }
+    // The certificate carries the team member's own name unless one was typed.
+    if (!nameGiven && emailChanged) name = teamUser.name;
   }
 
   try {
-    await db.transaction(async (tx) => {
+    await inTransaction(db, async (tx) => {
+      await lockFile(tx, actor.orgId, ctx.file.id);
       // The envelope row lock orders this against a signature arriving on the old link.
       const [open] = await tx
         .update(envelopes)
@@ -1013,7 +1330,7 @@ export async function updateSigner(
           email,
           tokenNonce: token.tokenNonce,
           tokenHash: token.tokenHash,
-          ...(signer.role === "company" ? { userId: teamUser?.id ?? null } : {}),
+          ...(isCompany && teamUser ? { userId: teamUser.id } : {}),
           // A different person has not seen the agreement, whatever the previous one did.
           ...(emailChanged && signer.status === "viewed" ? { status: "sent" as const, viewedAt: null } : {}),
         })
@@ -1021,6 +1338,7 @@ export async function updateSigner(
         .returning({ id: signers.id });
       if (!updated) throw new Raced();
 
+      const base = { orgId: actor.orgId, fileId: ctx.file.id, envelopeId: ctx.envelope.id };
       if (signer.role === "client") {
         // The client's name and email printed on the document follow the correction.
         const prefill: FieldValues = { ...(open.prefill ?? {}) };
@@ -1036,9 +1354,20 @@ export async function updateSigner(
           }
         }
         if (touched) await tx.update(envelopes).set({ prefill }).where(eq(envelopes.id, ctx.envelope.id));
+
+        // One correction, one place: the file is what lists, search, webhooks and a later re-send read.
+        const changed: string[] = [];
+        if (ctx.file.clientName !== name) changed.push("client name");
+        if (normalizeEmail(ctx.file.clientEmail) !== email) changed.push("client email");
+        if (changed.length > 0) {
+          await tx
+            .update(files)
+            .set({ clientName: name, clientEmail: email, updatedAt: now })
+            .where(and(eq(files.id, ctx.file.id), eq(files.orgId, actor.orgId)));
+          await recordEvent(tx, { ...base, envelopeId: undefined, type: "file.updated", actor, meta, data: { changed, reference: ctx.file.reference } });
+        }
       }
 
-      const base = { orgId: actor.orgId, fileId: ctx.file.id, envelopeId: ctx.envelope.id };
       await recordEvent(tx, {
         ...base,
         type: "signer.updated",
@@ -1062,41 +1391,118 @@ export async function updateSigner(
     delivery = await deliverTo(db, after.ctx, after.signer, actor, meta, { tellSender: false });
   }
   const fresh = await loadScopedBySigner(db, actor, signer.id);
-  return { signer: signerView(fresh.ctx, fresh.signer, new Date()), delivery, signingUrl: signingUrl(fresh.signer) };
+  return {
+    signer: signerView(fresh.ctx, fresh.signer, new Date(), viewer),
+    delivery,
+    signingUrl: maySeeLink(viewer, fresh.signer, fresh.ctx.org) ? signingUrl(fresh.signer) : null,
+  };
+}
+
+/**
+ * Kill the countersign links held by a team member, for every agreement still open.
+ * Call it when a member is turned off: their links already stop working while the
+ * account is off, and rotating them means the copies in their inbox stay dead even
+ * if the account is turned back on. Safe inside the caller's transaction.
+ * Returns how many links were replaced.
+ */
+export async function revokeCountersignLinksForUser(db: DbOrTx, orgId: string, userId: string): Promise<number> {
+  if (typeof orgId !== "string" || typeof userId !== "string" || !orgId || !userId) return 0;
+  const rows = await db
+    .select({ id: signers.id, envelopeId: signers.envelopeId, fileId: envelopes.fileId, email: signers.email })
+    .from(signers)
+    .innerJoin(envelopes, eq(envelopes.id, signers.envelopeId))
+    .where(
+      and(
+        eq(signers.orgId, orgId),
+        eq(signers.userId, userId),
+        eq(signers.role, "company"),
+        inArray(signers.status, ["waiting", "sent", "viewed"]),
+        inArray(envelopes.status, OPEN_STATUSES),
+      ),
+    );
+  let count = 0;
+  for (const row of rows) {
+    const token = mintSigningToken(row.id);
+    const [rotated] = await db
+      .update(signers)
+      .set({ tokenNonce: token.tokenNonce, tokenHash: token.tokenHash })
+      .where(and(eq(signers.id, row.id), eq(signers.orgId, orgId), inArray(signers.status, ["waiting", "sent", "viewed"])))
+      .returning({ id: signers.id });
+    if (!rotated) continue;
+    count++;
+    await recordEvent(db, {
+      orgId,
+      fileId: row.fileId,
+      envelopeId: row.envelopeId,
+      type: "link.reissued",
+      actor: { type: "system", orgId, label: "System" },
+      data: { signerId: row.id, email: row.email, reason: "The countersigner's account was turned off" },
+    });
+  }
+  return count;
 }
 
 // ---------------------------------------------------------------------------
 // Voiding
 // ---------------------------------------------------------------------------
 
+export interface VoidOptions {
+  /**
+   * Also void an agreement the client has already signed (it is waiting for the
+   * countersignature or for its final copy). Without this, voiding such an
+   * envelope is refused, so a cancel that was meant for an unsigned request can
+   * never silently throw away a signature that arrived a moment earlier.
+   */
+  includeSigned?: unknown;
+}
+
+function signedVoidError(clientName: string, raced: boolean): ServiceError {
+  return new ServiceError(
+    "conflict",
+    raced
+      ? `${clientName} signed while you were cancelling, so the agreement was not voided. Countersign it, or void it again and confirm that you want to discard the signed agreement.`
+      : `${clientName} has already signed this agreement. Voiding it discards their signature. Confirm that you want to void a signed agreement, then try again.`,
+    { confirm: "includeSigned" },
+  );
+}
+
 /**
  * Cancel an envelope that is still open. Its links stop working immediately.
  * Voiding one that is already voided is a no-op; any other closed envelope cannot be voided.
  */
-export async function voidEnvelope(actor: Actor, id: unknown, reason: unknown, meta?: RequestMeta): Promise<{ status: "voided"; alreadyVoided: boolean }> {
+export async function voidEnvelope(actor: Actor, id: unknown, reason: unknown, meta?: RequestMeta, opts: VoidOptions = {}): Promise<{ status: "voided"; alreadyVoided: boolean }> {
   const db = await getDb();
   await assertActor(db, actor);
   const ctx = await loadScoped(db, actor, id);
+  const includeSigned = Boolean(opts) && typeof opts === "object" && opts.includeSigned === true;
+  const clientName = ctx.signers.find((s) => s.role === "client")?.name ?? ctx.file.clientName;
   if (ctx.envelope.status === "voided") return { status: "voided", alreadyVoided: true };
   if (!OPEN_STATUSES.includes(ctx.envelope.status)) throw closedError(ctx.envelope, "it cannot be voided");
+  if (ctx.envelope.status === "client_signed" && !includeSigned) throw signedVoidError(clientName, false);
   const why = cleanReason(reason);
   const now = new Date();
 
-  const voided = await db.transaction(async (tx) => {
-    if (!(await voidInTx(tx, actor, ctx, why, meta, now))) return false;
+  const voided = await inTransaction(db, async (tx) => {
+    await lockFile(tx, actor.orgId, ctx.file.id);
+    if (!(await voidInTx(tx, actor, ctx, why, meta, now, includeSigned ? OPEN_STATUSES : AWAITING_CLIENT_STATUSES))) return false;
     await settleFileStatus(tx, actor.orgId, ctx.file.id, ctx.envelope.id, "no_agreement");
     return true;
   });
   if (!voided) {
     const after = await loadScoped(db, actor, ctx.envelope.id);
     if (after.envelope.status === "voided") return { status: "voided", alreadyVoided: true };
+    if (after.envelope.status === "client_signed") throw signedVoidError(clientName, true);
     throw closedError(after.envelope, "it cannot be voided");
   }
-  await notifySignersLinkDead(db, ctx, why, actor);
+  await notifySignersLinkDead(db, ctx, { kind: "voided", reason: why, actor });
   return { status: "voided", alreadyVoided: false };
 }
 
-/** Void everything still out for signature on a file (used when a file is archived). Returns how many were voided. */
+/**
+ * Void everything still out for signature on a file (used when a file is archived,
+ * which is a decision about the whole file, so agreements the client has signed but
+ * that are not complete are voided too). Returns how many were voided.
+ */
 export async function voidOpenEnvelopesForFile(actor: Actor, fileId: unknown, reason: unknown, meta?: RequestMeta): Promise<number> {
   const db = await getDb();
   await assertActor(db, actor);
@@ -1108,7 +1514,7 @@ export async function voidOpenEnvelopesForFile(actor: Actor, fileId: unknown, re
   let count = 0;
   for (const row of open) {
     try {
-      const result = await voidEnvelope(actor, row.id, reason, meta);
+      const result = await voidEnvelope(actor, row.id, reason, meta, { includeSigned: true });
       if (!result.alreadyVoided) count++;
     } catch (err) {
       // One that closed by itself in the meantime (signed, declined) is not a failure of this call.
@@ -1116,6 +1522,34 @@ export async function voidOpenEnvelopesForFile(actor: Actor, fileId: unknown, re
     }
   }
   return count;
+}
+
+// ---------------------------------------------------------------------------
+// Sealing again
+// ---------------------------------------------------------------------------
+
+/**
+ * Try again, now, to prepare the final copy of an agreement everyone has signed.
+ * The scheduler retries by itself with growing waits; this is the button for the
+ * sender who has been told the cause is fixed and does not want to wait.
+ */
+export async function retryFinalize(actor: Actor, envelopeId: unknown): Promise<FinalizeResult> {
+  const db = await getDb();
+  await assertActor(db, actor);
+  const ctx = await loadScoped(db, actor, envelopeId);
+  if (ctx.envelope.status === "completed") return { status: "completed", alreadyCompleted: true };
+  if (!OPEN_STATUSES.includes(ctx.envelope.status)) throw closedError(ctx.envelope, "there is no final copy to prepare");
+  if (!awaitingSeal(ctx)) {
+    throw new ServiceError("conflict", "Not everyone has signed this agreement yet. The final copy is prepared automatically as soon as they have.");
+  }
+  await limitSender(`finalize:envelope:${ctx.envelope.id}`, 6, 3600, "The final copy has been retried several times in the last hour and is still failing.");
+  const result = await finalizeEnvelope(ctx.envelope.id);
+  if (result.status === "not_ready") {
+    const after = await loadScoped(db, actor, ctx.envelope.id);
+    if (after.envelope.status === "completed") return { status: "completed", alreadyCompleted: true };
+    throw closedError(after.envelope, "there is no final copy to prepare");
+  }
+  return result;
 }
 
 // ---------------------------------------------------------------------------
@@ -1144,15 +1578,13 @@ export async function countersign(actor: Actor, envelopeId: unknown, input: Coun
   const ctx = await loadScoped(db, actor, envelopeId);
   const signer = ctx.signers.find((s) => s.role === "company");
   if (!signer) throw new ServiceError("conflict", "This agreement has no fields for your company to sign, so there is nothing to countersign.");
-  if (signer.status === "signed") return resultFor(ctx);
+  if (signer.status === "signed") return resultForRecipient(db, ctx, user.email);
   if (!OPEN_STATUSES.includes(ctx.envelope.status)) throw closedError(ctx.envelope, "it cannot be countersigned");
   if (ctx.envelope.status !== "client_signed" || signer.status === "waiting") {
     throw new ServiceError("conflict", "The client has not signed yet. You can countersign as soon as they have.");
   }
 
-  const settings = resolveSettings(ctx.org);
-  const allowed = signer.userId === user.id || settings.countersignerUserId === user.id || user.role === "owner" || user.role === "admin";
-  if (!allowed) {
+  if (!mayActForCompany(user, signer, ctx.org)) {
     throw new ServiceError("forbidden", `Only ${signer.name}, your company's countersigner, an owner or an admin can countersign this agreement.`);
   }
 
@@ -1170,7 +1602,8 @@ export async function countersign(actor: Actor, envelopeId: unknown, input: Coun
   }
 
   const now = new Date();
-  const dateLabel = signedDateLabel(now, body.timezone, undefined);
+  // The company's date is the company's calendar day; the browser's zone is the fallback until one is set.
+  const dateLabel = signedDateLabel(now, orgTimeZone(ctx.org) ?? body.timezone, undefined);
   const defaults = defaultValues(own, { name: user.name, email: user.email, title: user.title, company: ctx.org.legalName || ctx.org.name });
   const checked = validateSignerValues(own, raw, defaults, dateLabel);
   if (!checked.ok) {
@@ -1198,9 +1631,9 @@ export async function countersign(actor: Actor, envelopeId: unknown, input: Coun
   } catch (err) {
     if (!(err instanceof Raced)) throw err;
     const after = await loadScoped(db, actor, ctx.envelope.id);
-    if (after.signers.find((s) => s.id === signer.id)?.status === "signed") return resultFor(after);
+    if (after.signers.find((s) => s.id === signer.id)?.status === "signed") return resultForRecipient(db, after, user.email);
     if (!OPEN_STATUSES.includes(after.envelope.status)) throw closedError(after.envelope, "it cannot be countersigned");
     throw new ServiceError("conflict", "This agreement changed while you were countersigning. Reload the file and try again.");
   }
-  return afterSignature(ctx.envelope.id, outcome);
+  return afterSignature(ctx.envelope.id, outcome, user.email);
 }

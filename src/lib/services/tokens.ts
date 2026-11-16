@@ -52,11 +52,6 @@ export function tokenIsCurrent(signer: Pick<Signer, "id" | "tokenNonce" | "token
   return safeEqual(hashSigningSecret(signingSecret(signer.id, signer.tokenNonce)), signer.tokenHash);
 }
 
-/** Short, non-reversible handle for a link, for rate-limit keys. The secret itself never becomes a key. */
-export function linkRateKey(secret: unknown): string {
-  return sha256Hex(typeof secret === "string" ? secret.slice(0, 200) : "").slice(0, 24);
-}
-
 /**
  * Resolve a link secret to its signer. Anything malformed, unknown or revoked
  * returns null: callers must not be able to tell those apart.

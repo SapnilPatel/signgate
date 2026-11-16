@@ -53,6 +53,8 @@ export interface CompletedUpload {
   bytes: Uint8Array;
   filename: string;
   mimeType: string;
+  /** Short id of the upload, safe to use in keys and logs (the uploadId itself is long and signed). */
+  id: string;
 }
 
 /** What beginUpload promised, carried inside the upload id. */
@@ -83,7 +85,7 @@ function encodeDescriptor(d: Descriptor): string {
   return `${d.i}.${body}.${sign(body)}`;
 }
 
-function decodeDescriptor(actor: Actor, uploadId: unknown): Descriptor {
+function decodeDescriptor(actor: Actor, uploadId: unknown, opts: { allowExpired?: boolean } = {}): Descriptor {
   if (typeof uploadId !== "string" || uploadId.length === 0 || uploadId.length > UPLOAD_ID_MAX) throw startAgain();
   const parts = uploadId.split(".");
   if (parts.length !== 3) throw startAgain();
@@ -114,7 +116,7 @@ function decodeDescriptor(actor: Actor, uploadId: unknown): Descriptor {
   }
   // Another company's upload id is indistinguishable from one that never existed.
   if (d.o !== actor.orgId) throw startAgain();
-  if (Date.now() - d.t > UPLOAD_TTL_MS) {
+  if (!opts.allowExpired && Date.now() - d.t > UPLOAD_TTL_MS) {
     throw new ServiceError("gone", "This upload took too long and has expired. Start the upload again.");
   }
   return d;
@@ -250,43 +252,71 @@ export async function putChunk(actor: Actor, uploadId: unknown, index: unknown, 
 }
 
 /**
- * Join the parts and hand back the file. The parts are removed in the same statement
- * that reads them, so two simultaneous calls cannot both receive the file; if any part
- * is missing, nothing is removed and the browser can send what is missing.
+ * Join the parts and hand back the file. Nothing is removed: the parts stay until
+ * the caller has made something durable from them and calls discardUpload, so a
+ * step that times out, throws, or whose response is lost can simply be run again
+ * without the person uploading 25 MB a second time. Abandoned parts are purged by
+ * the scheduler.
+ *
+ * Two simultaneous calls both receive the file. A caller that must create exactly
+ * one thing from an upload uses createTemplateFromCompletedUpload, which claims it first.
  */
 export async function completeUpload(actor: Actor, uploadId: unknown): Promise<CompletedUpload> {
   const db = await getDb();
   await assertMayUpload(db, actor);
   const d = decodeDescriptor(actor, uploadId);
 
-  return db.transaction(async (tx) => {
-    const rows = await tx
-      .delete(uploadChunks)
-      .where(and(eq(uploadChunks.uploadId, d.i), eq(uploadChunks.orgId, d.o)))
-      .returning({ idx: uploadChunks.idx, bytes: uploadChunks.bytes });
+  const rows = await db
+    .select({ idx: uploadChunks.idx, bytes: uploadChunks.bytes })
+    .from(uploadChunks)
+    .where(and(eq(uploadChunks.uploadId, d.i), eq(uploadChunks.orgId, d.o)));
 
-    if (rows.length === 0) {
-      throw new ServiceError("not_found", "No parts of this upload were found. It may already have been finished, or it expired. Start the upload again.");
-    }
-    const byIndex = new Map(rows.map((r) => [r.idx, r.bytes]));
-    const missing: number[] = [];
-    for (let i = 0; i < d.c; i++) if (!byIndex.has(i)) missing.push(i);
-    if (missing.length > 0) {
-      const shown = missing.slice(0, 10).map((i) => i + 1).join(", ");
-      // Throwing rolls the delete back, so the parts that did arrive are kept.
-      throw new ServiceError(
-        "conflict",
-        `The upload is not finished: ${missing.length === 1 ? `part ${shown} has` : `parts ${shown}${missing.length > 10 ? " and others have" : " have"}`} not arrived. Send the missing parts, then finish again.`,
-        { missing: missing.join(",") },
-      );
-    }
-    const ordered = Array.from({ length: d.c }, (_, i) => byIndex.get(i) as Buffer);
-    const total = ordered.reduce((sum, b) => sum + b.byteLength, 0);
-    if (total !== d.s) {
-      throw new ServiceError("conflict", "The uploaded file does not match the size that was announced. Start the upload again.");
-    }
-    return { bytes: new Uint8Array(Buffer.concat(ordered, total)), filename: d.n, mimeType: d.m };
-  });
+  if (rows.length === 0) {
+    throw new ServiceError(
+      "not_found",
+      "No parts of this upload were found. It may already have been finished: check your list of agreements before uploading again. Otherwise it expired, so start the upload again.",
+    );
+  }
+  const byIndex = new Map(rows.map((r) => [r.idx, r.bytes]));
+  const missing: number[] = [];
+  for (let i = 0; i < d.c; i++) if (!byIndex.has(i)) missing.push(i);
+  if (missing.length > 0) {
+    const shown = missing.slice(0, 10).map((i) => i + 1).join(", ");
+    throw new ServiceError(
+      "conflict",
+      `The upload is not finished: ${missing.length === 1 ? `part ${shown} has` : `parts ${shown}${missing.length > 10 ? " and others have" : " have"}`} not arrived. Send the missing parts, then finish again.`,
+      { missing: missing.join(",") },
+    );
+  }
+  const ordered = Array.from({ length: d.c }, (_, i) => byIndex.get(i) as Buffer);
+  const total = ordered.reduce((sum, b) => sum + b.byteLength, 0);
+  if (total !== d.s) {
+    throw new ServiceError("conflict", "The uploaded file does not match the size that was announced. Start the upload again.");
+  }
+  return { bytes: new Uint8Array(Buffer.concat(ordered, total)), filename: d.n, mimeType: d.m, id: d.i };
+}
+
+/**
+ * Remove an upload's parts once what was made from them is safely stored. Returns
+ * how many parts were removed; discarding twice, or discarding an upload that
+ * already expired, removes nothing and is not an error.
+ */
+export async function discardUpload(actor: Actor, uploadId: unknown): Promise<number> {
+  const db = await getDb();
+  await assertMayUpload(db, actor);
+  let d: Descriptor;
+  try {
+    d = decodeDescriptor(actor, uploadId);
+  } catch (err) {
+    // An expired id still names parts that should go; anything else names nothing of this company's.
+    if (!(err instanceof ServiceError) || err.code !== "gone") return 0;
+    d = decodeDescriptor(actor, uploadId, { allowExpired: true });
+  }
+  const removed = await db
+    .delete(uploadChunks)
+    .where(and(eq(uploadChunks.uploadId, d.i), eq(uploadChunks.orgId, d.o)))
+    .returning({ idx: uploadChunks.idx });
+  return removed.length;
 }
 
 /** Scheduler job: remove parts of uploads that were never finished. Returns how many parts were removed. */
