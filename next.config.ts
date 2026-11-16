@@ -1,6 +1,8 @@
 import type { NextConfig } from "next";
 
 const nextConfig: NextConfig = {
+  // Lets several dev servers run from one checkout (parallel test runs), each with its own build directory.
+  ...(process.env.NEXT_DIST_DIR ? { distDir: process.env.NEXT_DIST_DIR } : {}),
   // Every page here is per-tenant and authenticated or token-gated, so nothing is
   // statically cacheable; classic request-time rendering keeps that explicit.
   serverExternalPackages: ["@electric-sql/pglite", "pg", "pdfjs-dist", "unpdf", "mammoth"],
