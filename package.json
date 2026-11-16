@@ -10,7 +10,8 @@
     "typecheck": "next typegen && tsc --noEmit",
     "test": "vitest run",
     "db:generate": "drizzle-kit generate",
-    "db:migrate": "tsx scripts/migrate.ts"
+    "db:migrate": "tsx scripts/migrate.ts",
+    "postinstall": "node scripts/copy-pdf-assets.mjs"
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^1.8.0",
