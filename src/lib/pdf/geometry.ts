@@ -39,20 +39,34 @@ export function pageRotation(page: PDFPage): 0 | 90 | 180 | 270 {
   return ((((snapped % 360) + 360) % 360) as 0 | 90 | 180 | 270);
 }
 
-/** The visible region of the page in user space. Falls back to the media box for malformed crop boxes. */
+// Boxes may be written with their corners in any order; normalize to a positive rectangle.
+function normalizeBox(box: Box): Box {
+  return {
+    x: Math.min(box.x, box.x + box.width),
+    y: Math.min(box.y, box.y + box.height),
+    width: Math.abs(box.width),
+    height: Math.abs(box.height),
+  };
+}
+
+/**
+ * The visible region of the page in user space: the crop box clipped to the media
+ * box, exactly as pdf.js computes a page's view, so fractions mean the same thing
+ * here as in the browser. Falls back to the media box for malformed crop boxes.
+ */
 export function visibleBox(page: PDFPage): Box {
-  const media = page.getMediaBox();
-  let box: Box = media;
+  const media = normalizeBox(page.getMediaBox());
   try {
-    const crop = page.getCropBox();
-    if (crop.width > 1 && crop.height > 1) box = crop;
+    const crop = normalizeBox(page.getCropBox());
+    const x = Math.max(media.x, crop.x);
+    const y = Math.max(media.y, crop.y);
+    const width = Math.min(media.x + media.width, crop.x + crop.width) - x;
+    const height = Math.min(media.y + media.height, crop.y + crop.height) - y;
+    if (width > 1 && height > 1) return { x, y, width, height };
   } catch {
     // keep media box
   }
-  // Boxes may be written with negative extents; normalize to a positive rectangle.
-  const x = Math.min(box.x, box.x + box.width);
-  const y = Math.min(box.y, box.y + box.height);
-  return { x, y, width: Math.abs(box.width), height: Math.abs(box.height) };
+  return media;
 }
 
 /** Size of the page as displayed, in points. */

@@ -41,8 +41,33 @@ export async function embedFonts<S extends FontStyle>(doc: PDFDocument, styles: 
   const out = {} as Record<S, PDFFont>;
   for (const style of styles) {
     out[style] = await doc.embedFont(await fontBytes(style), { subset: true });
+    primeGlyphCodePoints(out[style]);
   }
   return out;
+}
+
+interface FontkitFont {
+  characterSet?: number[];
+  glyphForCodePoint?: (codePoint: number) => unknown;
+}
+
+/**
+ * Makes text drawn with the font copy and search correctly. fontkit caches one
+ * object per glyph and remembers only the code points of whoever asked first;
+ * pdf-lib then writes those into the PDF's glyph-to-text map. Without this, the
+ * first use of "i" being inside a decomposed Vietnamese "\u1ecb" makes every "i" in
+ * the document extract as "\u1ecb", and the combining dot extracts as garbage.
+ * Asking for every glyph by its own code point first pins the right answer.
+ */
+function primeGlyphCodePoints(font: PDFFont): void {
+  try {
+    const fk = (font as unknown as { embedder?: { font?: FontkitFont } }).embedder?.font;
+    if (!fk?.characterSet || typeof fk.glyphForCodePoint !== "function") return;
+    // Ascending order, so where two characters share a glyph (space and no-break space) the plain one wins.
+    for (const codePoint of fk.characterSet) fk.glyphForCodePoint(codePoint);
+  } catch {
+    // Extraction quality only; drawing is unaffected, so never fail an embed over it.
+  }
 }
 
 const supportCache = new WeakMap<PDFFont, Set<number>>();
