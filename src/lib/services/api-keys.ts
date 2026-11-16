@@ -2,6 +2,7 @@ import { and, count, desc, eq, isNull, lt, or } from "drizzle-orm";
 import { getDb } from "@/lib/db";
 import { apiKeys, orgs, type ApiKey, type Org } from "@/lib/db/schema";
 import { newId, newSecret, sha256Hex } from "@/lib/ids";
+import { assertActiveActor } from "./accounts";
 import { ServiceError, type Actor } from "./context";
 import { cleanText, recordEvent } from "./events";
 
@@ -26,14 +27,17 @@ function summarize(row: ApiKey): ApiKeySummary {
 
 /** Keys grant full API access to the org, so only an owner or admin who is signed
  *  in may mint or revoke one. An API key can never create another key. */
-function assertManager(actor: Actor, action: string): asserts actor is Extract<Actor, { type: "user" }> {
-  if (!actor || actor.type !== "user" || (actor.role !== "owner" && actor.role !== "admin")) {
+function assertSignedIn(actor: Actor, action: string): asserts actor is Extract<Actor, { type: "user" }> {
+  if (!actor || actor.type !== "user") {
     throw new ServiceError("forbidden", `Only an owner or admin can ${action}. Ask one of them to do it for you.`);
   }
 }
 
 export async function createApiKey(actor: Actor, name: string): Promise<{ key: string; row: ApiKeySummary }> {
-  assertManager(actor, "create API keys");
+  assertSignedIn(actor, "create API keys");
+  const db = await getDb();
+  // The role is read from the stored row: the one in the Actor can predate a demotion.
+  await assertActiveActor(db, actor, "manage");
   const cleanName = cleanText(typeof name === "string" ? name.replace(/\s+/g, " ") : "", MAX_NAME_LENGTH + 1);
   if (!cleanName) {
     throw new ServiceError("invalid", "Give the key a name so you can tell it apart later, for example the system that will use it.", {
@@ -47,7 +51,6 @@ export async function createApiKey(actor: Actor, name: string): Promise<{ key: s
   }
 
   const key = API_KEY_PREFIX + newSecret();
-  const db = await getDb();
   const row = await db.transaction(async (tx) => {
     const [{ active }] = await tx
       .select({ active: count() })
@@ -76,16 +79,18 @@ export async function createApiKey(actor: Actor, name: string): Promise<{ key: s
 /** All of the org's keys, newest first, including revoked ones so their history stays visible. */
 export async function listApiKeys(actor: Actor): Promise<ApiKeySummary[]> {
   const db = await getDb();
+  await assertActiveActor(db, actor, "read");
   const rows = await db.select().from(apiKeys).where(eq(apiKeys.orgId, actor.orgId)).orderBy(desc(apiKeys.createdAt), desc(apiKeys.id));
   return rows.map(summarize);
 }
 
 /** Revoke a key. Revoking an already revoked key succeeds and changes nothing. */
 export async function revokeApiKey(actor: Actor, id: string): Promise<ApiKeySummary> {
-  assertManager(actor, "revoke API keys");
+  assertSignedIn(actor, "revoke API keys");
+  const db = await getDb();
+  await assertActiveActor(db, actor, "manage");
   const notFound = () => new ServiceError("not_found", "That API key does not exist. Refresh the page to see the current list.");
   if (typeof id !== "string" || !id) throw notFound();
-  const db = await getDb();
   return db.transaction(async (tx) => {
     const [revoked] = await tx
       .update(apiKeys)

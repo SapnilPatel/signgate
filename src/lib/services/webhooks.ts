@@ -8,6 +8,7 @@ import { getDb, type DbOrTx } from "@/lib/db";
 import { webhookDeliveries, webhooks, type Webhook } from "@/lib/db/schema";
 import { env } from "@/lib/env";
 import { newId, newSecret } from "@/lib/ids";
+import { assertActiveActor } from "./accounts";
 import { ServiceError, type Actor } from "./context";
 import { cleanText, recordEvent, toSafeJson } from "./events";
 
@@ -276,10 +277,16 @@ export function verifyWebhookSignature(
 // ---------------------------------------------------------------------------
 
 /** A webhook decides where the org's client data is sent, so only a signed-in owner or admin may change one. */
-function assertManager(actor: Actor, action: string): asserts actor is Extract<Actor, { type: "user" }> {
-  if (!actor || actor.type !== "user" || (actor.role !== "owner" && actor.role !== "admin")) {
+function assertSignedIn(actor: Actor, action: string): asserts actor is Extract<Actor, { type: "user" }> {
+  if (!actor || actor.type !== "user") {
     throw new ServiceError("forbidden", `Only an owner or admin can ${action}. Ask one of them to do it for you.`);
   }
+}
+
+/** Signed in, still active and still an owner or admin according to the stored row, not the session's copy of the role. */
+async function assertManager(actor: Actor, action: string): Promise<void> {
+  assertSignedIn(actor, action);
+  await assertActiveActor(await getDb(), actor, "manage");
 }
 
 const webhookNotFound = () => new ServiceError("not_found", "That webhook does not exist. Refresh the page to see the current list.");
@@ -292,7 +299,7 @@ function summarize(row: Webhook): WebhookSummary {
 
 /** Register an endpoint. The returned row carries the signing secret; it is not shown again. */
 export async function createWebhook(actor: Actor, url: string, deps: WebhookDeps = {}): Promise<Webhook> {
-  assertManager(actor, "add webhooks");
+  await assertManager(actor, "add webhooks");
   const checked = await checkWebhookUrl(url, deps);
   const db = await getDb();
   return db.transaction(async (tx) => {
@@ -316,13 +323,14 @@ export async function createWebhook(actor: Actor, url: string, deps: WebhookDeps
 
 export async function listWebhooks(actor: Actor): Promise<WebhookSummary[]> {
   const db = await getDb();
+  await assertActiveActor(db, actor, "read");
   const rows = await db.select().from(webhooks).where(eq(webhooks.orgId, actor.orgId)).orderBy(asc(webhooks.createdAt), asc(webhooks.id));
   return rows.map(summarize);
 }
 
 /** Remove a webhook and its delivery history. Deliveries not yet sent are dropped. */
 export async function deleteWebhook(actor: Actor, id: string): Promise<void> {
-  assertManager(actor, "remove webhooks");
+  await assertManager(actor, "remove webhooks");
   if (typeof id !== "string" || !id) throw webhookNotFound();
   const db = await getDb();
   await db.transaction(async (tx) => {
@@ -338,7 +346,7 @@ export async function deleteWebhook(actor: Actor, id: string): Promise<void> {
 /** Pause or resume a webhook. A paused webhook receives no new events, and
  *  deliveries still waiting to retry are closed as failed when they come due. */
 export async function setWebhookActive(actor: Actor, id: string, active: boolean): Promise<WebhookSummary> {
-  assertManager(actor, "change webhooks");
+  await assertManager(actor, "change webhooks");
   if (typeof id !== "string" || !id) throw webhookNotFound();
   const db = await getDb();
   const [row] = await db
@@ -353,6 +361,7 @@ export async function setWebhookActive(actor: Actor, id: string, active: boolean
 /** Recent deliveries for the org, newest first, optionally for one webhook. */
 export async function listDeliveries(actor: Actor, opts: { webhookId?: string; limit?: number } = {}): Promise<WebhookDelivery[]> {
   const db = await getDb();
+  await assertActiveActor(db, actor, "read");
   const conditions: SQL[] = [eq(webhookDeliveries.orgId, actor.orgId)];
   if (typeof opts.webhookId === "string" && opts.webhookId) conditions.push(eq(webhookDeliveries.webhookId, opts.webhookId));
   return db
@@ -637,7 +646,7 @@ export interface TestEventResult {
 /** Send one sample event right now and report what the endpoint said. It is sent
  *  once, never retried, and works for a paused webhook so it can be checked before resuming. */
 export async function sendTestEvent(actor: Actor, id: string, deps: WebhookDeps = {}): Promise<TestEventResult> {
-  assertManager(actor, "send test events");
+  await assertManager(actor, "send test events");
   if (typeof id !== "string" || !id) throw webhookNotFound();
   const db = await getDb();
   const [hook] = await db
@@ -682,6 +691,7 @@ export async function pruneWebhookDeliveries(olderThanDays = 30, now: Date = new
 /** Number of deliveries per status for one org; drives the "needs attention" badge on the integrations page. */
 export async function countDeliveriesByStatus(actor: Actor): Promise<Record<WebhookDelivery["status"], number>> {
   const db = await getDb();
+  await assertActiveActor(db, actor, "read");
   const rows = await db
     .select({ status: webhookDeliveries.status, n: count() })
     .from(webhookDeliveries)

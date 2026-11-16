@@ -18,10 +18,17 @@ vi.mock("@/lib/services/email-templates", () => ({
     html: `<a href="${p.url}">join</a>`,
     text: p.url,
   }),
+  inviteExistingAccountEmail: (p: { orgName: string; inviterName: string; resetUrl: string }) => ({
+    subject: `${p.inviterName} tried to invite you to ${p.orgName}`,
+    html: `<a href="${p.resetUrl}">existing account</a>`,
+    text: p.resetUrl,
+  }),
+  signInAlertEmail: (p: { name: string; resetUrl: string }) => ({ subject: "Many failed sign-in attempts", html: `<a href="${p.resetUrl}">alert</a>`, text: p.resetUrl }),
 }));
 
 import { getDb } from "@/lib/db";
-import { authTokens, events, orgs, rateLimits, sessions, users } from "@/lib/db/schema";
+import { apiKeys, authTokens, events, orgs, rateLimits, sessions, users } from "@/lib/db/schema";
+import { authenticateApiKey, createApiKey, listApiKeys } from "@/lib/services/api-keys";
 import { sha256Hex, newSecret } from "@/lib/ids";
 import { LIMITS } from "@/lib/types";
 import { ServiceError, type Actor } from "@/lib/services/context";
@@ -244,16 +251,66 @@ describe("logIn", () => {
     expect((await logIn({ email: member.email, password: PASSWORD })).id).toBe(member.id);
   });
 
-  it("locks an email after repeated failures, even with the right password, then recovers", async () => {
+  it("stops one network guessing at an email after ten tries, even with the right password, then recovers", async () => {
     const { owner } = await newOrg();
-    for (let i = 0; i < 10; i++) expect((await failure(() => logIn({ email: owner.email, password: "nope nope" }))).code).toBe("invalid");
-    const locked = await failure(() => logIn({ email: owner.email, password: PASSWORD }));
+    const meta = { ip: "203.0.113.40" };
+    for (let i = 0; i < 10; i++) expect((await failure(() => logIn({ email: owner.email, password: "nope nope" }, meta))).code).toBe("invalid");
+    const locked = await failure(() => logIn({ email: owner.email, password: PASSWORD }, meta));
     expect(locked.code).toBe("rate_limited");
-    expect(locked.message).toMatch(/Try again in \d+ minutes?/);
+    expect(locked.message).toMatch(/from your network\. Try again in \d+ minutes?, or reset your password/);
 
     const db = await getDb();
-    await db.update(rateLimits).set({ resetAt: new Date(Date.now() - 1000) }).where(eq(rateLimits.key, `login:email:${owner.email}`));
-    expect((await logIn({ email: owner.email, password: PASSWORD })).id).toBe(owner.id);
+    const windows = (await db.select().from(rateLimits)).filter((r) => r.key.startsWith("login:src:") && r.key.endsWith(":203.0.113.40"));
+    expect(windows).toHaveLength(1);
+    // The stored key never spells out the address being guessed at.
+    expect(windows[0].key).not.toContain(owner.email);
+    await db.update(rateLimits).set({ resetAt: new Date(Date.now() - 1000) }).where(eq(rateLimits.key, windows[0].key));
+    expect((await logIn({ email: owner.email, password: PASSWORD }, meta)).id).toBe(owner.id);
+  });
+
+  it("cannot be used to lock someone else out: wrong guesses from other networks do not block the right password", async () => {
+    const { owner } = await newOrg();
+    // One guess from each of ten addresses, then a whole run from each of three more.
+    for (let i = 0; i < 10; i++) await failure(() => logIn({ email: owner.email, password: "nope nope" }, { ip: `198.51.100.${100 + i}` }));
+    for (const ip of ["192.0.2.1", "192.0.2.2", "192.0.2.3"]) {
+      for (let i = 0; i < 12; i++) await failure(() => logIn({ email: owner.email, password: "nope nope" }, { ip }));
+    }
+    expect((await logIn({ email: owner.email, password: PASSWORD }, { ip: "203.0.113.77" })).id).toBe(owner.id);
+    // The attacking address itself stays blocked, right password or not.
+    expect((await failure(() => logIn({ email: owner.email, password: PASSWORD }, { ip: "192.0.2.1" }))).code).toBe("rate_limited");
+    expect(sent).toHaveLength(0);
+  });
+
+  it("treats odd network values as one source each without throwing", async () => {
+    const { owner } = await newOrg();
+    for (const ip of ["", "   ", null, "x".repeat(5000), "2001:DB8::1", "%_'; drop table rate_limits; --"]) {
+      expect((await logIn({ email: owner.email, password: PASSWORD }, { ip })).id).toBe(owner.id);
+    }
+  });
+
+  it("emails the account holder once when failures pile up across networks, without locking the account", async () => {
+    const { owner } = await newOrg();
+    const db = await getDb();
+    // Stand in for 100 earlier failures from many networks rather than hashing 100 passwords.
+    await db.insert(rateLimits).values({ key: `login:email:${owner.email}`, count: 100, resetAt: new Date(Date.now() + 3_600_000) });
+    await failure(() => logIn({ email: owner.email, password: "nope nope" }, { ip: "192.0.2.50" }));
+    await failure(() => logIn({ email: owner.email, password: "nope nope" }, { ip: "192.0.2.51" }));
+    expect(sent).toHaveLength(1);
+    expect(sent[0]).toMatchObject({ kind: "sign_in_alert", to: owner.email });
+    expect(sent[0].text).toContain("/forgot-password");
+    expect((await logIn({ email: owner.email, password: PASSWORD }, { ip: "192.0.2.52" })).id).toBe(owner.id);
+
+    // Nobody is emailed about an address with no account, and a broken provider changes nothing.
+    const ghost = uniqueEmail("ghost");
+    await db.insert(rateLimits).values({ key: `login:email:${ghost}`, count: 100, resetAt: new Date(Date.now() + 3_600_000) });
+    const unknown = await failure(() => logIn({ email: ghost, password: "nope nope" }));
+    expect(unknown.code).toBe("invalid");
+    expect(sent).toHaveLength(1);
+
+    const other = await newOrg();
+    emailBehaviour = "throw";
+    await db.insert(rateLimits).values({ key: `login:email:${other.owner.email}`, count: 100, resetAt: new Date(Date.now() + 3_600_000) });
+    expect((await failure(() => logIn({ email: other.owner.email, password: "nope nope" }))).code).toBe("invalid");
   });
 
   it("forgets earlier failures after a successful sign-in", async () => {
@@ -373,12 +430,21 @@ describe("password reset", () => {
     expect(sent).toHaveLength(3);
   });
 
-  it("lets someone locked out by failed sign-ins back in after a reset", async () => {
+  it("lets someone locked out by failed sign-ins back in after a reset, from every network", async () => {
     const { owner } = await newOrg();
-    for (let i = 0; i < 11; i++) await failure(() => logIn({ email: owner.email, password: "nope nope" }));
+    const sources = [undefined, { ip: "203.0.113.60" }, { ip: "203.0.113.61" }];
+    for (const meta of sources) {
+      for (let i = 0; i < 11; i++) await failure(() => logIn({ email: owner.email, password: "nope nope" }, meta));
+      expect((await failure(() => logIn({ email: owner.email, password: PASSWORD }, meta))).code).toBe("rate_limited");
+    }
+    // Someone else's counters are not swept up with them.
+    const bystander = await newOrg();
+    for (let i = 0; i < 11; i++) await failure(() => logIn({ email: bystander.owner.email, password: "nope nope" }));
+
     await requestPasswordReset(owner.email);
     await resetPassword(tokenFrom(sent[0].text), "a brand new password");
-    expect((await logIn({ email: owner.email, password: "a brand new password" })).id).toBe(owner.id);
+    for (const meta of sources) expect((await logIn({ email: owner.email, password: "a brand new password" }, meta)).id).toBe(owner.id);
+    expect((await failure(() => logIn({ email: bystander.owner.email, password: PASSWORD }))).code).toBe("rate_limited");
   });
 });
 
@@ -452,16 +518,54 @@ describe("invitations", () => {
     expect(pending[0]).toMatchObject({ email, role: "admin" });
   });
 
-  it("refuses to invite someone who already has an account, here or elsewhere", async () => {
+  it("refuses to invite someone who is already on the team", async () => {
     const a = await newOrg();
-    const b = await newOrg();
     const here = await failure(() => inviteMember(a.actor, { email: a.owner.email, role: "member" }));
     expect(here.code).toBe("conflict");
     expect(here.message).toMatch(/already on your team/);
-    const elsewhere = await failure(() => inviteMember(a.actor, { email: b.owner.email.toUpperCase(), role: "member" }));
-    expect(elsewhere.code).toBe("conflict");
-    expect(elsewhere.fields).toHaveProperty("email");
     expect(sent).toHaveLength(0);
+  });
+
+  it("does not reveal that an address has an account with another company", async () => {
+    const a = await newOrg("Asking Co");
+    const b = await newOrg();
+    const taken = await inviteMember(a.actor, { email: b.owner.email.toUpperCase(), role: "member" });
+    const fresh = await inviteMember(a.actor, { email: uniqueEmail("fresh"), role: "member" });
+
+    // Same shape and status either way: nothing for the inviter to tell them apart by.
+    expect(Object.keys(taken).sort()).toEqual(Object.keys(fresh).sort());
+    expect(taken.emailStatus).toBe(fresh.emailStatus);
+    expect(taken.invite).toMatchObject({ email: b.owner.email, role: "member", expired: false });
+    expect(taken.url).toMatch(/\/invite\/[^/]+$/);
+    expect((await listPendingInvites(a.actor)).map((i) => i.email).sort()).toEqual([taken.invite.email, fresh.invite.email].sort());
+
+    // The mailbox owner is told instead, without a join link they could never use.
+    const toTaken = sent.find((m) => m.to === b.owner.email);
+    expect(toTaken).toMatchObject({ kind: "invite", orgId: a.org.id });
+    expect(toTaken?.subject).toMatch(/tried to invite you to Asking Co/);
+    expect(toTaken?.text).toContain("/forgot-password");
+    expect(toTaken?.text).not.toContain("/invite/");
+
+    // The existing account is untouched and the invite can never create a second one.
+    const err = await failure(() => acceptInvite(tokenFrom(taken.url), { name: "Impostor", password: PASSWORD }));
+    expect(err.code).toBe("conflict");
+    expect((await logIn({ email: b.owner.email, password: PASSWORD })).orgId).toBe(b.org.id);
+    await revokeInvite(a.actor, taken.invite.id);
+
+    emailBehaviour = "failed";
+    const failedTaken = await inviteMember(a.actor, { email: b.owner.email, role: "admin" });
+    const failedFresh = await inviteMember(a.actor, { email: uniqueEmail("fresh"), role: "admin" });
+    expect({ status: failedTaken.emailStatus, error: failedTaken.emailError }).toEqual({ status: failedFresh.emailStatus, error: failedFresh.emailError });
+  });
+
+  it("counts every invite attempt against the hourly limit, including ones that are refused", async () => {
+    const a = await newOrg();
+    const db = await getDb();
+    await db.insert(rateLimits).values({ key: `invite:org:${a.org.id}`, count: 39, resetAt: new Date(Date.now() + 3_600_000) });
+    expect((await failure(() => inviteMember(a.actor, { email: a.owner.email, role: "member" }))).code).toBe("conflict");
+    const limited = await failure(() => inviteMember(a.actor, { email: a.owner.email, role: "member" }));
+    expect(limited.code).toBe("rate_limited");
+    expect(limited.message).toMatch(/Try again in/);
   });
 
   it("still creates the invite and returns the link when email fails, is off, or throws", async () => {
@@ -616,6 +720,116 @@ describe("roles and access", () => {
     const on = await setMemberDisabled(actor, member.id, false);
     expect(on.disabled).toBe(false);
     expect((await updateProfile(actorOf(member), { name: "Back Again" })).name).toBe("Back Again");
+  });
+
+  it("leaves a disabled admin no way back in: their open invites and API keys stop working", async () => {
+    const { actor, org } = await newOrg();
+    const admin = await addMember(actor, "admin", "Ada Admin");
+    const other = await addMember(actor, "admin", "Otto Other");
+    const backdoor = await inviteMember(actorOf(admin), { email: "admin-personal@elsewhere.test", role: "admin" });
+    const second = await inviteMember(actorOf(admin), { email: uniqueEmail("friend"), role: "member" });
+    const kept = await inviteMember(actorOf(other), { email: uniqueEmail("kept"), role: "member" });
+    const theirs = await createApiKey(actorOf(admin), "Ada's script");
+    const alreadyRevoked = await createApiKey(actorOf(admin), "Old script");
+    const db = await getDb();
+    const earlier = new Date("2026-01-01T00:00:00Z");
+    await db.update(apiKeys).set({ revokedAt: earlier }).where(eq(apiKeys.id, alreadyRevoked.row.id));
+    const others = await createApiKey(actorOf(other), "CRM");
+    expect(await authenticateApiKey(`Bearer ${theirs.key}`)).not.toBeNull();
+
+    const off = await setMemberDisabled(actor, admin.id, true, { ip: "203.0.113.5" });
+    expect(off.disabled).toBe(true);
+    expect(off.cancelledInvites.sort()).toEqual([backdoor.invite.email, second.invite.email].sort());
+    expect(off.revokedApiKeys).toEqual([{ id: theirs.row.id, name: "Ada's script" }]);
+
+    expect(await authenticateApiKey(`Bearer ${theirs.key}`)).toBeNull();
+    expect(await authenticateApiKey(`Bearer ${others.key}`)).not.toBeNull();
+    const keys = await listApiKeys(actor);
+    expect(keys.find((k) => k.id === alreadyRevoked.row.id)?.revokedAt).toEqual(earlier);
+
+    for (const url of [backdoor.url, second.url]) {
+      expect((await failure(() => getInvite(tokenFrom(url)))).code).toBe("gone");
+      expect((await failure(() => acceptInvite(tokenFrom(url), { name: "Ada Again", password: PASSWORD }))).code).toBe("gone");
+    }
+    expect((await listMembers(actor)).map((m) => m.email)).not.toContain("admin-personal@elsewhere.test");
+    expect((await listPendingInvites(actor)).map((i) => i.email)).toEqual([kept.invite.email]);
+    expect((await getInvite(tokenFrom(kept.url))).email).toBe(kept.invite.email);
+
+    const trail = await db.select().from(events).where(eq(events.orgId, org.id));
+    const disabledEvent = trail.find((e) => e.type === "member.disabled");
+    expect(disabledEvent?.data).toMatchObject({
+      userId: admin.id,
+      revokedKeys: [{ id: theirs.row.id, name: "Ada's script" }],
+    });
+    expect((disabledEvent?.data as { cancelledInvites: string[] }).cancelledInvites).toHaveLength(2);
+    const keyEvents = trail.filter((e) => e.type === "api_key.revoked");
+    expect(keyEvents).toHaveLength(1);
+    expect(keyEvents[0].data).toMatchObject({ keyId: theirs.row.id, reason: "creator_disabled" });
+    expect(JSON.stringify(trail)).not.toContain(theirs.key);
+
+    // Turning the account back on restores the sign-in, not what was cancelled.
+    const on = await setMemberDisabled(actor, admin.id, false);
+    expect(on).toMatchObject({ disabled: false, cancelledInvites: [], revokedApiKeys: [] });
+    expect(await authenticateApiKey(`Bearer ${theirs.key}`)).toBeNull();
+    expect((await failure(() => getInvite(tokenFrom(backdoor.url)))).code).toBe("gone");
+  });
+
+  it("rejects an invite whose sender has since lost the right to invite, even if the row survived", async () => {
+    const { actor, org } = await newOrg();
+    const admin = await addMember(actor, "admin");
+    const db = await getDb();
+    const plant = async (userId: string | null, orgId = org.id) => {
+      const token = newSecret();
+      await db.insert(authTokens).values({ id: sha256Hex(token), kind: "invite", orgId, userId, email: uniqueEmail("planted"), role: "admin", expiresAt: new Date(Date.now() + 86_400_000) });
+      return token;
+    };
+    const join = { name: "Late Joiner", password: PASSWORD };
+
+    // Rows left behind by a disable or demotion done directly in the database.
+    const fromDisabled = await plant(admin.id);
+    await db.update(users).set({ disabledAt: new Date() }).where(eq(users.id, admin.id));
+    expect((await failure(() => getInvite(fromDisabled))).code).toBe("gone");
+    expect((await failure(() => acceptInvite(fromDisabled, join))).code).toBe("gone");
+
+    await db.update(users).set({ disabledAt: null, role: "member" }).where(eq(users.id, admin.id));
+    expect((await failure(() => acceptInvite(fromDisabled, join))).code).toBe("gone");
+
+    // No sender on record, or a sender who belongs to a different company.
+    const noSender = await plant(null);
+    expect((await failure(() => acceptInvite(noSender, join))).code).toBe("gone");
+    const elsewhere = await newOrg();
+    const crossOrg = await plant(elsewhere.owner.id);
+    expect((await failure(() => getInvite(crossOrg))).code).toBe("gone");
+    expect((await failure(() => acceptInvite(crossOrg, join))).code).toBe("gone");
+
+    // A refused attempt does not burn the link: it works again once the sender is a manager again.
+    await db.update(users).set({ role: "admin" }).where(eq(users.id, admin.id));
+    expect((await acceptInvite(fromDisabled, join)).user.role).toBe("admin");
+    expect((await listMembers(actor)).filter((m) => m.name === "Late Joiner")).toHaveLength(1);
+  });
+
+  it("cancels the invites of someone demoted to member, and keeps them through other role changes", async () => {
+    const { actor, org } = await newOrg();
+    const admin = await addMember(actor, "admin");
+    const first = await inviteMember(actorOf(admin), { email: uniqueEmail("first"), role: "admin" });
+
+    const promoted = await changeMemberRole(actor, admin.id, "owner");
+    expect(promoted.cancelledInvites).toEqual([]);
+    expect((await getInvite(tokenFrom(first.url))).email).toBe(first.invite.email);
+    await changeMemberRole(actor, admin.id, "admin");
+    expect((await getInvite(tokenFrom(first.url))).email).toBe(first.invite.email);
+    const key = await createApiKey(actorOf(admin), "Reporting");
+
+    const demoted = await changeMemberRole(actor, admin.id, "member");
+    expect(demoted).toMatchObject({ role: "member", cancelledInvites: [first.invite.email], revokedApiKeys: [] });
+    expect((await failure(() => acceptInvite(tokenFrom(first.url), { name: "Friend", password: PASSWORD }))).code).toBe("gone");
+    expect(await listPendingInvites(actor)).toHaveLength(0);
+    // Still a colleague: the integration they set up keeps running.
+    expect(await authenticateApiKey(`Bearer ${key.key}`)).not.toBeNull();
+
+    const db = await getDb();
+    const changes = (await db.select().from(events).where(eq(events.orgId, org.id))).filter((e) => e.type === "member.role_changed");
+    expect(changes.map((e) => (e.data as { cancelledInvites?: string[] }).cancelledInvites)).toContainEqual([first.invite.email]);
   });
 
   it("stops using a disabled person as the countersigner", async () => {

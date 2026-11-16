@@ -8,7 +8,7 @@
  */
 import { and, asc, count, eq, gt, isNull } from "drizzle-orm";
 import { getDb, type DbOrTx, type Tx } from "@/lib/db";
-import { authTokens, orgs, sessions, users, type Org, type User } from "@/lib/db/schema";
+import { apiKeys, authTokens, orgs, sessions, users, type Org, type User } from "@/lib/db/schema";
 import { hashPassword, verifyPassword, PASSWORD_MAX_LENGTH, PASSWORD_MIN_LENGTH } from "@/lib/auth/password";
 import { env } from "@/lib/env";
 import { newId, newSecret, randomString, sha256Hex } from "@/lib/ids";
@@ -25,8 +25,8 @@ import {
 import { ServiceError, type Actor, type RequestMeta } from "./context";
 import { sendEmail } from "./email";
 import { recordEvent, type EventActor } from "./events";
-import { inviteEmail, passwordResetEmail } from "./email-templates";
-import { clearRateLimit, describeWait, rateLimit } from "./rate-limit";
+import { inviteEmail, inviteExistingAccountEmail, passwordResetEmail, signInAlertEmail } from "./email-templates";
+import { clearRateLimit, clearRateLimitPrefix, describeWait, rateLimit } from "./rate-limit";
 
 // ---------------------------------------------------------------------------
 // Public shapes
@@ -46,6 +46,17 @@ export interface Member {
   disabled: boolean;
   hasSignature: boolean;
   createdAt: Date;
+}
+
+/**
+ * What turning an account off (or demoting it) took away besides the sign-in, so the
+ * page can tell the manager which integrations now need a new key.
+ */
+export interface AccessChange extends Member {
+  /** Addresses whose unaccepted invitations from this person were cancelled. */
+  cancelledInvites: string[];
+  /** API keys this person created, revoked because they still know them. */
+  revokedApiKeys: { id: string; name: string }[];
 }
 
 export interface PendingInvite {
@@ -94,6 +105,7 @@ export const ACCOUNT_LIMITS = {
 } as const;
 
 /** Paths of the pages that consume the emailed tokens. */
+export const forgotPasswordUrl = () => `${env.appUrl}/forgot-password`;
 export const resetPasswordUrl = (token: string) => `${env.appUrl}/reset-password/${token}`;
 export const inviteUrl = (token: string) => `${env.appUrl}/invite/${token}`;
 
@@ -188,6 +200,29 @@ async function loadActorUser(db: DbOrTx, actor: Actor): Promise<User> {
   return user;
 }
 
+/**
+ * The one permission check for service entry points: is this caller still allowed to
+ * read, or to manage, their company's data right now?
+ *
+ * A signed-in person is checked against their stored row, never against the role
+ * carried in the Actor, so a demotion or a disabled account takes effect on the next
+ * call instead of when the session is next rebuilt. Returns that row. API-key and
+ * system actors return null: a key is checked for revocation each time it
+ * authenticates, and system actors are only ever built by server code. Services that
+ * must not be driven by a key at all (minting keys, changing webhooks) check
+ * `actor.type` themselves.
+ */
+export async function assertActiveActor(db: DbOrTx, actor: Actor, need: "read" | "manage"): Promise<User | null> {
+  if (!actor || typeof actor !== "object" || typeof actor.orgId !== "string" || !actor.orgId) {
+    throw new ServiceError("forbidden", "Sign in to do that.");
+  }
+  if (actor.type !== "user") return null;
+  if (typeof actor.userId !== "string" || !actor.userId) {
+    throw new ServiceError("forbidden", "Sign in to do that.");
+  }
+  return need === "manage" ? loadManager(db, actor) : loadActorUser(db, actor);
+}
+
 async function loadManager(db: DbOrTx, actor: Actor): Promise<User> {
   const user = await loadActorUser(db, actor);
   if (user.role !== "owner" && user.role !== "admin") {
@@ -201,6 +236,22 @@ async function lockOrg(tx: Tx, orgId: string): Promise<Org> {
   const [org] = await tx.select().from(orgs).where(eq(orgs.id, orgId)).for("update");
   if (!org) throw new ServiceError("not_found", "This company account no longer exists.");
   return org;
+}
+
+const isManagerRow = (u: Pick<User, "role" | "disabledAt"> | undefined | null): boolean =>
+  Boolean(u) && !u!.disabledAt && (u!.role === "owner" || u!.role === "admin");
+
+/**
+ * Cancels the invitations a person sent that nobody has accepted yet. An invite is the
+ * inviter's authority frozen into a link; once they lose that authority the link must
+ * stop working, or they could keep one addressed to themselves as a way back in.
+ */
+async function cancelInvitesFrom(tx: Tx, orgId: string, userId: string): Promise<string[]> {
+  const removed = await tx
+    .delete(authTokens)
+    .where(and(eq(authTokens.kind, "invite"), eq(authTokens.orgId, orgId), eq(authTokens.userId, userId), isNull(authTokens.usedAt)))
+    .returning({ email: authTokens.email });
+  return removed.map((r) => r.email);
 }
 
 async function assertActiveOwnerRemains(tx: Tx, orgId: string): Promise<void> {
@@ -528,6 +579,40 @@ function getDummyHash(): Promise<string> {
   return dummyHash;
 }
 
+const LOGIN_ATTEMPTS_PER_SOURCE = 10;
+/** Failures across every network in an hour before the account holder is told. Never a lockout. */
+const LOGIN_FAILURES_BEFORE_ALERT = 100;
+
+/**
+ * Prefix of the per-network attempt counters for one email. The email is hashed so the
+ * prefix has a fixed length: the full key always fits the limiter's stored form, which
+ * is what lets a password reset forget every network's counter at once.
+ */
+const loginSourcePrefix = (email: string) => `login:src:${sha256Hex(email).slice(0, 32)}:`;
+
+function loginSource(meta?: RequestMeta): string {
+  const ip = typeof meta?.ip === "string" ? meta.ip.trim().toLowerCase().slice(0, 64) : "";
+  // Without an address there is nothing to tell sources apart, so they share one counter.
+  return ip || "unknown";
+}
+
+/**
+ * Counts a wrong password against the email as a whole. Past the ceiling the account
+ * holder gets one email an hour; the account is never locked from here, because a
+ * lock keyed on something an attacker can type is a way to shut the real owner out.
+ */
+async function noteFailedLogin(email: string, user: User | undefined): Promise<void> {
+  const overall = await rateLimit(`login:email:${email}`, LOGIN_FAILURES_BEFORE_ALERT, 3600);
+  if (overall.ok || !user || user.disabledAt) return;
+  if (!(await rateLimit(`login:alert:${email}`, 1, 3600)).ok) return;
+  await safeSend({
+    orgId: user.orgId,
+    kind: "sign_in_alert",
+    to: user.email,
+    ...signInAlertEmail({ name: user.name, resetUrl: forgotPasswordUrl() }),
+  });
+}
+
 /**
  * Checks an email and password. Unknown email and wrong password are indistinguishable
  * by message and by timing. The caller starts the session with the returned id.
@@ -543,14 +628,19 @@ export async function logIn(input: { email: unknown; password: unknown }, meta?:
     throw invalid(fields);
   }
 
-  const emailKey = `login:email:${email}`;
   if (meta?.ip) {
     const byIp = await rateLimit(`login:ip:${meta.ip}`, 50, 900);
     if (!byIp.ok) throw new ServiceError("rate_limited", `Too many sign-in attempts from this network. Try again ${describeWait(byIp.retryAfterSeconds)}.`);
   }
-  const byEmail = await rateLimit(emailKey, 10, 900);
-  if (!byEmail.ok) {
-    throw new ServiceError("rate_limited", `Too many sign-in attempts for this email. Try again ${describeWait(byEmail.retryAfterSeconds)}, or reset your password.`);
+  // The hard stop is per email AND network. Keyed on the email alone it would let anyone
+  // who knows an address keep its owner signed out with ten wrong guesses every 15 minutes.
+  const sourceKey = `${loginSourcePrefix(email)}${loginSource(meta)}`;
+  const bySource = await rateLimit(sourceKey, LOGIN_ATTEMPTS_PER_SOURCE, 900);
+  if (!bySource.ok) {
+    throw new ServiceError(
+      "rate_limited",
+      `Too many sign-in attempts for this email from your network. Try again ${describeWait(bySource.retryAfterSeconds)}, or reset your password.`,
+    );
   }
 
   const db = await getDb();
@@ -560,15 +650,16 @@ export async function logIn(input: { email: unknown; password: unknown }, meta?:
   const fallback = await getDummyHash();
   const matches = await verifyPassword(candidate, user?.passwordHash ?? fallback);
   if (!user || !matches || password.length > PASSWORD_MAX_LENGTH) {
+    await noteFailedLogin(email, user);
     throw new ServiceError("invalid", LOGIN_FAILED);
   }
   // Only said after the right password, so it cannot be used to probe which emails exist.
   if (user.disabledAt) {
     throw new ServiceError("forbidden", "This account has been turned off. Ask an owner of your company account to turn it back on.");
   }
-  // Failed attempts are forgiven for the email only; the per-network counter keeps
-  // counting so one valid login cannot be used to reset a guessing run.
-  await clearRateLimit(emailKey);
+  // Earlier mistakes from this network are forgiven for this email only; the
+  // per-network counter keeps counting so one valid login cannot reset a guessing run.
+  await clearRateLimit(sourceKey);
   return toMember(user);
 }
 
@@ -662,9 +753,10 @@ export async function resetPassword(token: unknown, newPassword: unknown, meta?:
     await audit(tx, user.orgId, { type: "user", label: actorLabel(user) }, "member.password_reset", { userId: user.id }, meta);
     return toMember(user);
   });
-  // Someone locked out by failed attempts who then resets should be able to sign in straight away.
-  // After the transaction on purpose: the limiter uses its own connection.
-  await clearRateLimit(`login:email:${member.email}`);
+  // Someone locked out by failed attempts who then resets should be able to sign in straight
+  // away, from whichever network they are on. After the transaction on purpose: the limiter
+  // uses its own connection.
+  await clearRateLimitPrefix(loginSourcePrefix(member.email));
   return member;
 }
 
@@ -725,20 +817,24 @@ export async function inviteMember(actor: Actor, input: { email: unknown; role: 
   if (!role) fields.role = "Choose a role: admin or member.";
   if (!role || Object.keys(fields).length > 0) throw invalid(fields);
 
-  const [existing] = await db.select({ orgId: users.orgId }).from(users).where(eq(users.email, email)).limit(1);
-  if (existing) {
-    const message =
-      existing.orgId === manager.orgId
-        ? "This person is already on your team."
-        : "This email already has an account with another company, so it cannot be invited. Ask them for a different email address.";
-    throw new ServiceError("conflict", message, { email: message });
-  }
-
-  // Invites send email to arbitrary addresses on our domain's reputation.
+  // Invites send email to arbitrary addresses on our domain's reputation. Counted before
+  // the address is looked up, so attempts that end in "already on your team" are capped too.
   const limit = await rateLimit(`invite:org:${manager.orgId}`, 40, 3600);
   if (!limit.ok) {
     throw new ServiceError("rate_limited", `Your team has sent a lot of invitations. Try again ${describeWait(limit.retryAfterSeconds)}.`);
   }
+
+  const [existing] = await db.select({ orgId: users.orgId }).from(users).where(eq(users.email, email)).limit(1);
+  if (existing?.orgId === manager.orgId) {
+    // Not a leak: a manager can already see their own team list.
+    const message = "This person is already on your team.";
+    throw new ServiceError("conflict", message, { email: message });
+  }
+  // An address with an account at another company gets exactly the same result as a new
+  // one, or any free account could use invites to find out who is a customer. The
+  // invite is recorded as usual and can never be accepted; the mailbox owner is the one
+  // who is told why.
+  const hasAccountElsewhere = Boolean(existing);
 
   const token = newSecret();
   const { row, org } = await db.transaction(async (tx) => {
@@ -766,7 +862,9 @@ export async function inviteMember(actor: Actor, input: { email: unknown; role: 
     kind: "invite",
     to: email,
     fromName: org.name,
-    ...inviteEmail({ orgName: org.name, inviterName: manager.name, url }),
+    ...(hasAccountElsewhere
+      ? inviteExistingAccountEmail({ orgName: org.name, inviterName: manager.name, resetUrl: forgotPasswordUrl() })
+      : inviteEmail({ orgName: org.name, inviterName: manager.name, url })),
   });
   return { invite: toPendingInvite(row), url, emailStatus: sent.status, emailError: sent.error };
 }
@@ -795,12 +893,16 @@ export async function getInvite(token: unknown): Promise<InviteDetails> {
   if (!isSecretToken(token)) throw new ServiceError("gone", INVITE_GONE);
   const db = await getDb();
   const [row] = await db
-    .select({ invite: authTokens, orgName: orgs.name })
+    .select({ invite: authTokens, orgName: orgs.name, inviter: { role: users.role, disabledAt: users.disabledAt } })
     .from(authTokens)
     .innerJoin(orgs, eq(orgs.id, authTokens.orgId))
+    // Same company as the invite: an inviter row from anywhere else gives no authority here.
+    .leftJoin(users, and(eq(users.id, authTokens.userId), eq(users.orgId, authTokens.orgId)))
     .where(and(eq(authTokens.id, sha256Hex(token)), eq(authTokens.kind, "invite"), isNull(authTokens.usedAt), gt(authTokens.expiresAt, new Date())))
     .limit(1);
-  if (!row || !row.invite.orgId) throw new ServiceError("gone", INVITE_GONE);
+  // An invite is only as good as the person who sent it: once they are turned off or
+  // no longer a manager, the link is dead even if the row was never cleaned up.
+  if (!row || !row.invite.orgId || !isManagerRow(row.inviter)) throw new ServiceError("gone", INVITE_GONE);
   return {
     email: row.invite.email,
     role: row.invite.role === "admin" ? "admin" : "member",
@@ -833,6 +935,16 @@ export async function acceptInvite(token: unknown, input: { name: unknown; passw
     if (!used?.orgId) throw new ServiceError("gone", INVITE_GONE);
     const [org] = await tx.select().from(orgs).where(eq(orgs.id, used.orgId)).limit(1);
     if (!org) throw new ServiceError("gone", INVITE_GONE);
+    // Re-checked inside the transaction: the inviter may have been turned off or demoted
+    // between the page load and this submit. Throwing rolls the token update back.
+    const [inviter] = used.userId
+      ? await tx
+          .select({ role: users.role, disabledAt: users.disabledAt })
+          .from(users)
+          .where(and(eq(users.id, used.userId), eq(users.orgId, org.id)))
+          .limit(1)
+      : [];
+    if (!isManagerRow(inviter)) throw new ServiceError("gone", INVITE_GONE);
 
     const [user] = await tx
       .insert(users)
@@ -854,7 +966,7 @@ export async function acceptInvite(token: unknown, input: { name: unknown; passw
  * make or unmake an owner. Nobody changes their own role, which together with the
  * owner check below means a company always keeps an active owner.
  */
-export async function changeMemberRole(actor: Actor, userId: unknown, role: unknown, meta?: RequestMeta): Promise<Member> {
+export async function changeMemberRole(actor: Actor, userId: unknown, role: unknown, meta?: RequestMeta): Promise<AccessChange> {
   if (role !== "owner" && role !== "admin" && role !== "member") {
     throw invalid({ role: "Choose a role: owner, admin or member." });
   }
@@ -872,17 +984,32 @@ export async function changeMemberRole(actor: Actor, userId: unknown, role: unkn
     if (role === "owner" && target.disabledAt) {
       throw new ServiceError("conflict", "Turn this account back on before making them an owner.");
     }
-    if (target.role === role) return toMember(target);
+    if (target.role === role) return { ...toMember(target), cancelledInvites: [], revokedApiKeys: [] };
 
     const [updated] = await tx.update(users).set({ role }).where(and(eq(users.id, target.id), eq(users.orgId, org.id))).returning();
     await assertActiveOwnerRemains(tx, org.id);
-    await audit(tx, org.id, { type: "user", label: actorLabel(manager) }, "member.role_changed", { userId: target.id, email: target.email, from: target.role, to: role }, meta);
-    return toMember(updated);
+    // A member cannot invite, so invitations they sent as a manager stop with the role.
+    // Their API keys stay: they are still a trusted colleague, and a manager can revoke them.
+    const cancelledInvites = role === "member" ? await cancelInvitesFrom(tx, org.id, target.id) : [];
+    await audit(
+      tx,
+      org.id,
+      { type: "user", label: actorLabel(manager) },
+      "member.role_changed",
+      { userId: target.id, email: target.email, from: target.role, to: role, ...(cancelledInvites.length > 0 ? { cancelledInvites } : {}) },
+      meta,
+    );
+    return { ...toMember(updated), cancelledInvites, revokedApiKeys: [] };
   });
 }
 
-/** Turns a teammate's access off or back on. Turning it off signs them out everywhere. */
-export async function setMemberDisabled(actor: Actor, userId: unknown, disabled: unknown, meta?: RequestMeta): Promise<Member> {
+/**
+ * Turns a teammate's access off or back on. Turning it off removes every way back in
+ * that they hold: sessions, invitations they sent that are still open, and API keys
+ * they created (the key is shown to its creator, so they may still have it). The
+ * result lists what was cancelled; turning the account back on does not restore it.
+ */
+export async function setMemberDisabled(actor: Actor, userId: unknown, disabled: unknown, meta?: RequestMeta): Promise<AccessChange> {
   if (typeof disabled !== "boolean") throw invalid({ disabled: "Choose whether this account is on or off." });
   const db = await getDb();
   return db.transaction(async (tx) => {
@@ -895,21 +1022,46 @@ export async function setMemberDisabled(actor: Actor, userId: unknown, disabled:
     if (target.role === "owner" && manager.role !== "owner") {
       throw new ServiceError("forbidden", "Only an owner can turn an owner's account off or on.");
     }
-    if ((target.disabledAt !== null) === disabled) return toMember(target);
+    if ((target.disabledAt !== null) === disabled) return { ...toMember(target), cancelledInvites: [], revokedApiKeys: [] };
 
     const [updated] = await tx
       .update(users)
       .set({ disabledAt: disabled ? new Date() : null })
       .where(and(eq(users.id, target.id), eq(users.orgId, org.id)))
       .returning();
+    let cancelledInvites: string[] = [];
+    let revokedApiKeys: { id: string; name: string }[] = [];
     if (disabled) {
       await assertActiveOwnerRemains(tx, org.id);
       await tx.delete(sessions).where(eq(sessions.userId, target.id));
       // A disabled person must not keep signing agreements on the company's behalf.
       await releaseCountersigner(tx, org, target.id, { keepAsManual: false });
+      cancelledInvites = await cancelInvitesFrom(tx, org.id, target.id);
+      revokedApiKeys = await tx
+        .update(apiKeys)
+        .set({ revokedAt: new Date() })
+        .where(and(eq(apiKeys.orgId, org.id), eq(apiKeys.createdBy, target.id), isNull(apiKeys.revokedAt)))
+        .returning({ id: apiKeys.id, name: apiKeys.name });
+      for (const key of revokedApiKeys) {
+        // Same event a manual revoke writes, so the key's own history explains why it stopped working.
+        await audit(tx, org.id, { type: "user", label: actorLabel(manager) }, "api_key.revoked", { keyId: key.id, name: key.name, reason: "creator_disabled", createdBy: target.id }, meta);
+      }
     }
-    await audit(tx, org.id, { type: "user", label: actorLabel(manager) }, disabled ? "member.disabled" : "member.enabled", { userId: target.id, email: target.email }, meta);
-    return toMember(updated);
+    await audit(
+      tx,
+      org.id,
+      { type: "user", label: actorLabel(manager) },
+      disabled ? "member.disabled" : "member.enabled",
+      {
+        userId: target.id,
+        email: target.email,
+        ...(cancelledInvites.length > 0 ? { cancelledInvites } : {}),
+        // Not "revokedApiKeys": the audit trail drops any key that looks like it holds a credential.
+        ...(revokedApiKeys.length > 0 ? { revokedKeys: revokedApiKeys } : {}),
+      },
+      meta,
+    );
+    return { ...toMember(updated), cancelledInvites, revokedApiKeys };
   });
 }
 

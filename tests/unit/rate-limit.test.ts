@@ -2,7 +2,7 @@ import { describe, it, expect } from "vitest";
 import { eq } from "drizzle-orm";
 import { getDb } from "@/lib/db";
 import { rateLimits } from "@/lib/db/schema";
-import { rateLimit, clearRateLimit, describeWait } from "@/lib/services/rate-limit";
+import { rateLimit, clearRateLimit, clearRateLimitPrefix, describeWait } from "@/lib/services/rate-limit";
 import {
   normalizeEmail,
   isValidEmail,
@@ -106,6 +106,28 @@ describe("rateLimit", () => {
     await clearRateLimit(k);
     expect((await rateLimit(k, 1, 60)).ok).toBe(true);
     await expect(clearRateLimit(key("never-used"))).resolves.toBeUndefined();
+  });
+
+  it("clearRateLimitPrefix forgets every key under a prefix and nothing else", async () => {
+    const base = key("prefix");
+    const inside = [`${base}:a`, `${base}:b`, `${base}:`];
+    // "%" and "_" must be matched literally, not as wildcards.
+    const outside = [`${base}x:a`, `x${base}:a`, base.replace("test", "tes%") + ":a", base.replace(":", "_") + ":a"];
+    for (const k of [...inside, ...outside]) await rateLimit(k, 1, 60);
+
+    await clearRateLimitPrefix(`${base}:`);
+    for (const k of inside) expect((await rateLimit(k, 1, 60)).ok).toBe(true);
+    for (const k of outside) expect((await rateLimit(k, 1, 60)).ok).toBe(false);
+  });
+
+  it("clearRateLimitPrefix ignores an empty, wildcard-only or oversized prefix", async () => {
+    const k = key("survivor");
+    await rateLimit(k, 1, 60);
+    await expect(clearRateLimitPrefix("")).resolves.toBeUndefined();
+    await expect(clearRateLimitPrefix("%")).resolves.toBeUndefined();
+    await expect(clearRateLimitPrefix("x".repeat(5000))).resolves.toBeUndefined();
+    await expect(clearRateLimitPrefix(undefined as never)).resolves.toBeUndefined();
+    expect((await rateLimit(k, 1, 60)).ok).toBe(false);
   });
 
   it("describes waits in plain words", () => {

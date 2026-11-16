@@ -3,7 +3,7 @@ import type { AddressInfo } from "node:net";
 import { describe, it, expect } from "vitest";
 import { eq } from "drizzle-orm";
 import { getDb } from "@/lib/db";
-import { orgs, webhooks, webhookDeliveries } from "@/lib/db/schema";
+import { orgs, users, webhooks, webhookDeliveries } from "@/lib/db/schema";
 import { newId } from "@/lib/ids";
 import { systemActor, type Actor } from "@/lib/services/context";
 import {
@@ -32,13 +32,20 @@ async function makeOrg(): Promise<string> {
   const db = await getDb();
   const id = newId("org");
   await db.insert(orgs).values({ id, name: "Test Co", slug: id });
+  // Permissions are read from the stored user row, so each org gets one real user per role.
+  await db.insert(users).values(
+    ROLES.map((role) => ({ id: userIdFor(id, role), orgId: id, email: `${role}-${id}@example.com`, name: "Sam Lee", passwordHash: "x", role })),
+  );
   return id;
 }
+
+const ROLES = ["owner", "admin", "member"] as const;
+const userIdFor = (orgId: string, role: (typeof ROLES)[number] = "owner") => `usr_${role}_${orgId.slice(4)}`;
 
 const actorFor = (orgId: string, role: "owner" | "admin" | "member" = "owner"): Actor => ({
   type: "user",
   orgId,
-  userId: "usr_test",
+  userId: userIdFor(orgId, role),
   role,
   label: "Sam Lee",
 });
@@ -743,5 +750,53 @@ describe("pruneWebhookDeliveries", () => {
     ]);
     expect(await pruneWebhookDeliveries(30)).toBe(2);
     expect((await deliveriesFor(orgId)).map((r) => r.id).sort()).toEqual(["whd_new_done", "whd_old_pending"]);
+  });
+});
+
+describe("permissions follow the stored user, not the session's copy", () => {
+  it("refuses a demoted admin whose Actor still says admin", async () => {
+    const db = await getDb();
+    const orgId = await makeOrg();
+    const stale = actorFor(orgId, "admin");
+    const hook = await createWebhook(stale, "https://hooks.example.com/in", prod());
+    await db.update(users).set({ role: "member" }).where(eq(users.id, userIdFor(orgId, "admin")));
+
+    await expect(createWebhook(stale, "https://other.example.com/in", prod())).rejects.toMatchObject({ code: "forbidden" });
+    await expect(setWebhookActive(stale, hook.id, false)).rejects.toMatchObject({ code: "forbidden" });
+    await expect(sendTestEvent(stale, hook.id, { send: recorder().send, ...prod() })).rejects.toMatchObject({ code: "forbidden" });
+    await expect(deleteWebhook(stale, hook.id)).rejects.toMatchObject({ code: "forbidden" });
+    // Still on the team, so reading is fine.
+    expect(await listWebhooks(stale)).toHaveLength(1);
+    expect(await listDeliveries(stale)).toEqual([]);
+  });
+
+  it("refuses a disabled person every call, including the delivery log", async () => {
+    const db = await getDb();
+    const orgId = await makeOrg();
+    const stale = actorFor(orgId, "owner");
+    const hook = await createWebhook(stale, "https://hooks.example.com/in", prod());
+    await enqueueWebhookEvent(db, orgId, "file.created", { fileId: "fil_1", clientName: "Test Client" });
+    expect(await listDeliveries(stale)).toHaveLength(1);
+    await db.update(users).set({ disabledAt: new Date() }).where(eq(users.id, userIdFor(orgId, "owner")));
+
+    await expect(listDeliveries(stale)).rejects.toMatchObject({ code: "forbidden" });
+    await expect(listDeliveries(stale, { webhookId: hook.id })).rejects.toMatchObject({ code: "forbidden" });
+    await expect(countDeliveriesByStatus(stale)).rejects.toMatchObject({ code: "forbidden" });
+    await expect(listWebhooks(stale)).rejects.toMatchObject({ code: "forbidden" });
+    await expect(createWebhook(stale, "https://other.example.com/in", prod())).rejects.toMatchObject({ code: "forbidden" });
+    await expect(deleteWebhook(stale, hook.id)).rejects.toMatchObject({ code: "forbidden" });
+    // Server-side callers are unaffected.
+    expect(await listDeliveries(systemActor(orgId))).toHaveLength(1);
+  });
+
+  it("refuses the delivery log to an Actor that names no real user or no company", async () => {
+    const a = await makeOrg();
+    const b = await makeOrg();
+    await createWebhook(actorFor(b), "https://hooks.example.com/in", prod());
+    await enqueueWebhookEvent(await getDb(), b, "file.created", {});
+    const forged: Actor = { type: "user", orgId: b, userId: userIdFor(a, "owner"), role: "owner", label: "Sam Lee" };
+    await expect(listDeliveries(forged)).rejects.toMatchObject({ code: "forbidden" });
+    await expect(listDeliveries(undefined as never)).rejects.toMatchObject({ code: "forbidden" });
+    await expect(countDeliveriesByStatus({ type: "user" } as never)).rejects.toMatchObject({ code: "forbidden" });
   });
 });

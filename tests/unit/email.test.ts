@@ -25,6 +25,8 @@ import {
   deliveryFailedEmail,
   passwordResetEmail,
   inviteEmail,
+  inviteExistingAccountEmail,
+  signInAlertEmail,
   buttonColors,
   type EmailContent,
 } from "@/lib/services/email-templates";
@@ -47,6 +49,8 @@ function allEmails(s: string, url = SIGN_URL): Record<string, EmailContent> {
     deliveryFailed: deliveryFailedEmail({ brand: b, recipientName: s, clientName: s, clientEmail: s, fileReference: s, fileUrl: url }),
     passwordReset: passwordResetEmail({ name: s, url }),
     invite: inviteEmail({ orgName: s, inviterName: s, url }),
+    inviteExistingAccount: inviteExistingAccountEmail({ orgName: s, inviterName: s, resetUrl: url }),
+    signInAlert: signInAlertEmail({ name: s, resetUrl: url }),
   };
 }
 
@@ -257,6 +261,38 @@ describe("email templates", () => {
     const voided = voidedEmail({ brand, signerName: "Dana", agreementName: "A", reason: "Sent to the wrong person" });
     expect(voided.html).not.toContain("href=");
     expect(voided.text).toContain("> Sent to the wrong person");
+  });
+});
+
+describe("account notices", () => {
+  const RESET = "https://app.example.test/forgot-password";
+
+  it("tells an invited person with an existing account why they cannot join and what to do, without a join link", () => {
+    const mail = inviteExistingAccountEmail({ orgName: "Northwind Legal", inviterName: "Dana Reyes", resetUrl: RESET });
+    expect(mail.subject).toBe("Dana Reyes tried to invite you to Northwind Legal on Signgate");
+    for (const body of [mail.text, mail.html]) {
+      expect(body).toContain("already has a Signgate account with a different company");
+      expect(body).toContain("invite you at a different email address");
+      expect(body).toContain(RESET);
+      expect(body).not.toContain("/invite/");
+    }
+  });
+
+  it("tells an account holder about failed sign-ins and that they are not locked out", () => {
+    const mail = signInAlertEmail({ name: "Dana Reyes", resetUrl: RESET });
+    expect(mail.subject).toBe("Many failed sign-in attempts on your Signgate account");
+    for (const body of [mail.text, mail.html]) {
+      expect(body).toContain("Dana");
+      expect(body).toContain("not locked");
+      expect(body).toContain(RESET);
+    }
+  });
+
+  it("falls back to safe wording when names are missing or not strings", () => {
+    const mail = inviteExistingAccountEmail({ orgName: null as never, inviterName: 42 as never, resetUrl: "javascript:alert(1)" });
+    expect(mail.subject).toContain("tried to invite you to");
+    expect(mail.html).not.toContain("javascript:");
+    expect(() => signInAlertEmail({ name: undefined as never, resetUrl: undefined as never })).not.toThrow();
   });
 });
 

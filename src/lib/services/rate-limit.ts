@@ -77,6 +77,26 @@ export async function clearRateLimit(key: string): Promise<void> {
   }
 }
 
+/**
+ * Forgets every key that starts with `prefix`, for counters kept per source
+ * (`<subject>:<ip>`) that must all be forgiven at once. Never throws.
+ *
+ * Only reaches keys short enough to be stored as written; callers build such keys
+ * from bounded parts.
+ */
+export async function clearRateLimitPrefix(prefix: string): Promise<void> {
+  const text = String(prefix);
+  // An empty prefix would match every counter in the product.
+  if (!text || text.length > MAX_KEY_LENGTH) return;
+  try {
+    const db = await getDb();
+    // starts_with compares literally, so "%" or "_" in a prefix cannot widen the match.
+    await db.delete(rateLimits).where(sql`starts_with(${rateLimits.key}, ${text})`);
+  } catch {
+    // Leaving counters in place only makes the limit slightly stricter.
+  }
+}
+
 /** "in 1 minute", "in 12 minutes": for rate-limit messages shown to people. */
 export function describeWait(seconds: number): string {
   const minutes = Math.max(1, Math.ceil(seconds / 60));

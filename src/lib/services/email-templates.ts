@@ -614,3 +614,49 @@ export function inviteEmail(input: { orgName: string; inviterName: string; url: 
     footer: `Sent by ${PRODUCT_NAME} because ${inviter} entered this address to invite you to ${org}.`,
   });
 }
+
+/**
+ * Sent in place of the invitation when the invited address already has an account with
+ * another company. The person who sent the invite is told nothing different, so an
+ * invite cannot be used to find out who has an account; the owner of the mailbox is the
+ * one who learns why it cannot be accepted and what to do.
+ */
+export function inviteExistingAccountEmail(input: { orgName: string; inviterName: string; resetUrl: string }): EmailContent {
+  const org = line(input.orgName, 120) || "a team";
+  const inviter = line(input.inviterName, 120) || "A colleague";
+  return render({
+    subject: `${inviter} tried to invite you to ${org} on ${PRODUCT_NAME}`,
+    preheader: "This address already has an account, so the invitation cannot be accepted as sent.",
+    senderName: PRODUCT_NAME,
+    blocks: [
+      p("Hello,"),
+      p(b(inviter), " tried to invite you to join ", b(org), ` on ${PRODUCT_NAME}.`),
+      p(
+        `This email address already has a ${PRODUCT_NAME} account with a different company, and an address can belong to one company account only, so this invitation cannot be accepted.`,
+      ),
+      p(`To join ${org}, ask ${inviter} to invite you at a different email address.`),
+      p("If you do not recognise the existing account, set a new password for it. That signs out anyone else who is using it:"),
+      { kind: "button", label: "Set a new password", url: safeUrl(input.resetUrl) },
+      note(`${inviter} has not been told that this address has an account. If you were not expecting this, you can ignore this email.`),
+    ],
+    footer: `Sent by ${PRODUCT_NAME} because ${inviter} entered this address to invite you to ${org}.`,
+  });
+}
+
+/** Tells an account holder about a run of failed sign-ins. Their account is not locked, so the email says so. */
+export function signInAlertEmail(input: { name: string; resetUrl: string }): EmailContent {
+  return render({
+    subject: `Many failed sign-in attempts on your ${PRODUCT_NAME} account`,
+    preheader: "Your account is not locked and your password still works.",
+    senderName: PRODUCT_NAME,
+    blocks: [
+      greeting(input.name),
+      p(`Someone has tried many times in the last hour to sign in to your ${PRODUCT_NAME} account with the wrong password.`),
+      p("Nobody got in through these attempts. Your account is not locked and your password still works."),
+      p("If this was not you, and your password is short or used on other sites, choose a new one:"),
+      { kind: "button", label: "Choose a new password", url: safeUrl(input.resetUrl) },
+      note("If this was you, there is nothing you need to do. We send this message at most once an hour."),
+    ],
+    footer: `Sent by ${PRODUCT_NAME} because of repeated failed sign-in attempts for this address.`,
+  });
+}
