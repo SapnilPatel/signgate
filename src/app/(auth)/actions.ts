@@ -6,9 +6,27 @@ import { endSession, startSession } from "@/lib/auth/session";
 import { getRequestMeta } from "@/lib/request";
 import { acceptInvite, logIn, requestPasswordReset, resetPassword, signUp } from "@/lib/services/accounts";
 
-/** Only same-site paths are accepted as a post-sign-in destination. */
+/**
+ * Only same-site paths are accepted as a post-sign-in destination.
+ *
+ * Checked by allow-list and then by parsing, not by prefix: browsers strip tabs
+ * and newlines from URLs and treat a backslash as a slash, so "/\t/other.example"
+ * would otherwise become "//other.example", a link to another site.
+ */
 function safeNext(value: string): string {
-  return value.startsWith("/") && !value.startsWith("//") && !value.includes("\\") ? value : "/files";
+  const fallback = "/files";
+  if (value.length > 2000 || !/^\/(?!\/)[A-Za-z0-9\-._~!$&'()*+,;=:@%/?]*$/.test(value)) return fallback;
+  try {
+    const base = "http://internal.invalid";
+    const url = new URL(value, base);
+    if (url.origin !== base) return fallback;
+    // Dot segments are resolved by the parser; a path that resolves to a
+    // double slash is refused for the same reason as one that starts with it.
+    const path = url.pathname + url.search;
+    return path.startsWith("//") ? fallback : path;
+  } catch {
+    return fallback;
+  }
 }
 
 export async function signUpAction(_prev: ActionState, form: FormData): Promise<ActionState> {
@@ -19,6 +37,7 @@ export async function signUpAction(_prev: ActionState, form: FormData): Promise<
         name: field(form, "name"),
         email: field(form, "email"),
         password: String(form.get("password") ?? ""),
+        timeZone: field(form, "timeZone"),
       },
       await getRequestMeta(),
     );

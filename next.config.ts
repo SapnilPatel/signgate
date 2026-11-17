@@ -1,6 +1,28 @@
 import type { NextConfig } from "next";
 
+const dev = process.env.NODE_ENV !== "production";
+
+// Everything the app loads comes from its own origin (PDF.js worker, fonts, images),
+// so the policy can forbid all third-party script, frames and form targets. Inline
+// script and style are allowed because the framework emits both; the PDF.js image
+// decoders need WebAssembly.
+const csp = [
+  "default-src 'self'",
+  `script-src 'self' 'unsafe-inline' 'wasm-unsafe-eval'${dev ? " 'unsafe-eval'" : ""}`,
+  "style-src 'self' 'unsafe-inline'",
+  "img-src 'self' data: blob:",
+  "font-src 'self' data:",
+  "connect-src 'self'",
+  "worker-src 'self' blob:",
+  "object-src 'none'",
+  "base-uri 'self'",
+  "form-action 'self'",
+  "frame-ancestors 'none'",
+  ...(dev ? [] : ["upgrade-insecure-requests"]),
+].join("; ");
+
 const nextConfig: NextConfig = {
+  poweredByHeader: false,
   // Lets several dev servers run from one checkout (parallel test runs), each with its own build directory.
   ...(process.env.NEXT_DIST_DIR ? { distDir: process.env.NEXT_DIST_DIR } : {}),
   // Every page here is per-tenant and authenticated or token-gated, so nothing is
@@ -21,6 +43,7 @@ const nextConfig: NextConfig = {
       {
         source: "/(.*)",
         headers: [
+          { key: "Content-Security-Policy", value: csp },
           { key: "X-Content-Type-Options", value: "nosniff" },
           { key: "X-Frame-Options", value: "DENY" },
           { key: "Referrer-Policy", value: "strict-origin-when-cross-origin" },

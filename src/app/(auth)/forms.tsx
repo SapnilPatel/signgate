@@ -1,5 +1,6 @@
 "use client";
 
+import { useSyncExternalStore } from "react";
 import { ActionForm, SubmitButton } from "@/components/form";
 import { TextField } from "@/components/text-field";
 import {
@@ -12,9 +13,26 @@ import {
 
 const PASSWORD_HINT = "At least 8 characters.";
 
+const subscribeToNothing = () => () => {};
+
+function readBrowserZone(): string {
+  try {
+    return Intl.DateTimeFormat().resolvedOptions().timeZone ?? "";
+  } catch {
+    return "";
+  }
+}
+
 export function SignUpForm() {
+  // A new company starts in the time zone of the person who created it, so the
+  // dates printed on its agreements match the day its people and clients see.
+  // Without this it would start in UTC and an evening signature in the Americas
+  // would be dated the next day. Read through an external store so the server
+  // render and the first browser render agree. Changeable in Settings.
+  const timeZone = useSyncExternalStore(subscribeToNothing, readBrowserZone, () => "");
   return (
     <ActionForm action={signUpAction}>
+      <input type="hidden" name="timeZone" value={timeZone} />
       <TextField label="Company name" name="orgName" autoComplete="organization" autoFocus />
       <TextField label="Your name" name="name" autoComplete="name" />
       <TextField label="Work email" name="email" type="email" autoComplete="email" inputMode="email" />
