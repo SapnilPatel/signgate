@@ -30,7 +30,7 @@ import { IMAGE_FIELD_TYPES, LIMITS, type Field, type FieldValues } from "@/lib/t
 import { parseImageDataUrl } from "@/lib/pdf/stamp";
 import { cleanMultilineText, cleanText, isValidEmail, normalizeEmail } from "@/lib/validation";
 import { ServiceError, type Actor, type RequestMeta } from "./context";
-import { resolveSettings, type ResolvedOrgSettings } from "./accounts";
+import { EMAIL_UNVERIFIED_REASON, assertActiveActor, resolveSettings, type ResolvedOrgSettings } from "./accounts";
 import { getBlob } from "./blobs";
 import { describeEvent, listEvents, recordEvent } from "./events";
 import { enqueueWebhookEvent } from "./webhooks";
@@ -84,7 +84,24 @@ import {
 // Types
 // ---------------------------------------------------------------------------
 
-export type Delivery = "emailed" | "email_not_configured" | "email_failed";
+/**
+ * What happened to the email that carries a signing link:
+ * - emailed: it went out
+ * - email_failed: the provider refused it; the cause is on the file's timeline
+ * - email_not_configured: no email provider is set up, so nothing is ever emailed
+ * - email_unverified: email works, but the company's owner has not confirmed their
+ *   address yet, so nothing is emailed to people outside the company
+ * In every case but the first the link is valid and must be shared by hand.
+ */
+export type Delivery = "emailed" | "email_not_configured" | "email_failed" | "email_unverified";
+
+/** A sentence for the sender when the email did not go and why is already known; undefined otherwise. */
+export function deliveryReason(delivery: Delivery | "not_their_turn"): string | undefined {
+  if (delivery === "email_unverified") return EMAIL_UNVERIFIED_REASON;
+  if (delivery === "email_not_configured") return "Email is not set up, so nothing was emailed. Copy the signing link and send it yourself.";
+  if (delivery === "email_failed") return "The email could not be delivered. The reason is on the file's timeline. Copy the signing link and send it yourself, or correct the address and send again.";
+  return undefined;
+}
 
 export interface SendOptions {
   /** Send this agreement instead of the company's default one. */
@@ -104,6 +121,8 @@ export interface SendOptions {
 export interface SendResult {
   envelopeId: string;
   delivery: Delivery;
+  /** Present unless delivery is "emailed": why nothing reached the client's inbox and what to do. */
+  deliveryReason?: string;
   /** The client's signing link. Always returned so it can be shared by hand. */
   signingUrl: string;
   /** True when this request repeated an earlier one and its envelope was returned; nothing new was sent. */
@@ -141,6 +160,8 @@ export interface EnvelopeListItem extends EnvelopeSummary {
 
 export interface DeliveryResult {
   delivery: Delivery;
+  /** Present unless delivery is "emailed": why nothing reached the inbox and what to do. */
+  deliveryReason?: string;
   /** Null when the link is the company signer's and the caller is not someone who may countersign. */
   signingUrl: string | null;
 }
@@ -148,13 +169,14 @@ export interface DeliveryResult {
 /**
  * Ceilings on signing requests, so an account cannot be used to flood inboxes
  * through the platform's sending address. A company in its first days gets a much
- * lower ceiling: that is when an account made for abuse does its damage, and a
- * genuine new customer rarely needs more.
+ * lower ceiling: that is when an account made for abuse does its damage. It is still
+ * high enough for a real customer to import their whole book of clients on day one;
+ * the verified-owner rule and the per-recipient limit are what stop a throwaway account.
  */
 export const SEND_LIMITS = {
   newOrgDays: 7,
-  newOrgPerHour: 30,
-  newOrgPerDay: 100,
+  newOrgPerHour: 200,
+  newOrgPerDay: 1000,
   perHour: 1500,
   perDay: 5000,
   /** Requests to one address in a day, counted across every company. */
@@ -181,25 +203,23 @@ function idOf(value: unknown, message: string): string {
   return value;
 }
 
-/** Checks the actor's shape and, for a signed-in user, that the account is still active in this org. */
-async function assertActor(db: DbOrTx, actor: Actor): Promise<User | null> {
-  if (!actor || typeof actor !== "object" || typeof actor.orgId !== "string" || !actor.orgId) {
-    throw new ServiceError("forbidden", "Sign in again to continue.");
-  }
-  if (actor.type !== "user") return null;
-  const [user] = await db
-    .select()
-    .from(users)
-    .where(and(eq(users.id, String(actor.userId)), eq(users.orgId, actor.orgId)))
-    .limit(1);
-  if (!user || user.disabledAt) {
-    throw new ServiceError("forbidden", "Your account is no longer active. Ask an owner of your company account for access.");
-  }
-  return user;
+/**
+ * Everything here is open to any active member of the company (members create and
+ * send files). The stored row decides, so a disabled account loses access at once.
+ */
+function assertActor(db: DbOrTx, actor: Actor): Promise<User | null> {
+  return assertActiveActor(db, actor, "read");
+}
+
+function withReason<D extends Delivery | "not_their_turn">(delivery: D): { delivery: D; deliveryReason?: string } {
+  const reason = deliveryReason(delivery);
+  return reason ? { delivery, deliveryReason: reason } : { delivery };
 }
 
 function deliveryOf(outcome: SendOutcome): Delivery {
-  return outcome.status === "sent" ? "emailed" : outcome.status === "skipped" ? "email_not_configured" : "email_failed";
+  if (outcome.status === "sent") return "emailed";
+  if (outcome.status === "failed") return "email_failed";
+  return outcome.unverified ? "email_unverified" : "email_not_configured";
 }
 
 function wholeNumber(value: unknown, fallback: number, max: number): number {
@@ -454,6 +474,7 @@ export async function emailSigningRequest(ctx: EnvelopeContext, signer: Signer, 
 }
 
 function failureReason(outcome: SendOutcome): string {
+  if (outcome.unverified) return cleanText(outcome.error, 300) || EMAIL_UNVERIFIED_REASON;
   if (outcome.status === "skipped") return "Email is not set up, so nothing was emailed. Copy the signing link from the file and send it to the client yourself";
   return cleanText(outcome.error, 300) || "The email provider did not accept the message";
 }
@@ -487,7 +508,13 @@ async function recordClientDelivery(db: Db, ctx: EnvelopeContext, signer: Signer
         type: "envelope.delivery_failed",
         actor,
         meta,
-        data: { email: signer.email, signerId: signer.id, error: failureReason(outcome), configured: outcome.status !== "skipped" },
+        data: {
+          email: signer.email,
+          signerId: signer.id,
+          error: failureReason(outcome),
+          configured: outcome.status !== "skipped" || outcome.unverified === true,
+          ...(outcome.unverified ? { unverified: true } : {}),
+        },
       });
     }
   });
@@ -654,8 +681,11 @@ async function limitNewRequest(org: Org, fileId: string, recipient: string, now:
 async function deliveryOfExisting(db: Db, envelope: Envelope): Promise<Delivery> {
   if (envelope.sentAt) return "emailed";
   const trail = await listEvents(envelope.orgId, { envelopeId: envelope.id, limit: 50 }, db);
-  const failed = trail.find((e) => e.type === "envelope.delivery_failed");
-  return failed && (failed.data as Record<string, unknown> | null)?.configured === false ? "email_not_configured" : "email_failed";
+  // The latest attempt is the one that describes where the request stands now.
+  const failed = [...trail].reverse().find((e) => e.type === "envelope.delivery_failed");
+  const data = (failed?.data ?? {}) as Record<string, unknown>;
+  if (data.unverified === true) return "email_unverified";
+  return failed && data.configured === false ? "email_not_configured" : "email_failed";
 }
 
 /**
@@ -852,7 +882,8 @@ export async function sendAgreementForFile(actor: Actor, fileId: unknown, opts: 
       .where(and(eq(signers.envelopeId, outcome.duplicate.id), eq(signers.orgId, actor.orgId), eq(signers.role, "client")))
       .limit(1);
     if (!client) throw new ServiceError("conflict", "The agreement on this file changed while it was being sent. Reload the file and try again.");
-    return { envelopeId: outcome.duplicate.id, delivery: await deliveryOfExisting(db, outcome.duplicate), signingUrl: signingUrl(client), duplicate: true };
+    const earlier = await deliveryOfExisting(db, outcome.duplicate);
+    return { envelopeId: outcome.duplicate.id, ...withReason(earlier), signingUrl: signingUrl(client), duplicate: true };
   }
 
   // Everything below is after commit: the envelope exists whatever happens to the emails.
@@ -870,7 +901,7 @@ export async function sendAgreementForFile(actor: Actor, fileId: unknown, opts: 
   } catch (err) {
     console.error("[envelopes] post-send work failed", err instanceof Error ? err.message : err);
   }
-  return { envelopeId, delivery, signingUrl: url };
+  return { envelopeId, ...withReason(delivery), signingUrl: url };
 }
 
 /**
@@ -1177,7 +1208,7 @@ export async function resendToSigner(actor: Actor, signerId: unknown, meta?: Req
   await limitSender(`resend:org:${actor.orgId}`, 300, 3600, "Your company has sent a lot of signing requests in the last hour.", "org");
   const delivery = await deliverTo(db, ctx, signer, actor, meta, { tellSender: false });
   // The email goes to the signer's own inbox either way; the link itself is only handed to people who may use it.
-  return { delivery, signingUrl: maySeeLink(viewer, signer, ctx.org) ? signingUrl(signer) : null };
+  return { ...withReason(delivery), signingUrl: maySeeLink(viewer, signer, ctx.org) ? signingUrl(signer) : null };
 }
 
 /**
@@ -1202,14 +1233,14 @@ export async function sendReminderNow(actor: Actor, envelopeId: unknown, meta?: 
 
   if (signer.role === "company") {
     const delivery = deliveryOf(await emailCountersigner(ctx, signer));
-    return { delivery, signingUrl: maySeeLink(viewer, signer, ctx.org) ? signingUrl(signer) : null, to: signer.email };
+    return { ...withReason(delivery), signingUrl: maySeeLink(viewer, signer, ctx.org) ? signingUrl(signer) : null, to: signer.email };
   }
 
   // The first request never arrived, so this is not a reminder of anything: send the
   // request itself, which is also what moves the envelope from draft to sent.
   if (ctx.envelope.status === "draft") {
     const delivery = await deliverTo(db, ctx, signer, actor, meta, { tellSender: false });
-    return { delivery, signingUrl: signingUrl(signer), to: signer.email };
+    return { ...withReason(delivery), signingUrl: signingUrl(signer), to: signer.email };
   }
 
   const outcome = await emailSigningRequest(ctx, signer, { reminderNumber: ctx.envelope.reminderCount + 1 });
@@ -1241,7 +1272,7 @@ export async function sendReminderNow(actor: Actor, envelopeId: unknown, meta?: 
   } catch (err) {
     console.error("[envelopes] could not record reminder", err instanceof Error ? err.message : err);
   }
-  return { delivery: deliveryOf(outcome), signingUrl: signingUrl(signer), to: signer.email };
+  return { ...withReason(deliveryOf(outcome)), signingUrl: signingUrl(signer), to: signer.email };
 }
 
 // ---------------------------------------------------------------------------
@@ -1263,7 +1294,7 @@ export async function updateSigner(
   signerId: unknown,
   patch: { name?: unknown; email?: unknown },
   meta?: RequestMeta,
-): Promise<{ signer: SignerView; delivery: Delivery | "not_their_turn"; signingUrl: string | null }> {
+): Promise<{ signer: SignerView; delivery: Delivery | "not_their_turn"; deliveryReason?: string; signingUrl: string | null }> {
   const db = await getDb();
   const viewer = await assertActor(db, actor);
   const { ctx, signer } = await loadScopedBySigner(db, actor, signerId);
@@ -1393,7 +1424,7 @@ export async function updateSigner(
   const fresh = await loadScopedBySigner(db, actor, signer.id);
   return {
     signer: signerView(fresh.ctx, fresh.signer, new Date(), viewer),
-    delivery,
+    ...withReason(delivery),
     signingUrl: maySeeLink(viewer, fresh.signer, fresh.ctx.org) ? signingUrl(fresh.signer) : null,
   };
 }

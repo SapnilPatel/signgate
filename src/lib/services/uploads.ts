@@ -11,12 +11,13 @@
 import { createHmac } from "node:crypto";
 import { and, eq, lt, ne, sql } from "drizzle-orm";
 import { getDb, type DbOrTx } from "@/lib/db";
-import { uploadChunks, users } from "@/lib/db/schema";
+import { uploadChunks } from "@/lib/db/schema";
 import { env } from "@/lib/env";
 import { newId, safeEqual } from "@/lib/ids";
 import { LIMITS } from "@/lib/types";
 import { cleanText } from "@/lib/validation";
 import { ServiceError, type Actor } from "./context";
+import { assertActiveActor } from "./accounts";
 
 /** How long an upload may take from start to finish. Parts older than this are purged. */
 export const UPLOAD_TTL_MS = 6 * 60 * 60 * 1000;
@@ -128,21 +129,7 @@ function decodeDescriptor(actor: Actor, uploadId: unknown, opts: { allowExpired?
  * be minutes out of date.
  */
 async function assertMayUpload(db: DbOrTx, actor: Actor): Promise<void> {
-  if (!actor || typeof actor !== "object" || typeof actor.orgId !== "string" || !actor.orgId) {
-    throw new ServiceError("forbidden", "Sign in to upload an agreement.");
-  }
-  if (actor.type !== "user") return;
-  const [user] = await db
-    .select({ role: users.role, disabledAt: users.disabledAt })
-    .from(users)
-    .where(and(eq(users.id, actor.userId), eq(users.orgId, actor.orgId)))
-    .limit(1);
-  if (!user || user.disabledAt) {
-    throw new ServiceError("forbidden", "Your account is no longer active. Ask an owner of your company account for access.");
-  }
-  if (user.role !== "owner" && user.role !== "admin") {
-    throw new ServiceError("forbidden", "Only an owner or admin can upload an agreement. Ask one of them to do it for you.");
-  }
+  await assertActiveActor(db, actor, "manage");
 }
 
 function expectedChunkSize(d: Descriptor, index: number): number {

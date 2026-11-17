@@ -189,6 +189,37 @@ function withReason(sentence: string, data: Record<string, unknown>): string {
   return reason ? `${sentence}: ${reason.replace(/[.\s]+$/, "")}` : sentence;
 }
 
+function agreementSubject(data: Record<string, unknown>): string {
+  const name = str(data, "templateName", "name");
+  return name ? `Agreement "${name}"` : "Agreement";
+}
+
+function agreementObject(data: Record<string, unknown>): string {
+  const name = str(data, "templateName", "name");
+  return name ? `"${name}"` : "an agreement";
+}
+
+const SETTING_NAMES: Record<string, string> = {
+  name: "company name",
+  legalName: "legal name",
+  brandColor: "brand colour",
+  logo: "logo",
+  replyToEmail: "reply-to address",
+  reminderEveryDays: "reminder frequency",
+  maxReminders: "maximum reminders",
+  expireAfterDays: "expiry",
+  autoSendOnFileCreate: "automatic sending",
+  countersignMode: "countersigning",
+  countersignerUserId: "countersigner",
+  fileReferencePrefix: "file reference prefix",
+  emailMessage: "email message",
+  timeZone: "time zone",
+};
+
+function settingName(key: string): string {
+  return Object.prototype.hasOwnProperty.call(SETTING_NAMES, key) ? SETTING_NAMES[key] : cleanText(key, 40);
+}
+
 /**
  * One plain sentence for the file timeline and the signing certificate.
  * Never throws: an event with an unknown type or odd data still reads sensibly.
@@ -271,6 +302,89 @@ export function describeEvent(event: DescribableEvent): string {
       const what = kind === "original" || kind === "unsigned" ? "Unsigned agreement" : kind === "certificate" ? "Signing certificate" : "Signed agreement";
       return `${what} downloaded${by}`;
     }
+    case "file.unarchived":
+      return `File restored from the archive${by}`;
+    case "countersign.requested": {
+      const reminder = str(data, "reminder");
+      const base = recipient ? `Countersignature requested from ${recipient}` : "Countersignature requested";
+      return reminder ? `${base} (reminder ${reminder})` : base;
+    }
+    case "countersign.overdue":
+      return withReason("Countersignature overdue", data);
+    case "countersign.unassigned":
+      return withReason("Nobody is assigned to countersign", data);
+    case "envelope.finalize_failed":
+      // Older rows carry the cause under "error"; withReason reads either key.
+      return withReason("The final signed copy could not be produced; it will be retried automatically", data);
+    case "envelope.seal_warning":
+      return withReason("The signed copy shows something differently from what was entered", data);
+    case "template.created": {
+      const name = str(data, "templateName", "name");
+      return name ? `Agreement "${name}" uploaded${by}` : `Agreement uploaded${by}`;
+    }
+    case "template.renamed": {
+      const name = str(data, "templateName", "name");
+      const previous = str(data, "previousName");
+      if (name && previous) return `Agreement "${previous}" renamed to "${name}"${by}`;
+      return name ? `Agreement renamed to "${name}"${by}` : `Agreement renamed${by}`;
+    }
+    case "template.duplicated": {
+      const name = str(data, "templateName", "name");
+      const from = str(data, "fromName");
+      if (name && from) return `Agreement "${from}" copied as "${name}"${by}`;
+      return `Agreement copied${by}`;
+    }
+    case "template.fields_updated":
+      return `${agreementSubject(data)} fields changed${by}`;
+    case "template.fields_redetected":
+      return `${agreementSubject(data)} fields detected again${by}`;
+    case "template.document_replaced":
+      return `${agreementSubject(data)} document replaced${by}`;
+    case "template.activated":
+      return `${agreementSubject(data)} activated${by}${data.becameDefault === true ? " and made the default" : ""}`;
+    case "template.archived":
+      return `${agreementSubject(data)} archived${by}`;
+    case "template.default_changed":
+      return `${agreementSubject(data)} made the default agreement${by}`;
+    case "template.intake_enabled":
+      return `Client intake link turned on for ${agreementObject(data)}${by}`;
+    case "template.intake_disabled":
+      return `Client intake link turned off for ${agreementObject(data)}${by}`;
+    case "org.created":
+      return `Company account created${by}`;
+    case "org.updated": {
+      const changed = Array.isArray(data.changed)
+        ? data.changed.filter((c): c is string => typeof c === "string" && c.trim() !== "").slice(0, 12)
+        : [];
+      return changed.length ? `Company settings changed${by} (${changed.map((c) => settingName(c)).join(", ")})` : `Company settings changed${by}`;
+    }
+    case "member.invited": {
+      const role = str(data, "role");
+      return recipient ? `${recipient} invited to the team${role ? ` as ${role}` : ""}${by}` : `Team invitation sent${by}`;
+    }
+    case "member.invite_revoked":
+      return recipient ? `Invitation for ${recipient} cancelled${by}` : `Invitation cancelled${by}`;
+    case "member.joined":
+      return who ? `${who} joined the team` : "A new member joined the team";
+    case "member.role_changed": {
+      const to = str(data, "to");
+      const subject = recipient ?? "A team member";
+      return to ? `${subject} made ${to === "owner" || to === "admin" ? `an ${to}` : `a ${to}`}${by}` : `${subject}'s role changed${by}`;
+    }
+    case "member.disabled":
+      return `${recipient ? `${recipient}'s account` : "A team member's account"} turned off${by}`;
+    case "member.enabled":
+      return `${recipient ? `${recipient}'s account` : "A team member's account"} turned back on${by}`;
+    case "member.ownership_transferred": {
+      const to = str(data, "toEmail");
+      return to ? `Ownership transferred to ${to}${by}` : `Ownership transferred${by}`;
+    }
+    case "member.password_reset":
+      return who ? `${who} set a new password from a reset link` : "A password was set from a reset link";
+    case "member.password_changed":
+      return who ? `${who} changed their password` : "A password was changed";
+    case "member.email_verified":
+      return who ? `${who} confirmed their email address` : "An email address was confirmed";
     case "api_key.created": {
       const name = str(data, "name");
       return name ? `API key "${name}" created${by}` : `API key created${by}`;

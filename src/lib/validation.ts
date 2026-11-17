@@ -173,6 +173,22 @@ export const hexColorSchema = z.preprocess(
   z.string().refine(isHexColor, { message: "Enter a colour as a hex code, like #1f3a5f." }),
 );
 
+/**
+ * The canonical IANA name of a time zone ("america/toronto" becomes "America/Toronto"),
+ * or null when the runtime does not know the zone. Intl is the authority: a name it
+ * accepts here is one every later date calculation will accept too.
+ */
+export function normalizeTimeZone(value: unknown): string | null {
+  if (typeof value !== "string") return null;
+  const zone = value.trim();
+  if (zone.length < 3 || zone.length > 64 || !/^[A-Za-z0-9_+\-/]+$/.test(zone)) return null;
+  try {
+    return new Intl.DateTimeFormat("en-GB", { timeZone: zone }).resolvedOptions().timeZone || zone;
+  } catch {
+    return null;
+  }
+}
+
 /** Row ids as produced by newId(): prefix, underscore, 16 base36 characters. */
 export const idSchema = z.string().regex(/^[a-z]{2,5}_[0-9a-z]{16}$/, "That id is not valid.");
 

@@ -28,8 +28,34 @@ export const env = {
   get emailFrom(): string | undefined {
     return process.env.EMAIL_FROM?.trim() || undefined;
   },
+  /** Mailbox to send through over SMTP, e.g. a Gmail or Google Workspace address. Also the From address. */
+  get smtpUser(): string | undefined {
+    return process.env.SMTP_USER?.trim() || undefined;
+  },
+  /** For Gmail this is an app password, not the account password. Spaces are ignored, as Google prints it in groups of four. */
+  get smtpPass(): string | undefined {
+    const raw = process.env.SMTP_PASS?.trim();
+    if (!raw) return undefined;
+    return this.smtpHost === "smtp.gmail.com" ? raw.replace(/\s+/g, "") : raw;
+  },
+  get smtpHost(): string {
+    return process.env.SMTP_HOST?.trim() || "smtp.gmail.com";
+  },
+  get smtpPort(): number {
+    const port = Number(process.env.SMTP_PORT?.trim());
+    return Number.isInteger(port) && port > 0 && port < 65536 ? port : 465;
+  },
+  /**
+   * Which way email leaves: Resend when it is fully configured, otherwise SMTP when a
+   * mailbox and password are set, otherwise nowhere (links are shown for sharing by hand).
+   */
+  get emailTransport(): "resend" | "smtp" | null {
+    if (this.resendApiKey && this.emailFrom) return "resend";
+    if (this.smtpUser && this.smtpPass) return "smtp";
+    return null;
+  },
   get emailConfigured(): boolean {
-    return Boolean(this.resendApiKey && this.emailFrom);
+    return this.emailTransport !== null;
   },
   get anthropicApiKey(): string | undefined {
     return process.env.ANTHROPIC_API_KEY?.trim() || undefined;

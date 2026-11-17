@@ -417,6 +417,45 @@ export function voidedEmail(input: {
   });
 }
 
+/** Tells a signer their link ran out of time. Not the company cancelling: nobody decided anything. */
+export function linkExpiredEmail(input: {
+  brand: Brand;
+  signerName: string;
+  agreementName: string;
+  /** The day the link stopped working, already written out (e.g. "15 November 2026"). */
+  expiredOn?: string | null;
+}): EmailContent {
+  const org = orgName(input.brand);
+  const agreement = line(input.agreementName) || "the agreement";
+  const on = line(input.expiredOn, 40);
+  return branded(input.brand, {
+    subject: `Your signing link for ${agreement} has expired`,
+    preheader: `Ask ${org} to send the agreement again if you still want to sign.`,
+    blocks: [
+      greeting(input.signerName),
+      p(`The link ${org} sent you to sign `, b(agreement), ` expired${on ? ` on ${on}` : ""} before the agreement was signed, so it no longer works.`),
+      p(`If you still want to sign, contact ${org} and ask them to send the agreement again. You will get a new link.`),
+      note(`Questions? Reply to this email or contact ${org} directly.`),
+    ],
+  });
+}
+
+/** Tells a client who signed that the company declined to countersign, so nothing is in effect. */
+export function agreementNotCompletedEmail(input: { brand: Brand; signerName: string; agreementName: string }): EmailContent {
+  const org = orgName(input.brand);
+  const agreement = line(input.agreementName) || "the agreement";
+  return branded(input.brand, {
+    subject: `${agreement} with ${org} was not completed`,
+    preheader: `${org} did not countersign, so the agreement is not in effect.`,
+    blocks: [
+      greeting(input.signerName),
+      p("You signed ", b(agreement), `, but ${org} did not countersign it, so the agreement was not completed and is not in effect.`),
+      p(`The link you were sent no longer works. Contact ${org} if you were expecting the agreement to go ahead.`),
+      note(`Questions? Reply to this email or contact ${org} directly.`),
+    ],
+  });
+}
+
 // ---------------------------------------------------------------------------
 // Emails that can go to either side
 // ---------------------------------------------------------------------------
@@ -577,9 +616,103 @@ export function deliveryFailedEmail(input: {
   });
 }
 
+/**
+ * Sent when the client has signed and the company's own signature is what is holding
+ * the agreement up: the countersigner did not act on their reminders, can no longer
+ * sign, or nobody is set up to countersign at all.
+ */
+export function countersignOverdueEmail(input: {
+  brand: Brand;
+  recipientName: string;
+  clientName: string;
+  agreementName: string;
+  fileReference: string;
+  /** The person who was asked, when there is one. */
+  countersignerName?: string | null;
+  /** One plain sentence saying why this needs someone else, without a trailing full stop. */
+  reason?: string | null;
+  fileUrl: string;
+}): EmailContent {
+  const org = orgName(input.brand);
+  const agreement = line(input.agreementName) || "the agreement";
+  const reference = line(input.fileReference, 80);
+  const client = line(input.clientName, 120) || "The client";
+  const countersigner = line(input.countersignerName, 120);
+  const reason = line(input.reason, 300).replace(/[.\s]+$/, "");
+  return branded(input.brand, {
+    subject: `Countersignature overdue: ${client} is waiting on ${withReference(agreement, reference)}`,
+    preheader: `${client} has signed. ${org}'s signature is still missing.`,
+    blocks: [
+      greeting(input.recipientName),
+      p(b(client), " has signed ", b(agreement), `${reference ? ` for file ${reference}` : ""}, but it has not been countersigned for ${org}, so it is not complete.`),
+      p(reason ? `${reason}.` : countersigner ? `${countersigner} was asked to countersign and has not done so.` : "Nobody is set up to countersign for your company."),
+      { kind: "button", label: "Open the file", url: safeUrl(input.fileUrl) },
+      p(
+        "An owner or admin can countersign from the file, or choose a different countersigner in Settings. The client gets their signed copy, and the file is cleared to start work, as soon as that is done.",
+      ),
+    ],
+    footer: teamFooter(org),
+  });
+}
+
+/**
+ * Sent when everyone has signed but the sealed PDF could not be produced. The
+ * signatures are safe and the product keeps retrying; the team is told because the
+ * client is waiting for a copy that has not arrived.
+ */
+export function finalCopyFailedEmail(input: {
+  brand: Brand;
+  recipientName: string;
+  clientName: string;
+  agreementName: string;
+  fileReference: string;
+  /** What went wrong, as recorded on the file's timeline. */
+  error?: string | null;
+  fileUrl: string;
+}): EmailContent {
+  const org = orgName(input.brand);
+  const agreement = line(input.agreementName) || "the agreement";
+  const reference = line(input.fileReference, 80);
+  const client = line(input.clientName, 120) || "the client";
+  const error = line(input.error, 300);
+  return branded(input.brand, {
+    subject: `Signed, but the final copy could not be produced: ${withReference(agreement, reference)}`,
+    preheader: "Every signature is recorded. The signed PDF is being retried automatically.",
+    blocks: [
+      greeting(input.recipientName),
+      p("Everyone has signed ", b(agreement), `${reference ? ` for file ${reference}` : ""}, but the final signed PDF could not be produced, so ${client} has not received their copy yet.`),
+      p("Every signature is recorded and nothing needs to be signed again. We retry automatically, and you can also retry from the file."),
+      { kind: "details", rows: error ? [["What went wrong", error]] : [] },
+      { kind: "button", label: "Open the file", url: safeUrl(input.fileUrl) },
+      p("If it has not completed within a few hours, contact support and mention the file reference."),
+    ],
+    footer: teamFooter(org),
+  });
+}
+
 // ---------------------------------------------------------------------------
 // Account emails (from the product itself, not from an organization)
 // ---------------------------------------------------------------------------
+
+/** Asks someone who has just signed up to confirm that the address is theirs. */
+export function verifyEmailEmail(input: { name: string; orgName: string; url: string }): EmailContent {
+  const org = line(input.orgName, 120) || "your company";
+  return render({
+    subject: `Confirm your email address for ${PRODUCT_NAME}`,
+    preheader: `Confirm your address so ${PRODUCT_NAME} can email agreements to your clients.`,
+    senderName: PRODUCT_NAME,
+    blocks: [
+      greeting(input.name),
+      p(`Thanks for setting up ${org} on ${PRODUCT_NAME}. Confirm that this email address is yours:`),
+      { kind: "button", label: "Confirm my email address", url: safeUrl(input.url) },
+      p(
+        `Until you confirm, ${PRODUCT_NAME} does not email agreements to your clients for you. You can still create files and copy each signing link to send yourself.`,
+      ),
+      note("The link works once and expires after 48 hours. If you did not create this account, you can ignore this email."),
+    ],
+    footer: `Sent by ${PRODUCT_NAME} because this address was used to create an account.`,
+  });
+}
 
 export function passwordResetEmail(input: { name: string; url: string }): EmailContent {
   return render({

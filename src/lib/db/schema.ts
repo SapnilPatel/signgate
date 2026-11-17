@@ -10,6 +10,7 @@ import {
   uniqueIndex,
   primaryKey,
 } from "drizzle-orm/pg-core";
+import { sql } from "drizzle-orm";
 import type {
   Field,
   FieldValues,
@@ -58,6 +59,9 @@ export const users = pgTable(
     role: text("role").$type<"owner" | "admin" | "member">().notNull().default("member"),
     /** PNG data URL of this user's adopted signature, used for countersigning. */
     savedSignature: text("saved_signature"),
+    /** When this person proved they control the mailbox: by the emailed verification link,
+     *  by accepting an invitation sent to it, or by completing a password reset. */
+    emailVerifiedAt: ts("email_verified_at"),
     disabledAt: ts("disabled_at"),
     createdAt: createdAt(),
   },
@@ -78,11 +82,11 @@ export const sessions = pgTable(
   (t) => [index("sessions_user_idx").on(t.userId)],
 );
 
-/** Single-use tokens: password reset and team invitations. */
+/** Single-use tokens: password reset, team invitations and email verification. */
 export const authTokens = pgTable("auth_tokens", {
   /** sha256 of the emailed token. */
   id: text("id").primaryKey(),
-  kind: text("kind").$type<"password_reset" | "invite">().notNull(),
+  kind: text("kind").$type<"password_reset" | "invite" | "email_verify">().notNull(),
   orgId: text("org_id").references(() => orgs.id, { onDelete: "cascade" }),
   userId: text("user_id").references(() => users.id, { onDelete: "cascade" }),
   email: text("email").notNull(),
@@ -179,7 +183,7 @@ export const files = pgTable(
     orgId: text("org_id")
       .notNull()
       .references(() => orgs.id, { onDelete: "cascade" }),
-    /** Human file number, unique per org. Auto-generated when not supplied. */
+    /** Human file number, unique per org whatever the letter case. Auto-generated when not supplied. */
     reference: text("reference").notNull(),
     /** Optional caller-supplied id from another system; makes API creates idempotent. */
     externalId: text("external_id"),
@@ -204,7 +208,8 @@ export const files = pgTable(
     updatedAt: ts("updated_at").notNull().defaultNow(),
   },
   (t) => [
-    uniqueIndex("files_org_reference_uq").on(t.orgId, t.reference),
+    // On lower(reference): "f-2026-0001" next to "F-2026-0001" would only cause mix-ups.
+    uniqueIndex("files_org_reference_uq").on(t.orgId, sql`lower(${t.reference})`),
     uniqueIndex("files_org_external_uq").on(t.orgId, t.externalId),
     index("files_org_status_idx").on(t.orgId, t.agreementStatus),
     index("files_org_created_idx").on(t.orgId, t.createdAt),

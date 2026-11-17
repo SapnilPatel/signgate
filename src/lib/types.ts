@@ -111,6 +111,10 @@ export interface OrgSettings {
   fileReferencePrefix?: string;
   /** Extra message included in the signing request email. */
   emailMessage?: string;
+  /** IANA time zone name, e.g. "America/Toronto". Dates the company puts on a document
+   *  (the agreement date, its countersignature date, the year in a file reference) are
+   *  calendar days in this zone. Unset means UTC. */
+  timeZone?: string;
 }
 
 export const ORG_SETTING_DEFAULTS = {

@@ -1,17 +1,24 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
 import { and, eq } from "drizzle-orm";
 
-const sent: { kind: string; to: string; subject: string; html: string; text: string; orgId?: string | null }[] = [];
+const sent: { kind: string; to: string; subject: string; html: string; text: string; orgId?: string | null; holdReason?: string }[] = [];
 let emailBehaviour: "sent" | "failed" | "skipped" | "throw" = "sent";
 
 vi.mock("@/lib/services/email", () => ({
   sendEmail: vi.fn(async (msg: (typeof sent)[number]) => {
     if (emailBehaviour === "throw") throw new Error("provider exploded");
+    // A held message is logged as skipped and never sent, as in the real module.
+    if (msg.holdReason) return { status: "skipped", error: msg.holdReason };
     if (emailBehaviour === "sent") sent.push(msg);
     return emailBehaviour === "failed" ? { status: "failed", error: "Mailbox unavailable" } : { status: emailBehaviour };
   }),
+  // "skipped" is how the real module answers when no provider is set up.
+  emailIsConfigured: () => emailBehaviour !== "skipped",
 }));
-vi.mock("@/lib/services/email-templates", () => ({
+vi.mock("@/lib/services/email-templates", async (importOriginal) => ({
+  // The signing services reach this module too; everything not overridden below stays real.
+  ...(await importOriginal<typeof import("@/lib/services/email-templates")>()),
+  verifyEmailEmail: (p: { name: string; orgName: string; url: string }) => ({ subject: "Confirm your email address", html: `<a href="${p.url}">confirm</a>`, text: p.url }),
   passwordResetEmail: (p: { name: string; url: string }) => ({ subject: "Reset your password", html: `<a href="${p.url}">reset</a>`, text: p.url }),
   inviteEmail: (p: { orgName: string; inviterName: string; url: string }) => ({
     subject: `${p.inviterName} invited you to ${p.orgName}`,
@@ -67,9 +74,16 @@ const uniqueEmail = (label = "user") => `${label}${++seq}@example.com`;
 
 const actorOf = (m: Member): Actor => ({ type: "user", orgId: m.orgId, userId: m.id, role: m.role, label: m.name });
 
-async function newOrg(orgName = `Test Co ${++seq}`) {
+/** A company whose owner has confirmed their address, which is the normal state; `verified: false` leaves it as sign-up does. */
+async function newOrg(orgName = `Test Co ${++seq}`, opts: { verified?: boolean } = {}) {
   const { user, org } = await signUp({ orgName, name: "Olive Owner", email: uniqueEmail("owner"), password: PASSWORD });
-  return { owner: user, org, actor: actorOf(user) };
+  if (opts.verified !== false) {
+    const db = await getDb();
+    await db.update(users).set({ emailVerifiedAt: new Date() }).where(eq(users.id, user.id));
+  }
+  // The confirmation email every sign-up sends is not what these tests are about.
+  sent.length = 0;
+  return { owner: { ...user, emailVerified: opts.verified !== false }, org, actor: actorOf(user) };
 }
 
 /** Invites and accepts, returning the new member. */
@@ -367,7 +381,7 @@ describe("password reset", () => {
     expect(sent[0].text).toContain("/reset-password/");
 
     const db = await getDb();
-    const [row] = await db.select().from(authTokens).where(eq(authTokens.userId, owner.id));
+    const [row] = await db.select().from(authTokens).where(and(eq(authTokens.userId, owner.id), eq(authTokens.kind, "password_reset")));
     expect(row.id).toBe(sha256Hex(token));
     expect(JSON.stringify(row)).not.toContain(token);
     const lifetime = row.expiresAt.getTime() - Date.now();
@@ -1208,5 +1222,270 @@ describe("company settings", () => {
     const member = await addMember(actor, "member");
     await setMemberDisabled(actor, member.id, true);
     expect((await failure(() => updateOrg(actor, { settings: { countersignerUserId: member.id } }))).fields?.countersignerUserId).toMatch(/active member/);
+  });
+});
+
+// ---------------------------------------------------------------------------
+
+import { verifyEmail, resendVerification, getEmailSendingStatus, externalEmailHold, verifyEmailUrl, EMAIL_UNVERIFIED_REASON, ACCOUNT_LIMITS } from "@/lib/services/accounts";
+
+describe("email verification", () => {
+  it("sign-up starts unverified and emails a single-use 48 hour link, storing only its hash", async () => {
+    const email = uniqueEmail("founder");
+    const { user, org, verificationEmail } = await signUp({ orgName: "Verify Co", name: "Fran Founder", email, password: PASSWORD });
+    expect(user.emailVerified).toBe(false);
+    expect(verificationEmail).toBe("sent");
+    expect(sent).toHaveLength(1);
+    expect(sent[0]).toMatchObject({ kind: "verify_email", to: email, orgId: org.id });
+    const token = tokenFrom(sent[0].text);
+    expect(token).toMatch(/^[0-9a-z]{32}$/);
+    expect(sent[0].text).toBe(verifyEmailUrl(token));
+    expect(sent[0].text).toContain("/verify-email/");
+
+    const db = await getDb();
+    const [row] = await db.select().from(authTokens).where(and(eq(authTokens.userId, user.id), eq(authTokens.kind, "email_verify")));
+    expect(row.id).toBe(sha256Hex(token));
+    expect(JSON.stringify(row)).not.toContain(token);
+    const hours = (row.expiresAt.getTime() - Date.now()) / 3_600_000;
+    expect(hours).toBeGreaterThan(ACCOUNT_LIMITS.verifyEmailHours - 0.1);
+    expect(hours).toBeLessThanOrEqual(ACCOUNT_LIMITS.verifyEmailHours);
+
+    const verified = await verifyEmail(token, { ip: "203.0.113.7" });
+    expect(verified).toMatchObject({ alreadyVerified: false, user: { id: user.id, emailVerified: true } });
+    const [stored] = await db.select().from(users).where(eq(users.id, user.id));
+    expect(stored.emailVerifiedAt).toBeInstanceOf(Date);
+    const trail = await db.select().from(events).where(and(eq(events.orgId, org.id), eq(events.type, "member.email_verified")));
+    expect(trail).toHaveLength(1);
+
+    // Opening the same link again (a mail scanner, a double click) says so and changes nothing.
+    expect(await verifyEmail(token)).toMatchObject({ alreadyVerified: true, user: { emailVerified: true } });
+    expect(await db.select().from(events).where(and(eq(events.orgId, org.id), eq(events.type, "member.email_verified")))).toHaveLength(1);
+  });
+
+  it("still creates the account when the confirmation email fails, is off, or throws", async () => {
+    for (const behaviour of ["failed", "skipped", "throw"] as const) {
+      emailBehaviour = behaviour;
+      const result = await signUp({ orgName: "Any Co", name: "Any", email: uniqueEmail("anyv"), password: PASSWORD });
+      expect(result.verificationEmail).toBe(behaviour === "skipped" ? "skipped" : "failed");
+      expect(result.user.emailVerified).toBe(false);
+    }
+  });
+
+  it("verifies exactly once when the link is opened twice at the same moment", async () => {
+    const { user, org } = await signUp({ orgName: "Race Verify", name: "R", email: uniqueEmail("racev"), password: PASSWORD });
+    const token = tokenFrom(sent[0].text);
+    const results = await Promise.all([verifyEmail(token), verifyEmail(token)]);
+    expect(results.every((r) => r.user.id === user.id && r.user.emailVerified)).toBe(true);
+    expect(results.filter((r) => !r.alreadyVerified)).toHaveLength(1);
+    const db = await getDb();
+    expect(await db.select().from(events).where(and(eq(events.orgId, org.id), eq(events.type, "member.email_verified")))).toHaveLength(1);
+  });
+
+  it("rejects expired, unknown, malformed and wrong-kind links, and a link for a disabled account", async () => {
+    const db = await getDb();
+    const { user } = await signUp({ orgName: "Expired Verify", name: "E", email: uniqueEmail("expv"), password: PASSWORD });
+    const token = tokenFrom(sent[0].text);
+    await db.update(authTokens).set({ expiresAt: new Date(Date.now() - 1000) }).where(eq(authTokens.id, sha256Hex(token)));
+    const expired = await failure(() => verifyEmail(token));
+    expect(expired.code).toBe("gone");
+    expect(expired.message).toMatch(/expired or was already used/);
+    for (const junk of [newSecret(), "", "short", null, undefined, 42, { token }, `${token}x`]) {
+      expect((await failure(() => verifyEmail(junk))).code).toBe("gone");
+    }
+    // A password reset link is not a confirmation link.
+    sent.length = 0;
+    await requestPasswordReset(user.email);
+    expect((await failure(() => verifyEmail(tokenFrom(sent[0].text)))).code).toBe("gone");
+    expect((await db.select().from(users).where(eq(users.id, user.id)))[0].emailVerifiedAt).toBeNull();
+
+    const other = await signUp({ orgName: "Off Verify", name: "O", email: uniqueEmail("offv"), password: PASSWORD });
+    const offToken = tokenFrom(sent.at(-1)!.text);
+    await db.update(users).set({ disabledAt: new Date() }).where(eq(users.id, other.user.id));
+    expect((await failure(() => verifyEmail(offToken))).code).toBe("gone");
+  });
+
+  it("sends a fresh link on request, killing the earlier one, a few times an hour at most", async () => {
+    const { owner, actor } = await newOrg("Resend Co", { verified: false });
+    const db = await getDb();
+    const [first] = await db.select().from(authTokens).where(and(eq(authTokens.userId, owner.id), eq(authTokens.kind, "email_verify")));
+
+    expect(await resendVerification(actor)).toEqual({ status: "sent" });
+    expect(sent).toHaveLength(1);
+    expect(sent[0]).toMatchObject({ kind: "verify_email", to: owner.email });
+    const tokens = await db.select().from(authTokens).where(and(eq(authTokens.userId, owner.id), eq(authTokens.kind, "email_verify")));
+    expect(tokens).toHaveLength(1);
+    expect(tokens[0].id).not.toBe(first.id);
+
+    await resendVerification(actor);
+    await resendVerification(actor);
+    const limited = await failure(() => resendVerification(actor));
+    expect(limited.code).toBe("rate_limited");
+    expect(limited.message).toContain(owner.email);
+    expect(sent).toHaveLength(3);
+
+    // Only the newest link works.
+    expect((await verifyEmail(tokenFrom(sent[2].text))).alreadyVerified).toBe(false);
+    expect((await failure(() => verifyEmail(tokenFrom(sent[0].text)))).code).toBe("gone");
+    // Nothing more to send once verified, and no limit is consumed finding that out.
+    expect(await resendVerification(actor)).toEqual({ status: "already_verified" });
+    expect(sent).toHaveLength(3);
+  });
+
+  it("reports a failed resend with the reason, and is only for signed-in people", async () => {
+    const { actor, org } = await newOrg("Fail Resend", { verified: false });
+    emailBehaviour = "failed";
+    expect(await resendVerification(actor)).toEqual({ status: "failed", error: "Mailbox unavailable" });
+    expect((await failure(() => resendVerification({ type: "api", orgId: org.id, keyId: "key_x", label: "API" }))).code).toBe("forbidden");
+  });
+
+  it("accepting an invitation or completing a password reset proves the mailbox too", async () => {
+    const { actor, owner } = await newOrg();
+    const member = await addMember(actor, "member");
+    expect(member.emailVerified).toBe(true);
+    expect((await listMembers(actor)).find((m) => m.id === member.id)?.emailVerified).toBe(true);
+
+    const fresh = await newOrg("Reset Verifies", { verified: false });
+    expect((await listMembers(fresh.actor))[0].emailVerified).toBe(false);
+    await requestPasswordReset(fresh.owner.email);
+    const reset = await resetPassword(tokenFrom(sent.at(-1)!.text), "a brand new password");
+    expect(reset.emailVerified).toBe(true);
+
+    // A reset does not move the date of someone already verified.
+    const db = await getDb();
+    const [before] = await db.select().from(users).where(eq(users.id, owner.id));
+    sent.length = 0;
+    await requestPasswordReset(owner.email);
+    await resetPassword(tokenFrom(sent[0].text), "another new password");
+    const [after] = await db.select().from(users).where(eq(users.id, owner.id));
+    expect(after.emailVerifiedAt?.getTime()).toBe(before.emailVerifiedAt?.getTime());
+  });
+
+  it("holds email to people outside the company until an owner is verified, and never email to teammates", async () => {
+    const { actor, owner, org } = await newOrg("Hold Co", { verified: false });
+    const db = await getDb();
+    expect(await externalEmailHold(db, org.id, "client@client.test")).toBe(EMAIL_UNVERIFIED_REASON);
+    expect(await externalEmailHold(db, org.id, owner.email)).toBeNull();
+    expect(await externalEmailHold(db, org.id, `  ${owner.email.toUpperCase()} `)).toBeNull();
+    expect(await getEmailSendingStatus(actor)).toEqual({ emailConfigured: true, canEmailOutside: false, viewerVerified: false, viewerIsOwner: true, reason: EMAIL_UNVERIFIED_REASON });
+
+    // An invitation goes to an address outside the company, so it is held; the link is still handed over.
+    const invite = await inviteMember(actor, { email: uniqueEmail("held"), role: "member" });
+    expect(invite).toMatchObject({ emailStatus: "skipped", emailError: EMAIL_UNVERIFIED_REASON, emailUnverified: true });
+    expect(invite.url).toContain("/invite/");
+    expect(sent).toHaveLength(0);
+    // The invited person can still join with the link, and joining does not lift the hold: they are not an owner.
+    const { user: joined } = await acceptInvite(tokenFrom(invite.url), { name: "Jo Joined", password: PASSWORD });
+    expect(joined.emailVerified).toBe(true);
+    expect(await externalEmailHold(db, org.id, "client@client.test")).toBe(EMAIL_UNVERIFIED_REASON);
+    expect(await getEmailSendingStatus(actorOf(joined))).toMatchObject({ canEmailOutside: false, viewerVerified: true, viewerIsOwner: false });
+
+    await db.update(users).set({ emailVerifiedAt: new Date() }).where(eq(users.id, owner.id));
+    expect(await externalEmailHold(db, org.id, "client@client.test")).toBeNull();
+    expect(await getEmailSendingStatus(actor)).toEqual({ emailConfigured: true, canEmailOutside: true, viewerVerified: true, viewerIsOwner: true, reason: null });
+    expect((await inviteMember(actor, { email: uniqueEmail("free"), role: "member" })).emailStatus).toBe("sent");
+
+    // A verified owner whose account is turned off no longer counts.
+    const second = await addMember(actor, "admin", "Second Owner");
+    await transferOwnership(actor, second.id);
+    await db.update(users).set({ emailVerifiedAt: null }).where(eq(users.id, second.id));
+    expect(await externalEmailHold(db, org.id, "client@client.test")).toBe(EMAIL_UNVERIFIED_REASON);
+  });
+
+  it("requires nothing when email is not set up at all", async () => {
+    const { actor, org } = await newOrg("No Mail Co", { verified: false });
+    emailBehaviour = "skipped";
+    const db = await getDb();
+    expect(await externalEmailHold(db, org.id, "client@client.test")).toBeNull();
+    expect(await getEmailSendingStatus(actor)).toEqual({ emailConfigured: false, canEmailOutside: false, viewerVerified: false, viewerIsOwner: true, reason: null });
+    const invite = await inviteMember(actor, { email: uniqueEmail("nomail"), role: "member" });
+    expect(invite.emailStatus).toBe("skipped");
+    expect(invite.emailUnverified).toBeUndefined();
+    expect(invite.emailError).toBeUndefined();
+  });
+});
+
+describe("company time zone", () => {
+  it("stores a valid browser zone at sign-up and quietly ignores anything else", async () => {
+    const good = await signUp({ orgName: "Zone Co", name: "Z", email: uniqueEmail("zone"), password: PASSWORD, timeZone: "America/Toronto" });
+    expect(good.org.settings).toEqual({ timeZone: "America/Toronto" });
+    expect(resolveSettings(good.org).timeZone).toBe("America/Toronto");
+    for (const timeZone of ["Mars/Olympus_Mons", "", 42, null, undefined, "x".repeat(500), "America/Toronto; drop table orgs"]) {
+      const { org } = await signUp({ orgName: "Zone Co", name: "Z", email: uniqueEmail("zone"), password: PASSWORD, timeZone });
+      expect(org.settings, String(timeZone).slice(0, 30)).toEqual({});
+    }
+  });
+
+  it("is a setting managers can change, validated against the zones the runtime knows", async () => {
+    const { actor } = await newOrg();
+    expect((await updateOrg(actor, { settings: { timeZone: "Europe/London" } })).settings.timeZone).toBe("Europe/London");
+    // Letter case is corrected to the canonical name.
+    expect((await updateOrg(actor, { settings: { timeZone: "america/new_york" } })).settings.timeZone).toBe("America/New_York");
+    for (const bad of ["Not/AZone", "Toronto", 5, "Europe/London\nX"]) {
+      const err = await failure(() => updateOrg(actor, { settings: { timeZone: bad } }));
+      expect(err.fields?.timeZone, String(bad)).toMatch(/time zone/);
+    }
+    expect((await updateOrg(actor, { settings: { timeZone: "" } })).settings).not.toHaveProperty("timeZone");
+  });
+});
+
+describe("callers without a network address share one limit instead of having none", () => {
+  const unknownCount = async (action: string) => {
+    const db = await getDb();
+    const [row] = await db.select().from(rateLimits).where(eq(rateLimits.key, `${action}:ip:unknown`));
+    return row?.count ?? 0;
+  };
+
+  it("counts sign-ups, sign-ins and reset requests with no address against a shared bucket", async () => {
+    const before = { signup: await unknownCount("signup"), login: await unknownCount("login"), reset: await unknownCount("reset") };
+    const email = uniqueEmail("noip");
+    await signUp({ orgName: "No Ip", name: "N", email, password: PASSWORD });
+    await signUp({ orgName: "No Ip", name: "N", email: uniqueEmail("noip"), password: PASSWORD }, { ip: null });
+    await logIn({ email, password: PASSWORD });
+    await logIn({ email, password: PASSWORD }, { ip: "   " });
+    await requestPasswordReset(email);
+    await requestPasswordReset(email, {});
+    expect(await unknownCount("signup")).toBe(before.signup + 2);
+    expect(await unknownCount("login")).toBe(before.login + 2);
+    expect(await unknownCount("reset")).toBe(before.reset + 2);
+  });
+
+  it("stops every such caller once the shared bucket is full, without touching callers who have an address", async () => {
+    const db = await getDb();
+    const full = { resetAt: new Date(Date.now() + 3_600_000) };
+    await db.insert(rateLimits).values({ key: "signup:ip:unknown", count: 100, ...full }).onConflictDoUpdate({ target: rateLimits.key, set: { count: 100, ...full } });
+    await db.insert(rateLimits).values({ key: "login:ip:unknown", count: 500, ...full }).onConflictDoUpdate({ target: rateLimits.key, set: { count: 500, ...full } });
+    await db.insert(rateLimits).values({ key: "reset:ip:unknown", count: 200, ...full }).onConflictDoUpdate({ target: rateLimits.key, set: { count: 200, ...full } });
+    try {
+      const email = uniqueEmail("fullbucket");
+      expect((await failure(() => signUp({ orgName: "Full", name: "F", email, password: PASSWORD }))).code).toBe("rate_limited");
+      const { user } = await signUp({ orgName: "Full", name: "F", email, password: PASSWORD }, { ip: "203.0.113.201" });
+      expect((await failure(() => logIn({ email, password: PASSWORD }))).code).toBe("rate_limited");
+      expect((await logIn({ email, password: PASSWORD }, { ip: "203.0.113.201" })).id).toBe(user.id);
+      sent.length = 0;
+      await requestPasswordReset(email);
+      expect(sent).toHaveLength(0);
+      await requestPasswordReset(email, { ip: "203.0.113.201" });
+      expect(sent).toHaveLength(1);
+    } finally {
+      // Other tests in this file sign up and sign in without an address.
+      await db.delete(rateLimits).where(eq(rateLimits.key, "signup:ip:unknown"));
+      await db.delete(rateLimits).where(eq(rateLimits.key, "login:ip:unknown"));
+      await db.delete(rateLimits).where(eq(rateLimits.key, "reset:ip:unknown"));
+    }
+  });
+});
+
+describe("a saved signature must be one the document engine can draw", () => {
+  it("refuses a small file that claims enormous dimensions", async () => {
+    const { actor } = await newOrg();
+    const huge = Buffer.from(PNG);
+    // Width and height live in the IHDR chunk; 6000 x 6000 is far past what a signature may be.
+    huge.writeUInt32BE(6000, 16);
+    huge.writeUInt32BE(6000, 20);
+    const err = await failure(() => saveSignature(actor, `data:image/png;base64,${huge.toString("base64")}`));
+    expect(err.code).toBe("invalid");
+    expect(err.fields?.signature).toMatch(/too many pixels/);
+    expect(await getOwnSignature(actor)).toBeNull();
+    expect((await saveSignature(actor, PNG_URL)).hasSignature).toBe(true);
   });
 });

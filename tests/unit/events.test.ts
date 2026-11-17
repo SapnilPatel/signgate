@@ -236,6 +236,72 @@ describe("describeEvent", () => {
     expect(describeEvent(ev("document.downloaded", "Sam Lee", {}, "user"))).toBe("Signed agreement downloaded by Sam Lee");
   });
 
+  it("has a sentence for the countersigning, sealing and verification events", () => {
+    const sys = (type: string, data: Record<string, unknown> = {}) => describeEvent(ev(type, "System", data, "system"));
+    expect(sys("countersign.requested", { email: "sam@example.com", name: "Sam Lee" })).toBe("Countersignature requested from sam@example.com");
+    expect(sys("countersign.requested", { email: "sam@example.com", reminder: 2 })).toBe("Countersignature requested from sam@example.com (reminder 2)");
+    expect(sys("countersign.overdue", { reason: "Sam Lee has not countersigned after 5 reminders. An owner or admin can countersign from the file" })).toBe(
+      "Countersignature overdue: Sam Lee has not countersigned after 5 reminders. An owner or admin can countersign from the file",
+    );
+    expect(sys("countersign.overdue")).toBe("Countersignature overdue");
+    expect(sys("countersign.unassigned", { reason: "Choose a countersigner in Settings." })).toBe("Nobody is assigned to countersign: Choose a countersigner in Settings");
+    expect(sys("envelope.finalize_failed", { reason: "The original agreement PDF is missing from storage." })).toBe(
+      "The final signed copy could not be produced; it will be retried automatically: The original agreement PDF is missing from storage",
+    );
+    // Rows written before the key was renamed still read properly.
+    expect(sys("envelope.finalize_failed", { error: "Storage timed out" })).toMatch(/retried automatically: Storage timed out$/);
+    expect(sys("envelope.seal_warning", { code: "image_skipped", reason: "An image was left out." })).toBe(
+      "The signed copy shows something differently from what was entered: An image was left out",
+    );
+    expect(describeEvent(ev("member.email_verified", "Olive Owner <olive@example.com>", {}, "user"))).toBe("Olive Owner <olive@example.com> confirmed their email address");
+  });
+
+  it("has a sentence for everything else the services record", () => {
+    const by = (type: string, data: Record<string, unknown> = {}) => describeEvent(ev(type, "Sam Lee", data, "user"));
+    expect(by("file.unarchived")).toBe("File restored from the archive by Sam Lee");
+    expect(by("template.created", { templateName: "Client Agreement" })).toBe('Agreement "Client Agreement" uploaded by Sam Lee');
+    expect(by("template.renamed", { templateName: "New", previousName: "Old" })).toBe('Agreement "Old" renamed to "New" by Sam Lee');
+    expect(by("template.duplicated", { templateName: "Copy", fromName: "Original" })).toBe('Agreement "Original" copied as "Copy" by Sam Lee');
+    expect(by("template.fields_updated", { templateName: "Client Agreement" })).toBe('Agreement "Client Agreement" fields changed by Sam Lee');
+    expect(by("template.fields_redetected", { templateName: "Client Agreement" })).toBe('Agreement "Client Agreement" fields detected again by Sam Lee');
+    expect(by("template.document_replaced", { templateName: "Client Agreement" })).toBe('Agreement "Client Agreement" document replaced by Sam Lee');
+    expect(by("template.activated", { templateName: "Client Agreement", becameDefault: true })).toBe('Agreement "Client Agreement" activated by Sam Lee and made the default');
+    expect(by("template.archived", { templateName: "Client Agreement" })).toBe('Agreement "Client Agreement" archived by Sam Lee');
+    expect(by("template.default_changed", { templateName: "Client Agreement" })).toBe('Agreement "Client Agreement" made the default agreement by Sam Lee');
+    expect(by("template.intake_enabled", { templateName: "Client Agreement" })).toBe('Client intake link turned on for "Client Agreement" by Sam Lee');
+    expect(by("template.intake_disabled")).toBe("Client intake link turned off for an agreement by Sam Lee");
+    expect(by("org.created")).toBe("Company account created by Sam Lee");
+    expect(by("org.updated", { changed: ["name", "timeZone", "countersignerUserId"] })).toBe("Company settings changed by Sam Lee (company name, time zone, countersigner)");
+    expect(by("member.invited", { email: "jo@example.com", role: "admin" })).toBe("jo@example.com invited to the team as admin by Sam Lee");
+    expect(by("member.invite_revoked", { email: "jo@example.com" })).toBe("Invitation for jo@example.com cancelled by Sam Lee");
+    expect(by("member.joined")).toBe("Sam Lee joined the team");
+    expect(by("member.role_changed", { email: "jo@example.com", from: "member", to: "admin" })).toBe("jo@example.com made an admin by Sam Lee");
+    expect(by("member.role_changed", { email: "jo@example.com", to: "member" })).toBe("jo@example.com made a member by Sam Lee");
+    expect(by("member.disabled", { email: "jo@example.com" })).toBe("jo@example.com's account turned off by Sam Lee");
+    expect(by("member.enabled", { email: "jo@example.com" })).toBe("jo@example.com's account turned back on by Sam Lee");
+    expect(by("member.ownership_transferred", { toEmail: "jo@example.com" })).toBe("Ownership transferred to jo@example.com by Sam Lee");
+    expect(by("member.password_reset")).toBe("Sam Lee set a new password from a reset link");
+    expect(by("member.password_changed")).toBe("Sam Lee changed their password");
+  });
+
+  it("leaves no event type the services record to the generic fallback", async () => {
+    const { readFileSync, readdirSync } = await import("node:fs");
+    const { join } = await import("node:path");
+    const dir = join(process.cwd(), "src/lib/services");
+    const types = new Set<string>();
+    // events.ts itself is the reference being checked, not a place events are recorded.
+    for (const name of readdirSync(dir).filter((f) => f.endsWith(".ts") && f !== "events.ts")) {
+      const source = readFileSync(join(dir, name), "utf8");
+      // Audit event names are "noun.verb" string literals; webhook event names (agreement.*) are a different vocabulary.
+      for (const m of source.matchAll(/"((?:file|envelope|signer|reminder|link|countersign|template|org|member|api_key|webhook|document)\.[a-z_]+)"/g)) types.add(m[1]);
+    }
+    expect(types.size).toBeGreaterThan(40);
+    // file.created is also a webhook event name; it has a sentence either way.
+    const written = new Set([...readFileSync(join(dir, "events.ts"), "utf8").matchAll(/case "([a-z_]+\.[a-z_]+)":/g)].map((m) => m[1]));
+    // webhook.test is the name of the test delivery sent to an endpoint, never an audit event.
+    expect([...types].filter((type) => !written.has(type) && type !== "webhook.test")).toEqual([]);
+  });
+
   it("gives unknown types a readable sentence", () => {
     expect(describeEvent(ev("envelope.something_new", "Sam Lee", {}, "user"))).toBe("Envelope something new by Sam Lee");
     expect(describeEvent(ev("", "System", {}, "system"))).toBe("Activity recorded");

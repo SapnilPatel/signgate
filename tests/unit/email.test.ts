@@ -27,6 +27,11 @@ import {
   inviteEmail,
   inviteExistingAccountEmail,
   signInAlertEmail,
+  verifyEmailEmail,
+  linkExpiredEmail,
+  agreementNotCompletedEmail,
+  countersignOverdueEmail,
+  finalCopyFailedEmail,
   buttonColors,
   type EmailContent,
 } from "@/lib/services/email-templates";
@@ -51,6 +56,11 @@ function allEmails(s: string, url = SIGN_URL): Record<string, EmailContent> {
     invite: inviteEmail({ orgName: s, inviterName: s, url }),
     inviteExistingAccount: inviteExistingAccountEmail({ orgName: s, inviterName: s, resetUrl: url }),
     signInAlert: signInAlertEmail({ name: s, resetUrl: url }),
+    verifyEmail: verifyEmailEmail({ name: s, orgName: s, url }),
+    linkExpired: linkExpiredEmail({ brand: b, signerName: s, agreementName: s, expiredOn: s }),
+    notCompleted: agreementNotCompletedEmail({ brand: b, signerName: s, agreementName: s }),
+    countersignOverdue: countersignOverdueEmail({ brand: b, recipientName: s, clientName: s, agreementName: s, fileReference: s, countersignerName: s, reason: s, fileUrl: url }),
+    finalCopyFailed: finalCopyFailedEmail({ brand: b, recipientName: s, clientName: s, agreementName: s, fileReference: s, error: s, fileUrl: url }),
   };
 }
 
@@ -123,7 +133,8 @@ describe("email templates", () => {
       expect(email.text, name).not.toMatch(/<[a-z!/]/i);
       expect(email.text, name).not.toMatch(/&(amp|lt|gt|quot|#39|nbsp);/);
       expect(email.text.length, name).toBeGreaterThan(120);
-      if (name !== "voided") {
+      // These three tell someone a link is dead; they deliberately carry no link.
+      if (!["voided", "linkExpired", "notCompleted"].includes(name)) {
         // The link appears unescaped, on its own line, so it stays clickable in a text client.
         expect(email.text.split("\n"), name).toContain(SIGN_URL);
         // And in the HTML both as the button and as visible raw text.
@@ -261,6 +272,80 @@ describe("email templates", () => {
     const voided = voidedEmail({ brand, signerName: "Dana", agreementName: "A", reason: "Sent to the wrong person" });
     expect(voided.html).not.toContain("href=");
     expect(voided.text).toContain("> Sent to the wrong person");
+  });
+});
+
+describe("notices added for held links and stuck agreements", () => {
+  it("tells a signer their link expired in the company's own branding, without saying anyone cancelled", () => {
+    const email = linkExpiredEmail({ brand, signerName: "Fay Client", agreementName: "Engagement letter", expiredOn: "3 December 2026" });
+    expect(email.subject).toBe("Your signing link for Engagement letter has expired");
+    expect(email.text).toMatch(/expired on 3 December 2026 before the agreement was signed/);
+    expect(email.text).toMatch(/ask them to send the agreement again/);
+    expect(email.text).not.toMatch(/cancel/i);
+    // Branded like every other client email: the accent bar and the company as sender.
+    expect(email.html).toContain("background-color:#1f3a5f");
+    expect(email.html).toContain("Northwind Legal");
+    expect(email.text).toMatch(/Sent by Northwind Legal through/);
+    expect(linkExpiredEmail({ brand, signerName: "", agreementName: "" }).text).toMatch(/^Hello,\n\nThe link Northwind Legal sent you to sign the agreement expired before/);
+  });
+
+  it("tells a client who signed that the agreement is not in effect", () => {
+    const email = agreementNotCompletedEmail({ brand, signerName: "Fay Client", agreementName: "Engagement letter" });
+    expect(email.subject).toBe("Engagement letter with Northwind Legal was not completed");
+    expect(email.text).toMatch(/You signed Engagement letter, but Northwind Legal did not countersign it/);
+    expect(email.text).toMatch(/not in effect/);
+    expect(email.html).toContain("background-color:#1f3a5f");
+  });
+
+  it("tells the team the company's own signature is overdue, with why and where to act", () => {
+    const email = countersignOverdueEmail({
+      brand,
+      recipientName: "Olive Owner",
+      clientName: "Casey Example",
+      agreementName: "Engagement letter",
+      fileReference: "F-2026-0007",
+      countersignerName: "Sam Lee",
+      reason: "Sam Lee was asked to countersign and has not done so after 5 reminders.",
+      fileUrl: FILE_URL,
+    });
+    expect(email.subject).toBe("Countersignature overdue: Casey Example is waiting on Engagement letter (F-2026-0007)");
+    expect(email.text).toMatch(/Casey Example has signed Engagement letter for file F-2026-0007, but it has not been countersigned for Northwind Legal/);
+    expect(email.text).toMatch(/after 5 reminders\.\n/);
+    expect(email.text).toContain(`Open the file:\n${FILE_URL}`);
+    expect(email.text).toMatch(/You are receiving this because you are on the Northwind Legal team/);
+    // Without a reason it still says something true.
+    const bare = countersignOverdueEmail({ brand, recipientName: "O", clientName: "C", agreementName: "A", fileReference: "", fileUrl: FILE_URL });
+    expect(bare.text).toMatch(/Nobody is set up to countersign for your company\./);
+    expect(countersignOverdueEmail({ brand, recipientName: "O", clientName: "C", agreementName: "A", fileReference: "", countersignerName: "Sam Lee", fileUrl: FILE_URL }).text).toMatch(
+      /Sam Lee was asked to countersign and has not done so\./,
+    );
+  });
+
+  it("tells the team the final copy is stuck, that signatures are safe and that it is being retried", () => {
+    const email = finalCopyFailedEmail({
+      brand,
+      recipientName: "Olive Owner",
+      clientName: "Casey Example",
+      agreementName: "Engagement letter",
+      fileReference: "F-2026-0007",
+      error: "The original agreement PDF is missing from storage.",
+      fileUrl: FILE_URL,
+    });
+    expect(email.subject).toBe("Signed, but the final copy could not be produced: Engagement letter (F-2026-0007)");
+    expect(email.text).toMatch(/Casey Example has not received their copy yet/);
+    expect(email.text).toMatch(/nothing needs to be signed again/);
+    expect(email.text).toMatch(/What went wrong: The original agreement PDF is missing from storage\./);
+    expect(email.text).toContain(FILE_URL);
+    expect(finalCopyFailedEmail({ brand, recipientName: "O", clientName: "C", agreementName: "A", fileReference: "", fileUrl: FILE_URL }).text).not.toMatch(/What went wrong/);
+  });
+
+  it("asks a new owner to confirm their address and says what is on hold until they do", () => {
+    const email = verifyEmailEmail({ name: "Fran Founder", orgName: "Northwind Legal", url: "https://app.example.test/verify-email/abc" });
+    expect(email.subject).toMatch(/^Confirm your email address/);
+    expect(email.text).toContain("Confirm my email address:\nhttps://app.example.test/verify-email/abc");
+    expect(email.text).toMatch(/does not email agreements to your clients/);
+    expect(email.text).toMatch(/copy each signing link/);
+    expect(email.text).toMatch(/expires after 48 hours/);
   });
 });
 

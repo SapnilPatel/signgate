@@ -17,7 +17,7 @@ vi.mock("@/lib/pdf", async (importOriginal) => {
 });
 
 import { getDb } from "@/lib/db";
-import { emailLog, envelopes, events, files, orgs, signers, templates, users, webhookDeliveries, webhooks, type Envelope, type FileRow, type Org, type Signer, type Template, type User } from "@/lib/db/schema";
+import { emailLog, envelopes, events, files, orgs, rateLimits, signers, templates, users, webhookDeliveries, webhooks, type Envelope, type FileRow, type Org, type Signer, type Template, type User } from "@/lib/db/schema";
 import { newId, sha256Hex } from "@/lib/ids";
 import type { Field, OrgSettings } from "@/lib/types";
 import { ServiceError, type Actor } from "@/lib/services/context";
@@ -28,6 +28,7 @@ import {
   SEND_LIMITS,
   countersign,
   deliverUnsentDraft,
+  deliveryReason,
   getCountersignSession,
   getDocument,
   getEnvelope,
@@ -45,6 +46,10 @@ import {
   voidOpenEnvelopesForFile,
 } from "@/lib/services/envelopes";
 import { declineSigning, getSigningDocument, getSigningSession, longDate, submitSigning, verifyDocument } from "@/lib/services/signing";
+import { EMAIL_UNVERIFIED_REASON, setMemberDisabled } from "@/lib/services/accounts";
+import { isValidMergeKey } from "@/lib/services/templates";
+import { readFileSync } from "node:fs";
+import path from "node:path";
 import { findSignerBySecret, signingUrl } from "@/lib/services/tokens";
 
 // ---------------------------------------------------------------------------
@@ -148,7 +153,8 @@ async function makeWorld(opts: { company?: boolean; settings?: OrgSettings; fiel
     .insert(orgs)
     .values({ id: newId("org"), name: `Northwind Test ${n}`, legalName: `Northwind Test ${n} Ltd`, slug: `northwind-${n}`, settings: opts.settings ?? {} })
     .returning();
-  const owner = await addUser(org.id, "owner");
+  // Verified, as every owner is once they have used their confirmation link; without it client emails are held.
+  const owner = await addUser(org.id, "owner", { emailVerifiedAt: new Date() });
   const blob = await putBlob(db, { orgId: org.id, bytes: await makePdf(), contentType: "application/pdf", filename: "agreement.pdf" });
   const fields = opts.fields ?? [...prefillFields(), ...clientFields(), ...(opts.company ? companyFields() : [])];
   const [template] = await db
@@ -944,10 +950,13 @@ describe("the company signer's link is only for people who may countersign", () 
 describe("limits on signing requests", () => {
   it("a new account cannot send more than its hourly ceiling, and says when to try again", async () => {
     const world = await makeWorld();
-    for (let i = 0; i < SEND_LIMITS.newOrgPerHour; i++) await sendOne(world);
+    const db = await getDb();
+    // The counter as it stands after a first-week company's full hour of sending, minus two real sends.
+    await db.insert(rateLimits).values({ key: `send:org:${world.org.id}:hour`, count: SEND_LIMITS.newOrgPerHour - 2, resetAt: new Date(Date.now() + 3_600_000) });
+    for (let i = 0; i < 2; i++) await sendOne(world);
     const file = await makeFile(world.org.id);
     const err = await expectServiceError(sendAgreementForFile(world.actor, file.id), "rate_limited");
-    expect(err.message).toMatch(/limit of 30 signing requests an hour/);
+    expect(err.message).toMatch(/limit of 200 signing requests an hour/);
     expect(err.message).toMatch(/first 7 days/);
     expect(err.fields).toEqual({ scope: "org" });
     // Nothing half-made is left behind, and the file is untouched.
@@ -960,7 +969,8 @@ describe("limits on signing requests", () => {
     const world = await makeWorld();
     const db = await getDb();
     await db.update(orgs).set({ createdAt: new Date(Date.now() - 30 * 86_400_000) }).where(eq(orgs.id, world.org.id));
-    for (let i = 0; i < SEND_LIMITS.newOrgPerHour + 3; i++) await sendOne(world);
+    await db.insert(rateLimits).values({ key: `send:org:${world.org.id}:hour`, count: SEND_LIMITS.newOrgPerHour, resetAt: new Date(Date.now() + 3_600_000) });
+    for (let i = 0; i < 3; i++) await sendOne(world);
   }, 60_000);
 
   it("replacing over and over on one file is limited too", async () => {
@@ -1330,5 +1340,176 @@ describe("toPublicEnvelope", () => {
     const text = JSON.stringify(out);
     expect(text).not.toMatch(/tokenNonce|tokenHash|data:image|203\.0\.113\.9|TestBrowser|"fields"|"prefill"|"pages"|"ip"|userAgent/);
     expect(toPublicEnvelope(await envelopeRow(envelopeId)).signers).toEqual([]);
+  });
+});
+
+describe("until the owner confirms their email, client emails are held but everything else works", () => {
+  async function unverify(world: World): Promise<void> {
+    const db = await getDb();
+    await db.update(users).set({ emailVerifiedAt: null }).where(eq(users.id, world.owner.id));
+  }
+  async function verify(world: World): Promise<void> {
+    const db = await getDb();
+    await db.update(users).set({ emailVerifiedAt: new Date() }).where(eq(users.id, world.owner.id));
+  }
+
+  it("creates a valid envelope and hands back the link with a plain reason, without emailing the client", async () => {
+    const world = await makeWorld();
+    await unverify(world);
+    const { file, secret, ...sent } = await sendOne(world);
+    expect(sent.delivery).toBe("email_unverified");
+    expect(sent.deliveryReason).toBe(EMAIL_UNVERIFIED_REASON);
+    expect(sent.deliveryReason).toMatch(/has not confirmed their email address/);
+    expect(sent.deliveryReason).toMatch(/Copy the link/);
+    expect(getTestOutbox()).toHaveLength(0);
+
+    // The envelope is real and its link resolves; it is signed with that link at the end of this test.
+    expect((await envelopeRow(sent.envelopeId)).status).toBe("draft");
+    expect((await fileRow(file.id)).agreementStatus).toBe("needs_attention");
+    expect(await findSignerBySecret(secret)).not.toBeNull();
+
+    // The held attempt is on record, both in the email log and on the timeline.
+    const db = await getDb();
+    const log = await db.select().from(emailLog).where(eq(emailLog.envelopeId, sent.envelopeId));
+    expect(log).toHaveLength(1);
+    expect(log[0]).toMatchObject({ kind: "signing_request", status: "skipped", to: file.clientEmail });
+    expect(log[0].error).toMatch(/has not confirmed/);
+    const detail = await getEnvelope(world.actor, sent.envelopeId);
+    expect(detail.events.at(-1)?.type).toBe("envelope.delivery_failed");
+    expect(detail.events.at(-1)?.description).toMatch(/has not confirmed their email address/);
+    expect(detail.signers[0].signingUrl).toBe(sent.signingUrl);
+
+    // Chasing is held the same way, and still hands over the link.
+    const [client] = await signerRows(sent.envelopeId);
+    const resent = await resendToSigner(world.actor, client.id);
+    expect(resent).toEqual({ delivery: "email_unverified", deliveryReason: EMAIL_UNVERIFIED_REASON, signingUrl: sent.signingUrl });
+    expect(getTestOutbox()).toHaveLength(0);
+
+    // Once the owner has confirmed, the same request goes out.
+    await verify(world);
+    expect(await resendToSigner(world.actor, client.id)).toEqual({ delivery: "emailed", signingUrl: sent.signingUrl });
+    expect(mailTo(file.clientEmail, "signing_request")).toHaveLength(1);
+    expect((await envelopeRow(sent.envelopeId)).status).toBe("sent");
+
+    expect((await sign(secret)).completed).toBe(true);
+  });
+
+  it("still emails the company's own people, and records the copy the client did not get", async () => {
+    const world = await makeWorld({ company: true });
+    const admin = await addUser(world.org.id, "admin");
+    await setSettings(world.org.id, { countersignerUserId: admin.id });
+    await unverify(world);
+    const { file, secret, envelopeId, delivery } = await sendOne(world);
+    expect(delivery).toBe("email_unverified");
+
+    await sign(secret);
+    // The countersigner is on the team, so their request is not held.
+    expect(mailTo(admin.email, "countersign_request")).toHaveLength(1);
+    const result = await countersign(actorFor(admin), envelopeId, { signature: SIGNATURE });
+    expect(result.completed).toBe(true);
+
+    expect(mailTo(file.clientEmail)).toHaveLength(0);
+    expect(mailTo(admin.email, "completed")).toHaveLength(1);
+    expect(mailTo(world.owner.email, "completed")).toHaveLength(1);
+    const db = await getDb();
+    const held = await db.select().from(emailLog).where(and(eq(emailLog.envelopeId, envelopeId), eq(emailLog.kind, "completed"), eq(emailLog.status, "skipped")));
+    expect(held.map((h) => h.to)).toEqual([file.clientEmail]);
+    const trail = (await getEnvelope(world.actor, envelopeId)).events;
+    expect(trail.some((e) => e.type === "envelope.delivery_failed" && e.data.kind === "completed" && e.data.email === file.clientEmail)).toBe(true);
+    // The client is told the truth: no email is claimed, the download is.
+    expect((await sign(secret)).message).not.toMatch(/emailed/);
+  });
+
+  it("holds the notice to a client whose request is voided", async () => {
+    const world = await makeWorld();
+    const { envelopeId, file, secret } = await sendOne(world);
+    expect(mailTo(file.clientEmail, "signing_request")).toHaveLength(1);
+    await unverify(world);
+    await voidEnvelope(world.actor, envelopeId, "Sent in error");
+    expect(mailTo(file.clientEmail, "voided")).toHaveLength(0);
+    expect((await getSigningSession(secret)).state).toBe("voided");
+  });
+
+  it("asks for nothing when email is not set up at all", async () => {
+    const world = await makeWorld();
+    await unverify(world);
+    setTestEmailUnconfigured(true);
+    const { file, secret, ...sent } = await sendOne(world);
+    expect(sent.delivery).toBe("email_not_configured");
+    expect(sent.deliveryReason).toMatch(/Email is not set up/);
+    expect(sent.deliveryReason).not.toMatch(/confirmed/);
+    const db = await getDb();
+    const [log] = await db.select().from(emailLog).where(eq(emailLog.envelopeId, sent.envelopeId));
+    expect(log).toMatchObject({ status: "skipped", error: null, to: file.clientEmail });
+    expect((await sign(secret)).completed).toBe(true);
+  });
+
+  it("a repeated replace request reports the same held delivery", async () => {
+    const world = await makeWorld();
+    await unverify(world);
+    const first = await sendOne(world);
+    const replaced = await sendAgreementForFile(world.actor, first.file.id, { replace: true, replaceEnvelopeId: first.envelopeId });
+    const again = await sendAgreementForFile(world.actor, first.file.id, { replace: true, replaceEnvelopeId: first.envelopeId });
+    expect(again).toMatchObject({ envelopeId: replaced.envelopeId, duplicate: true, delivery: "email_unverified", deliveryReason: EMAIL_UNVERIFIED_REASON });
+  });
+
+  it("explains every delivery that is not an email", () => {
+    expect(deliveryReason("emailed")).toBeUndefined();
+    expect(deliveryReason("not_their_turn")).toBeUndefined();
+    for (const d of ["email_failed", "email_not_configured", "email_unverified"] as const) expect(deliveryReason(d)).toMatch(/[Cc]opy the (signing )?link/);
+  });
+});
+
+describe("turning a countersigner's account off", () => {
+  it("kills the countersign links in their inbox for good, even if the account is turned back on", async () => {
+    const world = await makeWorld({ company: true });
+    const admin = await addUser(world.org.id, "admin");
+    await setSettings(world.org.id, { countersignerUserId: admin.id });
+    const { envelopeId, secret } = await sendOne(world);
+    await sign(secret);
+    const [, company] = await signerRows(envelopeId);
+    const oldSecret = secretOf(signingUrlOf(company));
+    expect((await getSigningSession(oldSecret)).state).toBe("ready");
+
+    await setMemberDisabled(world.actor, admin.id, true);
+    expect((await getSigningSession(oldSecret)).state).toBe("unknown");
+    expect(count(await eventTypes(envelopeId), "link.reissued")).toBe(1);
+
+    await setMemberDisabled(world.actor, admin.id, false);
+    // The copy of the link they were emailed stays dead; the envelope itself is untouched.
+    expect((await getSigningSession(oldSecret)).state).toBe("unknown");
+    expect(await findSignerBySecret(oldSecret)).toBeNull();
+    expect((await envelopeRow(envelopeId)).status).toBe("client_signed");
+    // An owner can still countersign from the file.
+    expect((await countersign(world.actor, envelopeId, { signature: SIGNATURE })).completed).toBe(true);
+  });
+});
+
+describe("the detector, the editor and the sender agree on merge keys", () => {
+  // Read from the source so a key added to the detector later cannot be forgotten here.
+  const emitted = new Set<string>();
+  for (const name of ["labels.ts", "rules.ts", "index.ts", "ai.ts"]) {
+    const source = readFileSync(path.join(process.cwd(), "src/lib/pdf/detect", name), "utf8");
+    for (const match of source.matchAll(/mergeKey: "([^"]+)"/g)) emitted.add(match[1]);
+    const list = /const MERGE_KEYS = \[([^\]]+)\]/.exec(source);
+    for (const match of list?.[1].matchAll(/"([^"]+)"/g) ?? []) if (match[1] !== "none") emitted.add(match[1]);
+  }
+
+  it("every key the detector can emit is storable and resolves to a value when the agreement is sent", () => {
+    expect([...emitted]).toEqual(expect.arrayContaining(["client_name", "today", "custom:today_day", "custom:today_month", "custom:today_year", "custom:today_year_short"]));
+    const file = { clientName: "Casey Example", clientEmail: "casey@client.test", clientCompany: "Example Holdings", clientTitle: "Partner", clientPhone: "555 0100", reference: "F-2026-0001", description: "Lease review", data: {} };
+    const sentAt = new Date("2026-11-15T15:00:00Z");
+    for (const key of emitted) {
+      expect(isValidMergeKey(key), key).toBe(true);
+      const values = resolvePrefill([field("f", "text", "prefill", false, { mergeKey: key as Field["mergeKey"] })], file, { name: "Northwind", legalName: "Northwind Ltd" }, sentAt, "America/Toronto");
+      expect(values.f, key).toBeTruthy();
+    }
+    const dated = (key: string) => resolvePrefill([field("f", "text", "prefill", false, { mergeKey: key as Field["mergeKey"] })], file, { name: "N", legalName: null }, sentAt, "America/Toronto").f;
+    expect([dated("custom:today_day"), dated("custom:today_month"), dated("custom:today_year"), dated("custom:today_year_short")]).toEqual(["15th", "November", "2026", "26"]);
+  });
+
+  it("a value the file supplies under the same name wins over the send date", () => {
+    const file = { clientName: "C", clientEmail: "c@client.test", clientCompany: null, clientTitle: null, clientPhone: null, reference: "F-1", description: null, data: { today_month: "January" } };
+    expect(resolvePrefill([field("f", "text", "prefill", false, { mergeKey: "custom:today_month" })], file, { name: "N", legalName: null }, new Date("2026-11-15T15:00:00Z")).f).toBe("January");
   });
 });

@@ -1025,6 +1025,26 @@ describe("references that differ only in letter case", () => {
     expect(await db.select({ id: files.id }).from(files).where(eq(files.orgId, orgId))).toHaveLength(1);
   });
 
+  it("is refused by the database itself, so no code path can create the pair", async () => {
+    const { orgId } = await newOrg();
+    const other = await newOrg();
+    const db = await getDb();
+    const row = (org: string, reference: string) => ({ id: newId("file"), orgId: org, reference, clientName: "Jane Doe", clientEmail: "jane@example.com" });
+    await db.insert(files).values(row(orgId, "Matter-9"));
+    const clash = await db
+      .insert(files)
+      .values(row(orgId, "MATTER-9"))
+      .then(
+        () => null,
+        (e: unknown) => e,
+      );
+    expect(clash).not.toBeNull();
+    expect(JSON.stringify([String(clash), String((clash as { cause?: unknown }).cause)])).toMatch(/files_org_reference_uq|23505|unique/i);
+    // Another company may use the same reference.
+    await db.insert(files).values(row(other.orgId, "MATTER-9"));
+    expect(await db.select({ id: files.id }).from(files).where(eq(files.orgId, orgId))).toHaveLength(1);
+  });
+
   it("a rename cannot slip in beside a create either", async () => {
     const { actor } = await newOrg();
     const { file } = await createFile(actor, client({ reference: "ALPHA-1", send: false }));

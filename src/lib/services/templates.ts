@@ -18,7 +18,7 @@ import { clampRect } from "@/lib/pdf/geometry";
 import { ingestPageImages } from "@/lib/pdf/ingest";
 import { LIMITS, type DetectionMeta, type Field, type FieldRole, type FieldType, type FieldValues, type MergeKey, type OrgSettings, type PageInfo } from "@/lib/types";
 import { cleanText, isSecretToken } from "@/lib/validation";
-import { resolveSettings } from "./accounts";
+import { assertActiveActor, resolveSettings } from "./accounts";
 import { deleteBlob, getBlob, putBlob } from "./blobs";
 import { ServiceError, type Actor, type RequestMeta } from "./context";
 import { recordEvent } from "./events";
@@ -157,23 +157,13 @@ function asRecord(value: unknown): Record<string, unknown> {
   return isRecord(value) ? value : {};
 }
 
-/** Checks the caller against the stored user row: a role or disabled flag in a session can be minutes old. */
+/**
+ * Any active member may look at agreements; only an owner or admin may upload,
+ * change, activate or archive one, because the agreement is what every client signs.
+ * The stored row decides, so a demotion or a disabled account takes effect at once.
+ */
 async function assertActor(db: DbOrTx, actor: Actor, need: "read" | "manage"): Promise<void> {
-  if (!actor || typeof actor !== "object" || typeof actor.orgId !== "string" || !actor.orgId) {
-    throw new ServiceError("forbidden", "Sign in to work with agreements.");
-  }
-  if (actor.type !== "user") return;
-  const [user] = await db
-    .select({ role: users.role, disabledAt: users.disabledAt })
-    .from(users)
-    .where(and(eq(users.id, actor.userId), eq(users.orgId, actor.orgId)))
-    .limit(1);
-  if (!user || user.disabledAt) {
-    throw new ServiceError("forbidden", "Your account is no longer active. Ask an owner of your company account for access.");
-  }
-  if (need === "manage" && user.role !== "owner" && user.role !== "admin") {
-    throw new ServiceError("forbidden", "Only an owner or admin can change agreements. Ask one of them to make this change.");
-  }
+  await assertActiveActor(db, actor, need);
 }
 
 async function loadOrg(db: DbOrTx, orgId: string): Promise<Org> {

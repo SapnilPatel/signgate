@@ -23,18 +23,29 @@ import {
   type Signer,
   type User,
 } from "@/lib/db/schema";
-import { env, PRODUCT_NAME } from "@/lib/env";
+import { env } from "@/lib/env";
 import { IMAGE_FIELD_TYPES, LIMITS, type Field, type FieldValues, type PageInfo } from "@/lib/types";
 import { sealDocument, stampFields, type CertificateData, type CertificateSigner } from "@/lib/pdf";
-import { parseImageDataUrl } from "@/lib/pdf/stamp";
+import { MAX_TOTAL_IMAGE_PIXELS, parseImageDataUrl } from "@/lib/pdf/stamp";
 import { cleanMultilineText, cleanText, isValidEmail, normalizeEmail } from "@/lib/validation";
 import { ServiceError, systemActor, type RequestMeta } from "./context";
-import { resolveSettings } from "./accounts";
+import { externalEmailHold, resolveSettings } from "./accounts";
 import { getBlob, getBlobUnscopedForSigningLink, putBlob } from "./blobs";
 import { describeEvent, listEvents, recordEvent, type EventActor } from "./events";
 import { enqueueWebhookEvent } from "./webhooks";
 import { attachmentsFit, sendEmail } from "./email";
-import { completedEmail, countersignRequestEmail, declinedEmail, escapeHtml, voidedEmail, type Brand, type EmailContent } from "./email-templates";
+import {
+  agreementNotCompletedEmail,
+  completedEmail,
+  countersignOverdueEmail,
+  countersignRequestEmail,
+  declinedEmail,
+  finalCopyFailedEmail,
+  linkExpiredEmail,
+  voidedEmail,
+  type Brand,
+  type EmailContent,
+} from "./email-templates";
 import { describeWait, rateLimit } from "./rate-limit";
 import { resolveCountersigner } from "./templates";
 import { findSignerBySecret, mintSigningToken, signingUrl } from "./tokens";
@@ -50,6 +61,8 @@ export const AWAITING_CLIENT_STATUSES: EnvelopeStatus[] = ["draft", "sent", "vie
 
 /** Recorded on the audit trail each time sealing fails; the scheduler backs off between attempts. */
 export const FINALIZE_FAILED_EVENT = "envelope.finalize_failed";
+/** Recorded once per thing the sealed copy shows differently from what was entered. */
+export const SEAL_WARNING_EVENT = "envelope.seal_warning";
 /** First retry waits this long; each further failure doubles the wait, up to the cap. */
 export const FINALIZE_RETRY_BASE_MS = 5 * 60_000;
 export const FINALIZE_RETRY_MAX_MS = 6 * 3_600_000;
@@ -141,15 +154,84 @@ function signerActor(signer: Pick<Signer, "name" | "email">): EventActor {
   return { type: "signer", label: signerLabel(signer) };
 }
 
-export type SendOutcome = { status: "sent" | "failed" | "skipped"; error?: string };
+export type SendOutcome = {
+  status: "sent" | "failed" | "skipped";
+  error?: string;
+  /** True when the message was held because the company's owner has not confirmed their email address. `error` then says so. */
+  unverified?: boolean;
+};
 
-/** sendEmail does not throw, but a notification must never be able to fail the action behind it. */
-export async function safeSend(org: Org, msg: Omit<Parameters<typeof sendEmail>[0], "orgId" | "fromName" | "replyTo">): Promise<SendOutcome> {
+/**
+ * Every email sent in a company's name goes through here. sendEmail does not throw,
+ * but a notification must never be able to fail the action behind it.
+ *
+ * This is also where the verification gate lives: a message to someone outside the
+ * company is held (logged as skipped, never sent) until an owner has confirmed
+ * their address, so one rule covers requests, reminders, notices and signed copies.
+ */
+export async function safeSend(org: Org, msg: Omit<Parameters<typeof sendEmail>[0], "orgId" | "fromName" | "replyTo" | "holdReason">): Promise<SendOutcome> {
   try {
-    const result = await sendEmail({ ...msg, orgId: org.id, fromName: org.name, replyTo: resolveSettings(org).replyToEmail });
+    const hold = await externalEmailHold(await getDb(), org.id, msg.to);
+    const result = await sendEmail({ ...msg, orgId: org.id, fromName: org.name, replyTo: resolveSettings(org).replyToEmail, ...(hold ? { holdReason: hold } : {}) });
+    if (hold) return { status: "skipped", error: hold, unverified: true };
     return { status: result.status, error: result.error };
   } catch (err) {
     return { status: "failed", error: err instanceof Error ? err.message : "The email could not be sent." };
+  }
+}
+
+/**
+ * Who hears that an agreement is stuck on the company's side: whoever sent it and
+ * an owner, leaving out the person who was already asked and did not act.
+ */
+export async function escalationRecipients(
+  db: DbOrTx,
+  envelope: Pick<Envelope, "orgId" | "createdBy">,
+  excludeUserId?: string | null,
+): Promise<Pick<User, "id" | "name" | "email">[]> {
+  const active = await db
+    .select({ id: users.id, name: users.name, email: users.email, role: users.role })
+    .from(users)
+    .where(and(eq(users.orgId, envelope.orgId), isNull(users.disabledAt)))
+    .orderBy(asc(users.createdAt));
+  const others = active.filter((u) => u.id !== excludeUserId);
+  const picked = [others.find((u) => u.id === envelope.createdBy), others.find((u) => u.role === "owner") ?? others.find((u) => u.role === "admin")].filter(
+    (u): u is (typeof active)[number] => Boolean(u),
+  );
+  const unique = picked.filter((u, i) => picked.findIndex((o) => o.id === u.id) === i);
+  if (unique.length > 0) return unique;
+  // A one-person company: the only one who can act is the one who was asked.
+  const fallback = await teamRecipient(db, envelope);
+  return fallback ? [fallback] : [];
+}
+
+/** Tell the team that the company's own signature is what an agreement is waiting on. Best effort. */
+export async function notifyCountersignOverdue(
+  ctx: EnvelopeContext,
+  opts: { countersigner?: Pick<Signer, "name" | "userId"> | null; reason?: string | null } = {},
+): Promise<void> {
+  try {
+    const db = await getDb();
+    const client = ctx.signers.find((s) => s.role === "client");
+    for (const person of await escalationRecipients(db, ctx.envelope, opts.countersigner?.userId)) {
+      await safeSend(ctx.org, {
+        envelopeId: ctx.envelope.id,
+        kind: "countersign_overdue",
+        to: person.email,
+        ...countersignOverdueEmail({
+          brand: brandOf(ctx.org),
+          recipientName: person.name,
+          clientName: client?.name ?? ctx.file.clientName,
+          agreementName: ctx.envelope.templateName,
+          fileReference: ctx.file.reference,
+          countersignerName: opts.countersigner?.name,
+          reason: opts.reason,
+          fileUrl: fileUrl(ctx.file.id),
+        }),
+      });
+    }
+  } catch (err) {
+    console.error("[signing] could not send the countersign overdue email", err instanceof Error ? err.message : err);
   }
 }
 
@@ -320,6 +402,15 @@ function isoDateToLong(value: string): string | null {
 export type ValidatedValues = { ok: true; values: FieldValues } | { ok: false; errors: Record<string, string> };
 
 /**
+ * Pixels of distinct signature and initials images one signer may submit. The
+ * document engine embeds at most MAX_TOTAL_IMAGE_PIXELS in one sealed copy and
+ * leaves out whatever exceeds it; an envelope has at most two signers, so giving
+ * each half means a sealed copy never silently lacks a signature, and one signer
+ * cannot use up the other's share.
+ */
+export const MAX_SIGNER_IMAGE_PIXELS = MAX_TOTAL_IMAGE_PIXELS / 2;
+
+/**
  * Check submitted values against ONE signer's fields. Ids that are not among
  * `ownFields` are rejected, which is what stops a client filling in the company's
  * side or overwriting a prefilled value.
@@ -345,6 +436,8 @@ export function validateSignerValues(ownFields: Field[], raw: unknown, defaults:
   }
 
   const values: FieldValues = {};
+  // The same drawing reused across fields is embedded once, so it is counted once.
+  const imagePixels = new Map<string, number>();
   for (const field of ownFields) {
     const label = cleanText(field.label, 80) || "This field";
     let given: unknown;
@@ -381,7 +474,9 @@ export function validateSignerValues(ownFields: Field[], raw: unknown, defaults:
         errors[field.id] = image.reason;
         continue;
       }
-      values[field.id] = `data:image/png;base64,${Buffer.from(image.bytes).toString("base64")}`;
+      const dataUrl = `data:image/png;base64,${Buffer.from(image.bytes).toString("base64")}`;
+      imagePixels.set(dataUrl, image.width * image.height);
+      values[field.id] = dataUrl;
       continue;
     }
 
@@ -419,6 +514,13 @@ export function validateSignerValues(ownFields: Field[], raw: unknown, defaults:
       continue;
     }
     values[field.id] = field.type === "date" ? (isoDateToLong(text) ?? text) : text;
+  }
+
+  let totalPixels = 0;
+  for (const pixels of imagePixels.values()) totalPixels += pixels;
+  if (totalPixels > MAX_SIGNER_IMAGE_PIXELS) {
+    errors._form =
+      "The signature and initials images on this form are too large in total to be placed on the document. Use the same signature and the same initials for every field, or draw them smaller, then try again.";
   }
 
   return Object.keys(errors).length ? { ok: false, errors } : { ok: true, values };
@@ -900,6 +1002,8 @@ export interface RecordSignatureOutcome {
   /** The company signer who now needs to be asked, when countersigning is manual. */
   notify: Signer | null;
   allSigned: boolean;
+  /** Set when the client signed and nobody on the team can countersign; the team is told after commit. */
+  unassigned?: boolean;
 }
 
 /**
@@ -970,6 +1074,7 @@ export async function recordSignature(input: RecordSignatureInput): Promise<Reco
     const others = await tx.select().from(signers).where(and(eq(signers.envelopeId, ctx.envelope.id), ne(signers.id, signer.id))).orderBy(asc(signers.order));
     const pending = others.filter((s) => s.status !== "signed");
     let notify: Signer | null = null;
+    let unassigned = false;
 
     if (isClient) {
       await enqueueWebhookEvent(
@@ -1026,8 +1131,9 @@ export async function recordSignature(input: RecordSignatureInput): Promise<Reco
             ...base,
             type: "countersign.unassigned",
             actor: systemActor(ctx.org.id),
-            data: { signerId: waiting.id, reason: "Nobody on the team is available to countersign. Choose a countersigner in Settings" },
+            data: { signerId: waiting.id, reason: "Choose a countersigner in Settings, or have an owner or admin countersign from the file" },
           });
+          unassigned = true;
         } else {
           let auto: FieldValues | null = null;
           const zone = orgTimeZone(org);
@@ -1067,7 +1173,7 @@ export async function recordSignature(input: RecordSignatureInput): Promise<Reco
       }
     }
 
-    return { notify, allSigned: pending.length === 0 };
+    return { notify, allSigned: pending.length === 0, unassigned };
   });
 }
 
@@ -1168,6 +1274,10 @@ export async function afterSignature(envelopeId: string, outcome: RecordSignatur
   if (outcome.notify) {
     const ctx = await loadEnvelopeContext(db, envelopeId);
     if (ctx) await emailCountersigner(ctx, outcome.notify);
+  }
+  if (outcome.unassigned) {
+    const ctx = await loadEnvelopeContext(db, envelopeId);
+    if (ctx) await notifyCountersignOverdue(ctx, { reason: "Nobody on your team is set up to countersign, so nobody has been asked" });
   }
   if (outcome.allSigned) await finalizeEnvelope(envelopeId);
   const ctx = await loadEnvelopeContext(db, envelopeId);
@@ -1295,26 +1405,61 @@ const METHOD_TEXT: Record<string, string> = {
 };
 
 async function recordFinalizeFailure(ctx: EnvelopeContext, error: string): Promise<void> {
+  let first = false;
   try {
     const db = await getDb();
-    await inTransaction(db, async (tx) => {
+    first = await inTransaction(db, async (tx) => {
       await lockFile(tx, ctx.org.id, ctx.file.id);
+      // Under the file lock, so two failing attempts cannot both think they are the first.
+      const [earlier] = await tx
+        .select({ id: eventsTable.id })
+        .from(eventsTable)
+        .where(and(eq(eventsTable.envelopeId, ctx.envelope.id), eq(eventsTable.type, FINALIZE_FAILED_EVENT)))
+        .limit(1);
       await recordEvent(tx, {
         orgId: ctx.org.id,
         fileId: ctx.file.id,
         envelopeId: ctx.envelope.id,
         type: FINALIZE_FAILED_EVENT,
         actor: systemActor(ctx.org.id),
-        data: { error },
+        data: { reason: error },
       });
       // Signed but not sealed is exactly what "needs attention" is for.
       await tx
         .update(files)
         .set({ agreementStatus: "needs_attention", updatedAt: new Date() })
         .where(and(eq(files.id, ctx.file.id), inArray(files.agreementStatus, ["out_for_signature", "awaiting_countersign"])));
+      return !earlier;
     });
   } catch (err) {
     console.error("[signing] could not record finalize failure", err instanceof Error ? err.message : err);
+  }
+  // Sealing is retried many times; the team hears about it once, not on every attempt.
+  if (first) await notifyFinalCopyFailed(ctx, error);
+}
+
+async function notifyFinalCopyFailed(ctx: EnvelopeContext, error: string): Promise<void> {
+  try {
+    const db = await getDb();
+    const client = ctx.signers.find((s) => s.role === "client");
+    for (const person of await escalationRecipients(db, ctx.envelope)) {
+      await safeSend(ctx.org, {
+        envelopeId: ctx.envelope.id,
+        kind: "final_copy_failed",
+        to: person.email,
+        ...finalCopyFailedEmail({
+          brand: brandOf(ctx.org),
+          recipientName: person.name,
+          clientName: client?.name ?? ctx.file.clientName,
+          agreementName: ctx.envelope.templateName,
+          fileReference: ctx.file.reference,
+          error,
+          fileUrl: fileUrl(ctx.file.id),
+        }),
+      });
+    }
+  } catch (err) {
+    console.error("[signing] could not send the final copy failed email", err instanceof Error ? err.message : err);
   }
 }
 
@@ -1411,6 +1556,18 @@ export async function finalizeEnvelope(envelopeId: string): Promise<FinalizeResu
           actor: systemActor(current.org.id),
           data: { sha256: sealed.sha256 },
         });
+        // Anything the sealed copy shows differently from what was entered goes on the
+        // file's timeline with the completion, so the sender is never the last to know.
+        for (const warning of Array.isArray(sealed.warnings) ? sealed.warnings.slice(0, 50) : []) {
+          await recordEvent(tx, {
+            orgId: current.org.id,
+            fileId: current.file.id,
+            envelopeId: current.envelope.id,
+            type: SEAL_WARNING_EVENT,
+            actor: systemActor(current.org.id),
+            data: { code: warning.code, ...(warning.fieldId ? { fieldId: warning.fieldId } : {}), reason: cleanText(warning.message, 300) },
+          });
+        }
         await enqueueWebhookEvent(
           tx,
           current.org.id,
@@ -1482,7 +1639,7 @@ async function sendCompletedEmails(ctx: EnvelopeContext, pdf: Uint8Array): Promi
         attachments: attached ? attachments : undefined,
       });
       outcomes.push({ to: r.email, status: result.status });
-      if (result.status === "failed") {
+      if (result.status === "failed" || result.unverified) {
         await recordEvent(db, {
           orgId: ctx.org.id,
           fileId: ctx.file.id,
@@ -1566,33 +1723,8 @@ export function linkDeadEmail(
   input: { brand: Brand; signerName: string; agreementName: string; reason?: string | null; expiredOn?: string | null },
 ): EmailContent {
   if (kind === "voided") return voidedEmail(input);
-  const org = cleanText(input.brand.orgName, 120) || "Your service provider";
-  const agreement = cleanText(input.agreementName, 200) || "the agreement";
-  const name = cleanText(input.signerName, 120);
-  const on = cleanText(input.expiredOn, 40);
-  const subject = kind === "expired" ? `Your signing link for ${agreement} has expired` : `${agreement} with ${org} was not completed`;
-  const paragraphs =
-    kind === "expired"
-      ? [
-          name ? `Hi ${name},` : "Hello,",
-          `The link ${org} sent you to sign ${agreement} expired${on ? ` on ${on}` : ""} before the agreement was signed, so it no longer works.`,
-          `If you still want to sign, contact ${org} and ask them to send the agreement again. You will get a new link.`,
-        ]
-      : [
-          name ? `Hi ${name},` : "Hello,",
-          `You signed ${agreement}, but ${org} did not countersign it, so the agreement was not completed and is not in effect.`,
-          `The link you were sent no longer works. Contact ${org} if you were expecting the agreement to go ahead.`,
-        ];
-  const footer = `Sent by ${org} through ${PRODUCT_NAME}, the service ${org} uses to get agreements signed.`;
-  const font = "font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif;";
-  const html =
-    `<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><title>${escapeHtml(subject)}</title></head>` +
-    `<body style="margin:0;padding:24px;background-color:#ffffff;">` +
-    `<p style="${font}font-size:18px;font-weight:bold;color:#111827;margin:0 0 16px;">${escapeHtml(org)}</p>` +
-    paragraphs.map((text) => `<p style="${font}font-size:16px;line-height:24px;color:#1f2937;margin:0 0 16px;">${escapeHtml(text)}</p>`).join("") +
-    `<p style="${font}font-size:12px;line-height:18px;color:#6b7280;margin:24px 0 0;">${escapeHtml(footer)}</p>` +
-    `</body></html>`;
-  return { subject, html, text: [...paragraphs, "--", footer].join("\n\n") + "\n" };
+  if (kind === "expired") return linkExpiredEmail(input);
+  return agreementNotCompletedEmail(input);
 }
 
 // ---------------------------------------------------------------------------

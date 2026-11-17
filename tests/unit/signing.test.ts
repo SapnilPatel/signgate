@@ -3,7 +3,7 @@ import { deflateSync } from "node:zlib";
 import { and, asc, eq } from "drizzle-orm";
 import { PDFDocument } from "pdf-lib";
 
-const seal = vi.hoisted(() => ({ fail: false, calls: 0 }));
+const seal = vi.hoisted(() => ({ fail: false, calls: 0, warnings: [] as { code: "characters_replaced" | "image_skipped"; fieldId?: string; message: string }[] }));
 vi.mock("@/lib/pdf", async (importOriginal) => {
   const real = await importOriginal<typeof import("@/lib/pdf")>();
   return {
@@ -11,7 +11,8 @@ vi.mock("@/lib/pdf", async (importOriginal) => {
     sealDocument: async (input: Parameters<typeof real.sealDocument>[0]) => {
       seal.calls++;
       if (seal.fail) throw new Error("simulated sealing failure");
-      return real.sealDocument(input);
+      const sealed = await real.sealDocument(input);
+      return { ...sealed, warnings: [...sealed.warnings, ...seal.warnings] };
     },
   };
 });
@@ -24,9 +25,11 @@ import { ServiceError, type Actor } from "@/lib/services/context";
 import { putBlob } from "@/lib/services/blobs";
 import { clearTestOutbox, getTestOutbox } from "@/lib/services/email";
 import { sendAgreementForFile, voidEnvelope } from "@/lib/services/envelopes";
-import { FINALIZE_FAILED_EVENT, calendarParts, inTransaction, isRetryableTxError, linkDeadEmail, orgTimeZone, declineSigning, finalizeEnvelope, getSignedCopy, getSigningDocument, getSigningSession, listUnsealedEnvelopeIds, longDate, maskEmail, signedDateLabel, submitSigning, validateSignerValues, verifyDocument } from "@/lib/services/signing";
+import { FINALIZE_FAILED_EVENT, MAX_SIGNER_IMAGE_PIXELS, SEAL_WARNING_EVENT, calendarParts, inTransaction, isRetryableTxError, linkDeadEmail, orgTimeZone, declineSigning, finalizeEnvelope, getSignedCopy, getSigningDocument, getSigningSession, listUnsealedEnvelopeIds, longDate, maskEmail, signedDateLabel, submitSigning, validateSignerValues, verifyDocument } from "@/lib/services/signing";
 import { findSignerBySecret, hashSigningSecret, signingSecret, signingUrl } from "@/lib/services/tokens";
 import { runScheduledJobs } from "@/lib/services/jobs";
+import { describeEvent, listEvents } from "@/lib/services/events";
+import { MAX_TOTAL_IMAGE_PIXELS } from "@/lib/pdf/stamp";
 
 // ---------------------------------------------------------------------------
 // Fixtures (test data only; duplicated across the lifecycle test files on purpose,
@@ -129,7 +132,8 @@ async function makeWorld(opts: { company?: boolean; settings?: OrgSettings; fiel
     .insert(orgs)
     .values({ id: newId("org"), name: `Northwind Test ${n}`, legalName: `Northwind Test ${n} Ltd`, slug: `northwind-${n}`, settings: opts.settings ?? {} })
     .returning();
-  const owner = await addUser(org.id, "owner");
+  // Verified, as every owner is once they have used their confirmation link; without it client emails are held.
+  const owner = await addUser(org.id, "owner", { emailVerifiedAt: new Date() });
   const blob = await putBlob(db, { orgId: org.id, bytes: await makePdf(), contentType: "application/pdf", filename: "agreement.pdf" });
   const fields = opts.fields ?? [...prefillFields(), ...clientFields(), ...(opts.company ? companyFields() : [])];
   const [template] = await db
@@ -224,6 +228,7 @@ const sign = (secret: string, extra: Record<string, unknown> = {}, input: Record
 beforeEach(() => {
   clearTestOutbox();
   seal.fail = false;
+  seal.warnings = [];
 });
 
 // ---------------------------------------------------------------------------
@@ -765,6 +770,16 @@ describe("when sealing fails", () => {
     expect((await fileRow(file.id)).agreementStatus).toBe("needs_attention");
     expect(count(await eventTypes(envelopeId), FINALIZE_FAILED_EVENT)).toBe(1);
     expect(getTestOutbox().filter((m) => m.kind === "completed")).toHaveLength(0);
+    // The team is told once that the copy is stuck, with what went wrong; the client is not.
+    const [stuck, ...more] = mailTo(world.owner.email, "final_copy_failed");
+    expect(more).toHaveLength(0);
+    expect(stuck.subject).toMatch(/final copy could not be produced/);
+    expect(stuck.text).toMatch(/simulated sealing failure/);
+    expect(stuck.text).toContain(`/files/${file.id}`);
+    expect(mailTo(file.clientEmail, "final_copy_failed")).toHaveLength(0);
+    const failure = (await listEvents(world.org.id, { envelopeId })).find((e) => e.type === FINALIZE_FAILED_EVENT);
+    expect(failure?.data).toEqual({ reason: "simulated sealing failure" });
+    expect(describeEvent(failure!)).toBe("The final signed copy could not be produced; it will be retried automatically: simulated sealing failure");
     expect((await getSigningSession(secret)).state).toBe("signed");
     await expectServiceError(getSignedCopy(secret), "not_ready");
     // A retry by the signer does not sign again.
@@ -806,6 +821,8 @@ describe("when sealing fails", () => {
       expect((await runScheduledJobs(at(wait + 1))).finalized).toEqual({ completed: 0, failed: 1 });
     }
     expect(count(await eventTypes(envelopeId), FINALIZE_FAILED_EVENT)).toBe(10);
+    // Ten failures, one email: the team is not written to on every retry.
+    expect(mailTo(world.owner.email, "final_copy_failed")).toHaveLength(1);
     expect((await envelopeRow(envelopeId)).status).toBe("client_signed");
     expect((await signerRows(envelopeId))[0].status).toBe("signed");
 
@@ -1111,4 +1128,76 @@ describe("what a signer is told when a link dies", () => {
     const bare = linkDeadEmail("expired", { brand: { orgName: "" }, signerName: "", agreementName: "" });
     expect(`${bare.subject} ${bare.text}`).not.toMatch(/undefined|null/);
   });
+});
+
+describe("what the sealed copy shows differently is put on the file's timeline", () => {
+  it("records one event per warning, with the completion and never twice", async () => {
+    const world = await makeWorld();
+    const { envelopeId, secret } = await sendOne(world);
+    seal.warnings = [
+      { code: "characters_replaced", fieldId: "c_note", message: 'The value of "Note" contains 2 characters the document font cannot draw; they are shown as boxes.' },
+      { code: "image_skipped", fieldId: "c_sig", message: 'The image for "Client signature" was left out because too many different images were supplied.' },
+    ];
+    expect((await sign(secret)).completed).toBe(true);
+
+    const trail = await listEvents(world.org.id, { envelopeId });
+    const warnings = trail.filter((e) => e.type === SEAL_WARNING_EVENT);
+    expect(warnings.map((w) => w.data)).toEqual([
+      { code: "characters_replaced", fieldId: "c_note", reason: seal.warnings[0].message },
+      { code: "image_skipped", fieldId: "c_sig", reason: seal.warnings[1].message },
+    ]);
+    expect(warnings.every((w) => w.actorType === "system")).toBe(true);
+    expect(describeEvent(warnings[0])).toMatch(/^The signed copy shows something differently from what was entered: The value of "Note"/);
+    // After the completion they belong to, in the same transaction.
+    expect(trail.findIndex((e) => e.type === "envelope.completed")).toBeLessThan(trail.findIndex((e) => e.type === SEAL_WARNING_EVENT));
+
+    // Finalizing again is a no-op and adds nothing.
+    expect(await finalizeEnvelope(envelopeId)).toEqual({ status: "completed", alreadyCompleted: true });
+    expect(count(await eventTypes(envelopeId), SEAL_WARNING_EVENT)).toBe(2);
+  });
+
+  it("records nothing for a clean seal", async () => {
+    const world = await makeWorld();
+    const { envelopeId, secret } = await sendOne(world);
+    await sign(secret);
+    expect(count(await eventTypes(envelopeId), SEAL_WARNING_EVENT)).toBe(0);
+  });
+});
+
+describe("a submission cannot carry more image than a sealed copy can hold", () => {
+  const big = (i: number) => `data:image/png;base64,${makePng(1500, 1000 - i).toString("base64")}`;
+  const sigFields = Array.from({ length: 9 }, (_, i) => field(`s${i}`, i % 2 ? "initials" : "signature", "client", true));
+
+  it("gives each signer half of what the document engine will embed", () => {
+    expect(MAX_SIGNER_IMAGE_PIXELS * 2).toBe(MAX_TOTAL_IMAGE_PIXELS);
+  });
+
+  it("accepts the same large image in every field, because it is embedded once", () => {
+    const values = Object.fromEntries(sigFields.map((f) => [f.id, big(0)]));
+    expect(validateSignerValues(sigFields, values, {}, "15 November 2026").ok).toBe(true);
+  });
+
+  it("accepts distinct images up to the limit and rejects the submission that goes over", () => {
+    const eight = Object.fromEntries(sigFields.slice(0, 8).map((f, i) => [f.id, big(i)]));
+    expect(validateSignerValues(sigFields.slice(0, 8), eight, {}, "15 November 2026").ok).toBe(true);
+
+    const nine = Object.fromEntries(sigFields.map((f, i) => [f.id, big(i)]));
+    const result = validateSignerValues(sigFields, nine, {}, "15 November 2026");
+    expect(result.ok).toBe(false);
+    if (!result.ok) {
+      expect(Object.keys(result.errors)).toEqual(["_form"]);
+      expect(result.errors._form).toMatch(/too large in total/);
+      expect(result.errors._form).toMatch(/same signature/);
+    }
+  });
+
+  it("refuses such a submission at the signing link and leaves the envelope unsigned", async () => {
+    const world = await makeWorld({ fields: sigFields });
+    const { envelopeId, secret } = await sendOne(world);
+    const nine = Object.fromEntries(sigFields.map((f, i) => [f.id, big(i)]));
+    const err = await expectServiceError(submitSigning(secret, { values: nine, consent: true }), "invalid");
+    expect(err.fields?._form).toMatch(/too large in total/);
+    expect((await signerRows(envelopeId))[0].status).toBe("sent");
+    expect((await submitSigning(secret, { values: Object.fromEntries(sigFields.map((f) => [f.id, SIGNATURE])), consent: true })).completed).toBe(true);
+  }, 60_000);
 });

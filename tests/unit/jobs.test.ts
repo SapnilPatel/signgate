@@ -128,7 +128,8 @@ async function makeWorld(opts: { company?: boolean; settings?: OrgSettings; fiel
     .insert(orgs)
     .values({ id: newId("org"), name: `Northwind Test ${n}`, legalName: `Northwind Test ${n} Ltd`, slug: `northwind-${n}`, settings: opts.settings ?? {} })
     .returning();
-  const owner = await addUser(org.id, "owner");
+  // Verified, as every owner is once they have used their confirmation link; without it client emails are held.
+  const owner = await addUser(org.id, "owner", { emailVerifiedAt: new Date() });
   const blob = await putBlob(db, { orgId: org.id, bytes: await makePdf(), contentType: "application/pdf", filename: "agreement.pdf" });
   const fields = opts.fields ?? [...prefillFields(), ...clientFields(), ...(opts.company ? companyFields() : [])];
   const [template] = await db
@@ -561,6 +562,16 @@ describe("chasing the countersigner", () => {
     expect(count(await eventTypes(envelopeId), "countersign.overdue")).toBe(1);
     const trail = (await getEnvelope(world.actor, envelopeId)).events;
     expect(String(trail.find((e) => e.type === "countersign.overdue")?.data.reason)).toMatch(/has not countersigned after 2 reminders/);
+    expect(trail.find((e) => e.type === "countersign.overdue")?.description).toMatch(/^Countersignature overdue: .* has not countersigned after 2 reminders/);
+    // Whoever sent it hears once that the company's signature is what the client is waiting on; the person already asked does not get another email.
+    const [overdue, ...extra] = mailTo(world.owner.email, "countersign_overdue");
+    expect(extra).toHaveLength(0);
+    expect(overdue.subject).toMatch(/^Countersignature overdue/);
+    expect(overdue.text).toContain(admin.name);
+    expect(overdue.text).toMatch(/after 2 reminders/);
+    expect(overdue.text).toContain(`/files/${file.id}`);
+    expect(mailTo(admin.email, "countersign_overdue")).toHaveLength(0);
+    expect(mailTo(file.clientEmail, "countersign_overdue")).toHaveLength(0);
     const later = await runScheduledJobs(inDays(45));
     expect(later.countersign).toEqual({ reminded: 0, failed: 0, escalated: 0 });
     expect(later.expired).toBe(0);

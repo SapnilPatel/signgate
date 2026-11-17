@@ -358,10 +358,14 @@ export async function setWebhookActive(actor: Actor, id: string, active: boolean
   return summarize(row);
 }
 
-/** Recent deliveries for the org, newest first, optionally for one webhook. */
+/**
+ * Recent deliveries for the org, newest first, optionally for one webhook. Owners
+ * and admins only: a delivery row holds the full payload, client names and emails
+ * included, for every file in the company.
+ */
 export async function listDeliveries(actor: Actor, opts: { webhookId?: string; limit?: number } = {}): Promise<WebhookDelivery[]> {
   const db = await getDb();
-  await assertActiveActor(db, actor, "read");
+  await assertActiveActor(db, actor, "manage");
   const conditions: SQL[] = [eq(webhookDeliveries.orgId, actor.orgId)];
   if (typeof opts.webhookId === "string" && opts.webhookId) conditions.push(eq(webhookDeliveries.webhookId, opts.webhookId));
   return db

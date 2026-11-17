@@ -765,9 +765,28 @@ describe("permissions follow the stored user, not the session's copy", () => {
     await expect(setWebhookActive(stale, hook.id, false)).rejects.toMatchObject({ code: "forbidden" });
     await expect(sendTestEvent(stale, hook.id, { send: recorder().send, ...prod() })).rejects.toMatchObject({ code: "forbidden" });
     await expect(deleteWebhook(stale, hook.id)).rejects.toMatchObject({ code: "forbidden" });
-    // Still on the team, so reading is fine.
+    // Still on the team, so the list of endpoints is fine; the delivery log holds client data and is not.
     expect(await listWebhooks(stale)).toHaveLength(1);
-    expect(await listDeliveries(stale)).toEqual([]);
+    await expect(listDeliveries(stale)).rejects.toMatchObject({ code: "forbidden" });
+  });
+
+  it("shows the delivery log, which holds client details, to owners and admins only", async () => {
+    const db = await getDb();
+    const orgId = await makeOrg();
+    await createWebhook(actorFor(orgId), "https://hooks.example.com/in", prod());
+    await enqueueWebhookEvent(db, orgId, "file.created", { fileId: "fil_1", clientName: "Test Client" });
+    expect(await listDeliveries(actorFor(orgId, "owner"))).toHaveLength(1);
+    expect(await listDeliveries(actorFor(orgId, "admin"))).toHaveLength(1);
+    const refused = await listDeliveries(actorFor(orgId, "member")).then(
+      () => null,
+      (e: unknown) => e as { code: string; message: string },
+    );
+    expect(refused).toMatchObject({ code: "forbidden" });
+    expect(refused?.message).toMatch(/owner or admin/);
+    // A member who claims to be an owner in a stale session is still read from the stored row.
+    await expect(listDeliveries({ ...actorFor(orgId, "member"), role: "owner" } as Actor)).rejects.toMatchObject({ code: "forbidden" });
+    // The badge count carries no client data and stays visible to the team.
+    expect(await countDeliveriesByStatus(actorFor(orgId, "member"))).toMatchObject({ pending: 1 });
   });
 
   it("refuses a disabled person every call, including the delivery log", async () => {

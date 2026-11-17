@@ -6,7 +6,7 @@
  * reads and writes only rows whose org_id is actor.orgId; an id from another company
  * behaves exactly like an id that does not exist.
  */
-import { and, asc, count, eq, gt, isNull } from "drizzle-orm";
+import { and, asc, count, eq, gt, isNull, sql } from "drizzle-orm";
 import { getDb, type DbOrTx, type Tx } from "@/lib/db";
 import { apiKeys, authTokens, orgs, sessions, users, type Org, type User } from "@/lib/db/schema";
 import { hashPassword, verifyPassword, PASSWORD_MAX_LENGTH, PASSWORD_MIN_LENGTH } from "@/lib/auth/password";
@@ -20,12 +20,15 @@ import {
   isValidEmail,
   normalizeEmail,
   normalizeHexColor,
+  normalizeTimeZone,
   parseImageDataUrl,
 } from "@/lib/validation";
+import { parseImageDataUrl as parseSignatureImage } from "@/lib/pdf/stamp";
 import { ServiceError, type Actor, type RequestMeta } from "./context";
-import { sendEmail } from "./email";
+import { emailIsConfigured, sendEmail } from "./email";
+import { revokeCountersignLinksForUser } from "./envelopes";
 import { recordEvent, type EventActor } from "./events";
-import { inviteEmail, inviteExistingAccountEmail, passwordResetEmail, signInAlertEmail } from "./email-templates";
+import { inviteEmail, inviteExistingAccountEmail, passwordResetEmail, signInAlertEmail, verifyEmailEmail } from "./email-templates";
 import { clearRateLimit, clearRateLimitPrefix, describeWait, rateLimit } from "./rate-limit";
 
 // ---------------------------------------------------------------------------
@@ -45,6 +48,8 @@ export interface Member {
   role: Role;
   disabled: boolean;
   hasSignature: boolean;
+  /** True once this person has proved they control their mailbox. */
+  emailVerified: boolean;
   createdAt: Date;
 }
 
@@ -74,7 +79,10 @@ export interface InviteResult {
   /** The join link. Returned so it can be copied by hand when email is not configured or fails. */
   url: string;
   emailStatus: "sent" | "failed" | "skipped";
+  /** Why the email did not go, including "the owner has not confirmed their email address yet". */
   emailError?: string;
+  /** True when the invitation was not emailed because the company's owner has not confirmed their address. */
+  emailUnverified?: boolean;
 }
 
 export interface InviteDetails {
@@ -102,12 +110,14 @@ export const ACCOUNT_LIMITS = {
   logoMaxBytes: 200 * 1024,
   resetTokenMinutes: 60,
   inviteDays: 7,
+  verifyEmailHours: 48,
 } as const;
 
 /** Paths of the pages that consume the emailed tokens. */
 export const forgotPasswordUrl = () => `${env.appUrl}/forgot-password`;
 export const resetPasswordUrl = (token: string) => `${env.appUrl}/reset-password/${token}`;
 export const inviteUrl = (token: string) => `${env.appUrl}/invite/${token}`;
+export const verifyEmailUrl = (token: string) => `${env.appUrl}/verify-email/${token}`;
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -123,6 +133,7 @@ function toMember(u: User): Member {
     role: u.role,
     disabled: u.disabledAt !== null,
     hasSignature: Boolean(u.savedSignature),
+    emailVerified: u.emailVerifiedAt !== null,
     createdAt: u.createdAt,
   };
 }
@@ -310,6 +321,7 @@ const SETTING_KEYS = [
   "countersignerUserId",
   "fileReferencePrefix",
   "emailMessage",
+  "timeZone",
 ] as const satisfies readonly (keyof OrgSettings)[];
 
 const INT_RANGES = {
@@ -422,6 +434,12 @@ function validateSettingsPatch(patch: unknown, fields: Record<string, string>): 
         else clear.push(k);
         break;
       }
+      case "timeZone": {
+        const zone = normalizeTimeZone(raw);
+        if (zone) set[k] = zone;
+        else fields[k] = "Choose a time zone from the list, for example America/Toronto or Europe/London.";
+        break;
+      }
     }
   }
   return { set: set as OrgSettings, clear };
@@ -513,11 +531,39 @@ async function releaseCountersigner(tx: Tx, org: Org, userId: string, opts: { ke
 
 const DUPLICATE_EMAIL = "An account with this email already exists. Sign in instead, or reset your password.";
 
-/** Creates a company and its owner. The caller starts the session with user.id. */
+/** Address used for rate limits; callers whose address the route could not determine share one counter. */
+function sourceOf(meta?: RequestMeta): { ip: string; known: boolean } {
+  const ip = typeof meta?.ip === "string" ? meta.ip.trim().toLowerCase().slice(0, 64) : "";
+  return ip ? { ip, known: true } : { ip: "unknown", known: false };
+}
+
+/**
+ * The shared "unknown" counter stands for every caller without an address at once, so
+ * it gets a higher ceiling than one network would: a missing header must never mean
+ * "no limit", and it must not let one such caller lock out all the others either.
+ */
+const UNKNOWN_SOURCE_FACTOR = 10;
+
+async function limitBySource(action: string, meta: RequestMeta | undefined, limit: number, windowSeconds: number) {
+  const source = sourceOf(meta);
+  return rateLimit(`${action}:ip:${source.ip}`, source.known ? limit : limit * UNKNOWN_SOURCE_FACTOR, windowSeconds);
+}
+
+export interface SignUpResult {
+  user: Member;
+  org: Org;
+  /** What happened to the "confirm your email address" message. "skipped" when email is not set up. */
+  verificationEmail: "sent" | "failed" | "skipped";
+}
+
+/**
+ * Creates a company and its owner. The caller starts the session with user.id.
+ * `timeZone` is the browser's IANA zone; it is stored when valid and ignored otherwise.
+ */
 export async function signUp(
-  input: { orgName: unknown; name: unknown; email: unknown; password: unknown },
+  input: { orgName: unknown; name: unknown; email: unknown; password: unknown; timeZone?: unknown },
   meta?: RequestMeta,
-): Promise<{ user: Member; org: Org }> {
+): Promise<SignUpResult> {
   const raw = asRecord(input);
   const fields: Record<string, string> = {};
   const orgName = requiredText(raw.orgName, ACCOUNT_LIMITS.orgNameMax, "orgName", "your company name", fields);
@@ -528,13 +574,13 @@ export async function signUp(
   if (pw) fields.password = pw;
   if (Object.keys(fields).length > 0) throw invalid(fields);
 
-  if (meta?.ip) {
-    // Each sign-up costs a password hash and creates a tenant; cap what one address can do.
-    const limit = await rateLimit(`signup:ip:${meta.ip}`, 10, 3600);
-    if (!limit.ok) {
-      throw new ServiceError("rate_limited", `Too many accounts were created from this network. Try again ${describeWait(limit.retryAfterSeconds)}.`);
-    }
+  // Each sign-up costs a password hash and creates a tenant; cap what one address can do.
+  const limit = await limitBySource("signup", meta, 10, 3600);
+  if (!limit.ok) {
+    throw new ServiceError("rate_limited", `Too many accounts were created from this network. Try again ${describeWait(limit.retryAfterSeconds)}.`);
   }
+  // A zone the runtime does not know is dropped, not refused: it is a convenience, never a reason to fail a sign-up.
+  const timeZone = normalizeTimeZone(raw.timeZone);
 
   const db = await getDb();
   const [existing] = await db.select({ id: users.id }).from(users).where(eq(users.email, email)).limit(1);
@@ -544,13 +590,18 @@ export async function signUp(
   const passwordHash = await hashPassword(raw.password as string);
   const base = slugify(orgName);
 
-  return db.transaction(async (tx) => {
+  const verifyToken = newSecret();
+  const created = await db.transaction(async (tx) => {
     let org: Org | undefined;
     // ON CONFLICT DO NOTHING rather than catching a unique violation: an error would
     // abort the transaction, and a pre-check would race with a concurrent sign-up.
     for (let attempt = 0; attempt < 8 && !org; attempt++) {
       const slug = attempt === 0 ? base : `${base}-${randomString(attempt < 5 ? 4 : 12)}`;
-      [org] = await tx.insert(orgs).values({ id: newId("org"), name: orgName, slug }).onConflictDoNothing().returning();
+      [org] = await tx
+        .insert(orgs)
+        .values({ id: newId("org"), name: orgName, slug, settings: timeZone ? { timeZone } : {} })
+        .onConflictDoNothing()
+        .returning();
     }
     if (!org) throw new ServiceError("conflict", "We could not set up your company account. Try again.");
 
@@ -562,9 +613,166 @@ export async function signUp(
     // Throwing rolls the org insert back, so a lost race never leaves an ownerless company.
     if (!user) throw new ServiceError("conflict", DUPLICATE_EMAIL, { email: DUPLICATE_EMAIL });
 
+    await insertVerifyToken(tx, user, verifyToken);
     await audit(tx, org.id, { type: "user", label: actorLabel(user) }, "org.created", { userId: user.id }, meta);
-    return { user: toMember(user), org };
+    return { user, org };
   });
+
+  // After commit: the account exists whether or not this email goes out, and it can be sent again.
+  const sent = await sendVerificationEmail(created.user, created.org, verifyToken);
+  return { user: toMember(created.user), org: created.org, verificationEmail: sent.status };
+}
+
+// ---------------------------------------------------------------------------
+// Email verification
+// ---------------------------------------------------------------------------
+
+/**
+ * Said wherever an email to someone outside the company was held back. The link the
+ * email would have carried is always handed to the sender instead.
+ */
+export const EMAIL_UNVERIFIED_REASON =
+  "Your company's owner has not confirmed their email address yet, so nothing was emailed. Copy the link and send it yourself, or ask the owner to use the confirmation link we emailed them.";
+
+const VERIFY_GONE = "This confirmation link has expired or was already used. Sign in and ask for a new one from the banner at the top of the page.";
+
+async function insertVerifyToken(tx: DbOrTx, user: Pick<User, "id" | "orgId" | "email">, token: string): Promise<void> {
+  // Only the newest link works, like password resets.
+  await tx.delete(authTokens).where(and(eq(authTokens.kind, "email_verify"), eq(authTokens.userId, user.id)));
+  await tx.insert(authTokens).values({
+    id: sha256Hex(token),
+    kind: "email_verify",
+    orgId: user.orgId,
+    userId: user.id,
+    email: user.email,
+    expiresAt: new Date(Date.now() + ACCOUNT_LIMITS.verifyEmailHours * 3_600_000),
+  });
+}
+
+function sendVerificationEmail(user: Pick<User, "orgId" | "email" | "name">, org: Pick<Org, "name">, token: string) {
+  const url = verifyEmailUrl(token);
+  // With no email provider in local development, sendEmail prints the link to the console.
+  return safeSend({ orgId: user.orgId, kind: "verify_email", to: user.email, ...verifyEmailEmail({ name: user.name, orgName: org.name, url }) });
+}
+
+/**
+ * Confirms an address from its emailed link. The link works once; opening it again
+ * after it worked says so instead of failing, because mail scanners and double
+ * clicks open links twice.
+ */
+export async function verifyEmail(token: unknown, meta?: RequestMeta): Promise<{ user: Member; alreadyVerified: boolean }> {
+  if (!isSecretToken(token)) throw new ServiceError("gone", VERIFY_GONE);
+  const db = await getDb();
+  return db.transaction(async (tx) => {
+    const now = new Date();
+    const [row] = await tx
+      .select()
+      .from(authTokens)
+      .where(and(eq(authTokens.id, sha256Hex(token)), eq(authTokens.kind, "email_verify")))
+      .limit(1);
+    if (!row?.userId) throw new ServiceError("gone", VERIFY_GONE);
+    const [user] = await tx.select().from(users).where(eq(users.id, row.userId)).limit(1);
+    // The link proves control of one address; it says nothing about any other.
+    if (!user || user.disabledAt || user.email !== row.email) throw new ServiceError("gone", VERIFY_GONE);
+    if (row.usedAt) {
+      if (user.emailVerifiedAt) return { user: toMember(user), alreadyVerified: true };
+      throw new ServiceError("gone", VERIFY_GONE);
+    }
+    // Guarded update: of two concurrent openings of the same link, exactly one gets a row back.
+    const [used] = await tx
+      .update(authTokens)
+      .set({ usedAt: now })
+      .where(and(eq(authTokens.id, row.id), eq(authTokens.kind, "email_verify"), isNull(authTokens.usedAt), gt(authTokens.expiresAt, now)))
+      .returning({ id: authTokens.id });
+    if (!used) throw new ServiceError("gone", VERIFY_GONE);
+    if (user.emailVerifiedAt) return { user: toMember(user), alreadyVerified: true };
+    const [updated] = await tx.update(users).set({ emailVerifiedAt: now }).where(eq(users.id, user.id)).returning();
+    await audit(tx, user.orgId, { type: "user", label: actorLabel(user) }, "member.email_verified", { userId: user.id, email: user.email }, meta);
+    return { user: toMember(updated), alreadyVerified: false };
+  });
+}
+
+export interface ResendVerificationResult {
+  /** "already_verified" when there was nothing to send. */
+  status: "sent" | "failed" | "skipped" | "already_verified";
+  error?: string;
+}
+
+/** Emails the signed-in person a fresh confirmation link; the earlier one stops working. */
+export async function resendVerification(actor: Actor): Promise<ResendVerificationResult> {
+  const db = await getDb();
+  const me = await loadActorUser(db, actor);
+  if (me.emailVerifiedAt) return { status: "already_verified" };
+  // Each one is an email to an address nobody has confirmed; a few an hour is plenty for a real person.
+  const hourly = await rateLimit(`verify:user:${me.id}`, 3, 3600);
+  const daily = hourly.ok ? await rateLimit(`verify:user:${me.id}:day`, 8, 86_400) : hourly;
+  if (!daily.ok) {
+    throw new ServiceError(
+      "rate_limited",
+      `We have already sent several confirmation emails to ${me.email}. Check your inbox and spam folder, or try again ${describeWait(daily.retryAfterSeconds)}.`,
+    );
+  }
+  const [org] = await db.select().from(orgs).where(eq(orgs.id, me.orgId)).limit(1);
+  const token = newSecret();
+  await db.transaction((tx) => insertVerifyToken(tx, me, token));
+  const sent = await sendVerificationEmail(me, org ?? { name: "your company" }, token);
+  return { status: sent.status, ...(sent.error ? { error: sent.error } : {}) };
+}
+
+export interface EmailSendingStatus {
+  /** False when no email provider is set up at all: links are always shared by hand and nothing needs confirming. */
+  emailConfigured: boolean;
+  /** True when agreements and invitations can be emailed to people outside the company right now. */
+  canEmailOutside: boolean;
+  /** True when the signed-in person has confirmed their own address. */
+  viewerVerified: boolean;
+  /** True when the signed-in person is an owner, so confirming their address is what lifts the hold. */
+  viewerIsOwner: boolean;
+  /** Plain sentence for a banner while emails are on hold; null otherwise. */
+  reason: string | null;
+}
+
+/** Whether the company's emails to clients are on hold, for the banner that explains it. */
+export async function getEmailSendingStatus(actor: Actor): Promise<EmailSendingStatus> {
+  const db = await getDb();
+  const me = await loadActorUser(db, actor);
+  const configured = emailIsConfigured();
+  const verified = !configured || (await ownerEmailVerified(db, me.orgId));
+  return {
+    emailConfigured: configured,
+    canEmailOutside: configured && verified,
+    viewerVerified: me.emailVerifiedAt !== null,
+    viewerIsOwner: me.role === "owner",
+    reason: verified ? null : EMAIL_UNVERIFIED_REASON,
+  };
+}
+
+async function ownerEmailVerified(db: DbOrTx, orgId: string): Promise<boolean> {
+  const [row] = await db
+    .select({ id: users.id })
+    .from(users)
+    .where(and(eq(users.orgId, orgId), eq(users.role, "owner"), isNull(users.disabledAt), sql`${users.emailVerifiedAt} is not null`))
+    .limit(1);
+  return Boolean(row);
+}
+
+/**
+ * The soft gate against using a throwaway account to email strangers: until an owner
+ * of the company has confirmed their own address, the product does not email anyone
+ * outside the company on its behalf. Returns the reason to hold a message to `to`,
+ * or null when it may go. Teammates can always be emailed, and with no email
+ * provider configured there is nothing to gate.
+ */
+export async function externalEmailHold(db: DbOrTx, orgId: string, to: unknown): Promise<string | null> {
+  if (!emailIsConfigured()) return null;
+  if (typeof orgId !== "string" || !orgId) return null;
+  if (await ownerEmailVerified(db, orgId)) return null;
+  const address = normalizeEmail(to);
+  if (address) {
+    const [teammate] = await db.select({ id: users.id }).from(users).where(and(eq(users.orgId, orgId), eq(users.email, address))).limit(1);
+    if (teammate) return null;
+  }
+  return EMAIL_UNVERIFIED_REASON;
 }
 
 const LOGIN_FAILED = "That email and password do not match an account. Check both and try again, or reset your password.";
@@ -628,10 +836,8 @@ export async function logIn(input: { email: unknown; password: unknown }, meta?:
     throw invalid(fields);
   }
 
-  if (meta?.ip) {
-    const byIp = await rateLimit(`login:ip:${meta.ip}`, 50, 900);
-    if (!byIp.ok) throw new ServiceError("rate_limited", `Too many sign-in attempts from this network. Try again ${describeWait(byIp.retryAfterSeconds)}.`);
-  }
+  const byIp = await limitBySource("login", meta, 50, 900);
+  if (!byIp.ok) throw new ServiceError("rate_limited", `Too many sign-in attempts from this network. Try again ${describeWait(byIp.retryAfterSeconds)}.`);
   // The hard stop is per email AND network. Keyed on the email alone it would let anyone
   // who knows an address keep its owner signed out with ten wrong guesses every 15 minutes.
   const sourceKey = `${loginSourcePrefix(email)}${loginSource(meta)}`;
@@ -676,7 +882,7 @@ export async function requestPasswordReset(emailInput: unknown, meta?: RequestMe
   try {
     const email = normalizeEmail(emailInput);
     if (!isValidEmail(email)) return;
-    if (meta?.ip && !(await rateLimit(`reset:ip:${meta.ip}`, 20, 3600)).ok) return;
+    if (!(await limitBySource("reset", meta, 20, 3600)).ok) return;
     if (!(await rateLimit(`reset:email:${email}`, 3, 3600)).ok) return;
 
     const db = await getDb();
@@ -744,7 +950,8 @@ export async function resetPassword(token: unknown, newPassword: unknown, meta?:
 
     const [user] = await tx
       .update(users)
-      .set({ passwordHash })
+      // The reset link only ever went to this mailbox, so using it proves control of the address.
+      .set({ passwordHash, emailVerifiedAt: sql`coalesce(${users.emailVerifiedAt}, ${now.toISOString()}::timestamptz)` })
       .where(and(eq(users.id, used.userId), isNull(users.disabledAt)))
       .returning();
     if (!user) throw new ServiceError("gone", RESET_GONE);
@@ -857,16 +1064,25 @@ export async function inviteMember(actor: Actor, input: { email: unknown; role: 
   });
 
   const url = inviteUrl(token);
+  // An invitation is an email to an address outside the company, sent in its name.
+  const hold = await externalEmailHold(db, org.id, email);
   const sent = await safeSend({
     orgId: org.id,
     kind: "invite",
     to: email,
     fromName: org.name,
+    ...(hold ? { holdReason: hold } : {}),
     ...(hasAccountElsewhere
       ? inviteExistingAccountEmail({ orgName: org.name, inviterName: manager.name, resetUrl: forgotPasswordUrl() })
       : inviteEmail({ orgName: org.name, inviterName: manager.name, url })),
   });
-  return { invite: toPendingInvite(row), url, emailStatus: sent.status, emailError: sent.error };
+  return {
+    invite: toPendingInvite(row),
+    url,
+    emailStatus: hold ? "skipped" : sent.status,
+    emailError: hold ?? sent.error,
+    ...(hold ? { emailUnverified: true } : {}),
+  };
 }
 
 /** Cancels an invite that has not been accepted. */
@@ -948,7 +1164,8 @@ export async function acceptInvite(token: unknown, input: { name: unknown; passw
 
     const [user] = await tx
       .insert(users)
-      .values({ id: newId("usr"), orgId: org.id, email: used.email, name, passwordHash, role: used.role === "admin" ? "admin" : "member" })
+      // The invitation only ever went to this mailbox, so accepting it proves control of the address.
+      .values({ id: newId("usr"), orgId: org.id, email: used.email, name, passwordHash, role: used.role === "admin" ? "admin" : "member", emailVerifiedAt: now })
       .onConflictDoNothing()
       .returning();
     // Rolls back, so the invite is not consumed by an attempt that created nothing.
@@ -1036,6 +1253,8 @@ export async function setMemberDisabled(actor: Actor, userId: unknown, disabled:
       await tx.delete(sessions).where(eq(sessions.userId, target.id));
       // A disabled person must not keep signing agreements on the company's behalf.
       await releaseCountersigner(tx, org, target.id, { keepAsManual: false });
+      // The countersign links in their inbox stay dead even if the account is turned back on.
+      await revokeCountersignLinksForUser(tx, org.id, target.id);
       cancelledInvites = await cancelInvitesFrom(tx, org.id, target.id);
       revokedApiKeys = await tx
         .update(apiKeys)
@@ -1158,6 +1377,16 @@ export async function saveSignature(actor: Actor, dataUrl: unknown): Promise<Mem
         : img.reason === "corrupt"
           ? "That signature image could not be read. Draw it again or upload a different PNG."
           : "A signature must be a PNG image. Draw it again or upload a PNG.";
+    throw new ServiceError("invalid", message, { signature: message });
+  }
+  // The same check the document engine runs when it draws the image: byte size alone
+  // would accept a small file with enormous pixel dimensions, which every later
+  // countersignature would then refuse.
+  const drawable = parseSignatureImage(img.dataUrl);
+  if (!drawable.ok) {
+    const message = /too large/i.test(drawable.reason)
+      ? "That signature image has too many pixels to be placed on a document. Draw it again, or upload a smaller PNG."
+      : "That signature image could not be read as a PNG. Draw it again or upload a different PNG.";
     throw new ServiceError("invalid", message, { signature: message });
   }
   const [updated] = await db.update(users).set({ savedSignature: img.dataUrl }).where(and(eq(users.id, me.id), eq(users.orgId, me.orgId))).returning();

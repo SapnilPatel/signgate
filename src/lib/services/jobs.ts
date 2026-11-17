@@ -31,6 +31,7 @@ import {
   loadEnvelopeContext,
   lockFile,
   longDate,
+  notifyCountersignOverdue,
   orgTimeZone,
   resendCompletedEmails,
   safeSend,
@@ -255,6 +256,13 @@ async function chaseCountersigners(db: Db, now: Date, summary: JobsSummary, outO
           });
         });
         summary.countersign.escalated++;
+        // After commit, and only by the runner that won the claim above, so the team hears once.
+        await notifyCountersignOverdue(ctx, {
+          countersigner: signer,
+          reason: canSign
+            ? `${signer.name} was asked to countersign and has not done so after ${envelope.reminderCount} ${envelope.reminderCount === 1 ? "reminder" : "reminders"}`
+            : `${signer.name} was asked to countersign but can no longer sign for the company`,
+        });
         continue;
       }
 

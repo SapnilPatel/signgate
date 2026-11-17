@@ -11,8 +11,19 @@ import { newId, randomString } from "@/lib/ids";
 import { LIMITS, ORG_SETTING_DEFAULTS } from "@/lib/types";
 import { cleanMultilineText, cleanText, isValidEmail, normalizeEmail } from "@/lib/validation";
 import { ServiceError, type Actor, type RequestMeta } from "./context";
+import { assertActiveActor } from "./accounts";
 import { normalizeDataKey, type ImportRow } from "./csv";
-import { canCountersignNow, describeEvents, sendAgreementForFile, signerView, viewerOf, voidOpenEnvelopesForFile, type DescribedEvent, type SignerView } from "./envelopes";
+import {
+  canCountersignNow,
+  describeEvents,
+  sendAgreementForFile,
+  signerView,
+  viewerOf,
+  voidOpenEnvelopesForFile,
+  type Delivery,
+  type DescribedEvent,
+  type SignerView,
+} from "./envelopes";
 import { listEvents, recordEvent } from "./events";
 import { calendarParts, orgTimeZone } from "./signing";
 import { enqueueWebhookEvent } from "./webhooks";
@@ -72,7 +83,9 @@ export interface CreateFileInput {
 export interface AgreementOutcome {
   sent: boolean;
   envelopeId?: string;
-  delivery?: "emailed" | "email_not_configured" | "email_failed";
+  delivery?: Delivery;
+  /** Present when the agreement was created but not emailed: why, and what to do with the link. */
+  deliveryReason?: string;
   signingUrl?: string;
   /** Present when sent is false: why, in words that can be shown as they are. */
   reason?: string;
@@ -263,10 +276,12 @@ function validateCreate(input: unknown): CleanFileValues {
   return values;
 }
 
-function assertActor(actor: Actor): void {
-  if (!actor || typeof actor.orgId !== "string" || !actor.orgId) {
-    throw new ServiceError("forbidden", "Sign in again to continue.");
-  }
+/**
+ * Files are everyone's work: any active member may create, read, change, archive and
+ * send them. The stored row decides, so a disabled account loses access on its next call.
+ */
+async function assertActor(actor: Actor): Promise<void> {
+  await assertActiveActor(await getDb(), actor, "read");
 }
 
 const NOT_FOUND = "That file was not found. It may belong to a different account or the link may be wrong.";
@@ -373,7 +388,7 @@ async function findByExternalId(db: DbOrTx, orgId: string, externalId: string): 
 }
 
 async function referenceTaken(db: DbOrTx, orgId: string, reference: string, exceptId?: string): Promise<boolean> {
-  // The index is case-sensitive; people are not. "f-2026-0001" next to "F-2026-0001" would only cause mix-ups.
+  // People do not tell "f-2026-0001" from "F-2026-0001", so neither does this check (nor the unique index behind it).
   const conditions: SQL[] = [eq(files.orgId, orgId), sql`lower(${files.reference}) = ${reference.toLowerCase()}`];
   if (exceptId) conditions.push(ne(files.id, exceptId));
   const [row] = await db.select({ id: files.id }).from(files).where(and(...conditions)).limit(1);
@@ -396,7 +411,13 @@ const GENERIC_SEND_FAILURE = "The agreement could not be sent. Open the file and
 async function trySend(actor: Actor, id: string, meta?: RequestMeta): Promise<AgreementOutcome & { orgWide?: boolean }> {
   try {
     const result = await sendAgreementForFile(actor, id, {}, meta);
-    return { sent: true, envelopeId: result.envelopeId, delivery: result.delivery, signingUrl: result.signingUrl };
+    return {
+      sent: true,
+      envelopeId: result.envelopeId,
+      delivery: result.delivery,
+      ...(result.deliveryReason ? { deliveryReason: result.deliveryReason } : {}),
+      signingUrl: result.signingUrl,
+    };
   } catch (err) {
     if (err instanceof ServiceError) {
       // not_ready describes the org's setup (no agreement, no countersigner) and the company's
@@ -425,8 +446,8 @@ async function insertFile(db: Db, actor: Actor, org: Org, values: CleanFileValue
       const file = await db.transaction(async (tx) => {
         let reference = values.reference;
         // Serialises references per org: twenty simultaneous creates get twenty consecutive
-        // numbers, and two typed references that differ only in letter case cannot both pass
-        // the check below (the unique index alone is case-sensitive). Released when the transaction ends.
+        // numbers, and a typed reference that differs from an existing one only in letter case
+        // gets the plain "already used" answer below instead of tripping the unique index. Released when the transaction ends.
         await lockReferences(tx, org.id);
         if (reference) {
           if (await referenceTaken(tx, org.id, reference)) throw referenceConflict(reference);
@@ -488,7 +509,7 @@ async function insertFile(db: Db, actor: Actor, org: Org, values: CleanFileValue
  * exists, nothing about the agreement can make this throw: see `agreement.reason`.
  */
 export async function createFile(actor: Actor, input: CreateFileInput, meta?: RequestMeta): Promise<CreateFileResult> {
-  assertActor(actor);
+  await assertActor(actor);
   const values = validateCreate(input);
   const raw = input as unknown as Record<string, unknown>;
   const source: FileSource = FILE_SOURCES.includes(raw.source as FileSource) ? (raw.source as FileSource) : actor.type === "api" ? "api" : "manual";
@@ -515,6 +536,7 @@ export async function createFile(actor: Actor, input: CreateFileInput, meta?: Re
   const agreement: AgreementOutcome = { sent: outcome.sent };
   if (outcome.envelopeId) agreement.envelopeId = outcome.envelopeId;
   if (outcome.delivery) agreement.delivery = outcome.delivery;
+  if (outcome.deliveryReason) agreement.deliveryReason = outcome.deliveryReason;
   if (outcome.signingUrl) agreement.signingUrl = outcome.signingUrl;
   if (outcome.reason) agreement.reason = outcome.reason;
   // Sending changes the file's agreement status; hand back the row as it is now.
@@ -527,7 +549,7 @@ export async function createFile(actor: Actor, input: CreateFileInput, meta?: Re
 // ---------------------------------------------------------------------------
 
 export async function getFile(actor: Actor, id: unknown): Promise<FileDetail> {
-  assertActor(actor);
+  await assertActor(actor);
   const db = await getDb();
   const file = await findFile(db, actor.orgId, fileId(id));
   if (!file) throw new ServiceError("not_found", NOT_FOUND);
@@ -583,7 +605,7 @@ function isStatus(value: unknown): value is AgreementStatus {
 }
 
 export async function listFiles(actor: Actor, opts: ListFilesOptions = {}): Promise<ListFilesResult> {
-  assertActor(actor);
+  await assertActor(actor);
   const options = isRecord(opts) ? opts : {};
   const conditions: SQL[] = [eq(files.orgId, actor.orgId)];
 
@@ -624,7 +646,7 @@ export async function listFiles(actor: Actor, opts: ListFilesOptions = {}): Prom
 
 /** Current (not archived) files by agreement status, plus the archived total. */
 export async function fileCounts(actor: Actor): Promise<FileCounts> {
-  assertActor(actor);
+  await assertActor(actor);
   const db = await getDb();
   const rows = await db
     .select({
@@ -666,7 +688,7 @@ function startOfMonth(now: Date, timeZone: string | null): Date {
 }
 
 export async function dashboardStats(actor: Actor, now: Date = new Date()): Promise<DashboardStats> {
-  assertActor(actor);
+  await assertActor(actor);
   const db = await getDb();
   const counts = await fileCounts(actor);
   const monthStart = startOfMonth(now, orgTimeZone(await loadOrg(db, actor.orgId)));
@@ -777,7 +799,7 @@ function sameData(a: Record<string, string>, b: Record<string, string>): boolean
  * changed and they have not signed, `reissueSuggested` tells the caller to offer that.
  */
 export async function updateFile(actor: Actor, id: unknown, patch: UpdateFilePatch, meta?: RequestMeta): Promise<UpdateFileResult> {
-  assertActor(actor);
+  await assertActor(actor);
   const targetId = fileId(id);
   if (!isRecord(patch)) throw new ServiceError("invalid", "No changes were received. Edit a field and save again.");
   const has = (key: string) => Object.prototype.hasOwnProperty.call(patch, key) && (patch as Record<string, unknown>)[key] !== undefined;
@@ -862,7 +884,7 @@ export interface ArchiveFileResult {
  * Archiving an archived file changes nothing.
  */
 export async function archiveFile(actor: Actor, id: unknown, meta?: RequestMeta): Promise<ArchiveFileResult> {
-  assertActor(actor);
+  await assertActor(actor);
   const targetId = fileId(id);
   const db = await getDb();
   const existing = await findFile(db, actor.orgId, targetId);
@@ -887,7 +909,7 @@ export async function archiveFile(actor: Actor, id: unknown, meta?: RequestMeta)
 
 /** Returns an archived file to the working lists. Voided agreements stay void; send a new one from the file. */
 export async function unarchiveFile(actor: Actor, id: unknown, meta?: RequestMeta): Promise<FileRow> {
-  assertActor(actor);
+  await assertActor(actor);
   const targetId = fileId(id);
   const db = await getDb();
   return db.transaction(async (tx) => {
@@ -1002,7 +1024,7 @@ async function existingKeys(db: Db, orgId: string, references: string[], externa
  * Throws only when the batch as a whole is unusable (not a list, over 1000 rows).
  */
 export async function importFiles(actor: Actor, rows: ImportRow[], opts: ImportOptions = {}, meta?: RequestMeta): Promise<ImportRowResult[]> {
-  assertActor(actor);
+  await assertActor(actor);
   if (!Array.isArray(rows)) throw new ServiceError("invalid", "No rows were received. Upload the spreadsheet again.");
   if (rows.length > FILE_LIMITS.importMaxRows) {
     throw new ServiceError(
@@ -1155,7 +1177,9 @@ export async function importFiles(actor: Actor, rows: ImportRow[], opts: ImportO
           ? `Created file ${result.reference} and emailed the agreement.`
           : outcome.delivery === "email_failed"
             ? `Created file ${result.reference}. The agreement is ready but the email could not be delivered; copy the signing link from the file.`
-            : `Created file ${result.reference}. The agreement is ready; copy the signing link from the file (email is not set up).`;
+            : outcome.delivery === "email_unverified"
+              ? `Created file ${result.reference}. The agreement is ready but was not emailed, because your company's owner has not confirmed their email address yet; copy the signing link from the file.`
+              : `Created file ${result.reference}. The agreement is ready; copy the signing link from the file (email is not set up).`;
     } else {
       result.message = `Created file ${result.reference}. Agreement not sent: ${outcome.reason ?? GENERIC_SEND_FAILURE}`;
       if (outcome.orgWide) blocked = outcome.reason ?? GENERIC_SEND_FAILURE;
@@ -1179,7 +1203,7 @@ export interface BulkSendResult {
  * how the agreements of a large import get sent without opening files one by one.
  */
 export async function sendAgreementsForFiles(actor: Actor, fileIds: unknown, opts: { budgetMs?: number } = {}, meta?: RequestMeta): Promise<BulkSendResult> {
-  assertActor(actor);
+  await assertActor(actor);
   if (!Array.isArray(fileIds)) throw new ServiceError("invalid", "No files were chosen. Select the files to send the agreement for.");
   if (fileIds.length > FILE_LIMITS.importMaxRows) {
     throw new ServiceError("invalid", `Agreements can be sent for at most ${FILE_LIMITS.importMaxRows} files at a time and ${fileIds.length} were chosen. Send them in smaller groups.`);
