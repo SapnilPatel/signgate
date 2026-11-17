@@ -316,7 +316,7 @@ describe("sealDocument", () => {
       const footer = page.runs.filter((r) => r.text === "Envelope env_test0000000000aa");
       expect(footer).toHaveLength(1);
       expect(footer[0].u).toBeCloseTo(24, 1);
-      expect(page.height - footer[0].v).toBeCloseTo(12, 1);
+      expect(page.height - footer[0].v).toBeCloseTo(6, 1);
       expect(footer[0].dirX).toBeCloseTo(1, 5);
     }
     // The certificate has its own footer, not the page stamp.
@@ -324,6 +324,47 @@ describe("sealDocument", () => {
       expect(page.runs.filter((r) => r.text === "Envelope env_test0000000000aa")).toHaveLength(0);
       expect(page.text).toContain("Sealed by Signgate");
     }
+  });
+
+  it("keeps the envelope reference clear of the agreement's own footer, moving it to a free corner when needed", async () => {
+    const doc = await PDFDocument.create();
+    const font = await doc.embedFont(StandardFonts.Helvetica);
+    // A footer where word processors and browsers print one.
+    const usual = doc.addPage([612, 792]);
+    usual.drawText("Example Advisory Ltd Services Agreement | Page 1 of 3 | Initials: ____", { x: 40, y: 15, size: 8.5, font });
+    // A footer printed right at the bottom-left edge, on a rotated page.
+    const low = doc.addPage([612, 792]);
+    low.setRotation(degrees(90));
+    low.drawText("Form 12-B revision 4 confidential", { x: 612 - 7, y: 20, size: 6, font, rotate: degrees(90) });
+    // Both bottom corners taken.
+    const both = doc.addPage([595.28, 841.89]);
+    both.drawText("Form 12-B revision 4 confidential and proprietary", { x: 20, y: 6, size: 6, font });
+    both.drawText("Page 3 of 3 of the agreement", { x: 480, y: 6, size: 6, font });
+    const sealed = await sealDocument({ pdf: await doc.save(), fields: [], values: {}, certificate: certificate() });
+    const pages = await readPages(sealed.pdf);
+    const mark = (index: number) => {
+      const found = pages[index].runs.filter((r) => r.text === "Envelope env_test0000000000aa");
+      expect(found).toHaveLength(1);
+      expect(found[0].dirX).toBeCloseTo(1, 5);
+      return found[0];
+    };
+    // Nothing the agreement prints may share space with the mark.
+    pages.slice(0, 3).forEach((page, index) => {
+      const m = mark(index);
+      for (const run of page.runs) {
+        if (run === m) continue;
+        const apart = run.u + run.width < m.u - 2 || run.u > m.u + m.width + 2 || run.v + 2 < m.v - 5 || run.v - 6 > m.v + 1.25;
+        expect(apart, `${run.text} on page ${index + 1}`).toBe(true);
+      }
+    });
+    // Below the usual footer, in the same corner.
+    expect(mark(0).u).toBeCloseTo(24, 1);
+    expect(pages[0].height - mark(0).v).toBeCloseTo(6, 1);
+    // Bottom-left taken: bottom-right.
+    expect(mark(1).u + mark(1).width).toBeCloseTo(pages[1].width - 24, 0);
+    expect(pages[1].height - mark(1).v).toBeCloseTo(6, 1);
+    // Both bottom corners taken: the top margin.
+    expect(mark(2).v).toBeCloseTo(12, 1);
   });
 
   it("seals with nothing to stamp, unknown pages, junk values and odd certificate text", async () => {
