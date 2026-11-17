@@ -227,6 +227,9 @@ function contextAround(model: Model, blank: Blank): { left: string; right: strin
   return { left, right };
 }
 
+/** A label that asks for an organization's name without saying whose. */
+const BARE_ORGANIZATION = /^(the )?(company|organi[sz]ation|business|firm|employer)( name)?$/;
+
 function kindClass(kind: Kind): string {
   return kind === "signature" || kind === "unlabeled" || kind === "party" ? "sig" : kind;
 }
@@ -687,6 +690,21 @@ export function detectByRules(model: Model, companyName?: string, options: RuleO
         let prev: Candidate | null = null;
         for (const cand of column.slice().sort((a, b) => a.blank.y - b.blank.y || a.blank.x0 - b.blank.x0)) {
           tick();
+          // "Signature: ____ / Name: ____ / Company: ____" in one stack: the bare "Company" row asks which
+          // organization the signer is from. It is a detail of that block, not a second party's place to sign.
+          if (
+            current !== null &&
+            cand.kind === "party" &&
+            cand.labelFrom === "left" &&
+            cand.party?.party === "company" &&
+            cand.party.strength === 1 &&
+            BARE_ORGANIZATION.test(normalize(cand.labelText ?? "")) &&
+            current.cands.some((c) => c.kind === "signature") &&
+            !current.cands.some((c) => c.kind === "company")
+          ) {
+            cand.kind = "company";
+            cand.party = null;
+          }
           const cls = kindClass(cand.kind);
           const repeats = current !== null && ["sig", "full_name", "date", "title"].includes(cls) && current.cands.some((c) => kindClass(c.kind) === cls);
           const partyChange = current !== null && cand.party !== null && cand.kind !== "party" && current.cands.some((c) => c.party && c.kind !== "party" && c.party.party !== cand.party!.party);
@@ -874,7 +892,7 @@ export function detectByRules(model: Model, companyName?: string, options: RuleO
       // "Client Name: ____   Company: ____": next to the client's own details, a bare "Company" asks
       // who the client works for. The sender's name is never a blank in its own agreement's client panel.
       const clientPanel = cluster.cands.some((c) => c !== cand && c.party?.party === "client");
-      const bareCompany = side === "company" && (cand.kind === "party" || cand.kind === "company") && (cand.party?.strength ?? 1) === 1 && /^(the )?(company|organi[sz]ation|business|firm|employer)( name)?$/.test(normalize(cand.labelText ?? ""));
+      const bareCompany = side === "company" && (cand.kind === "party" || cand.kind === "company") && (cand.party?.strength ?? 1) === 1 && BARE_ORGANIZATION.test(normalize(cand.labelText ?? ""));
       if (clientPanel && bareCompany) emit(cand.blank, "company", "prefill", false, "Client company", conf - 0.1, "client_company");
       else if (side === "company") {
         if (cand.kind === "full_name" || cand.kind === "company" || cand.kind === "party") emit(cand.blank, "company", "prefill", false, "Company name", conf - 0.1, "company_name");

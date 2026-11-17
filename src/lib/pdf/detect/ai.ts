@@ -38,8 +38,21 @@ export const TextReviewSchema = z.object({
   notes: z.array(z.string()),
 });
 
+/** Pieces of the send date, for a date printed as several blanks ("____________, 20__"). Stored as `custom:<key>`. */
+const DATE_PART_KEYS = ["today_day", "today_month", "today_month_day", "today_year", "today_year_short"] as const;
+const scannedBox = { page: z.number(), x: z.number(), y: z.number(), w: z.number(), h: z.number() };
+const scannedShape = { ...fieldShape, merge_key: z.enum([...MERGE_KEYS, ...DATE_PART_KEYS]) };
+
 export const ScannedSchema = z.object({
-  fields: z.array(z.object({ page: z.number(), x: z.number(), y: z.number(), w: z.number(), h: z.number(), ...fieldShape })),
+  // Asked for first so the whole document is looked at before any field is written down.
+  pages_with_fields: z.array(z.number()),
+  fields: z.array(z.object({ ...scannedBox, ...scannedShape, text_before: z.string(), text_after: z.string() })),
+  notes: z.array(z.string()),
+});
+
+/** What is accepted back: the same answer, tolerating a missing reading of the words around a box. */
+const ScannedAnswer = z.object({
+  fields: z.array(z.object({ ...scannedBox, ...scannedShape, text_before: z.string().optional(), text_after: z.string().optional() })),
   notes: z.array(z.string()),
 });
 
@@ -73,15 +86,21 @@ You also receive CANDIDATES that a rule-based detector already placed. Review th
 - In "decisions", list only the candidates you want to change or remove, by candidate_id. Set keep to false to remove one that is not really a place to fill in (a table border, a heading, decoration). Candidates you do not list stay as they are.
 - In "additions", add places the detector missed, by line_id. placement "blank" uses the blank number blank_index (0 for the first [blank] on that line); "after_text" uses the empty space after the line's text (for "Signature:" with nothing after it); "above_text" uses the space directly above a caption such as "Client Signature" that has no line drawn. Set blank_index to 0 when placement is not "blank".
 - Never add a field for a witness or notary.
+- Add a signature for the sender only where the document gives the sender a place to sign: a blank, a drawn line, or a label such as "By:" or "Signature:". A letter that closes with the sender's typed name (for example under "Sincerely,") and nothing else is already signed off by the sender, and only the client signs it.
 - In "notes", write at most three short plain sentences the sender should read before sending, only when something genuinely needs checking.
 If the candidates are already right, return empty lists.`;
 
 const SYSTEM_SCANNED = `${SYSTEM_COMMON}
 
-This document is a scan with no text layer. Look at the pages and return every place that needs to be filled in or signed.
+This document is a scan with no text layer. Look at every page, from the first to the last, and return every place that needs to be filled in or signed. Agreements are usually signed on their last pages: do not stop before you have read them.
+Start with "pages_with_fields": the number of every page that has a blank, a signature line or a place for initials. Then return the fields for every one of those pages, in this order: first everything in the signature block or blocks (signatures, printed names, titles, signing dates), then all the other blanks page by page, initials included. The list is complete only when each page you named has its fields in it.
 Give each field's page (1 for the first page) and its box as fractions of the page: x and y are the top-left corner measured from the page's top-left, w and h its width and height, all between 0 and 1. A box sits on its writing line and does not cover the printed label.
+For each field also copy the printed characters on the same line that touch it: "text_before" is the last 20 or so characters printed immediately before the blank and "text_after" the first 20 or so immediately after it, with any further blank written as "__". Use an empty string when nothing is printed there.
+A date is often printed as several blanks with words between them, for example "____________, 20__" or "this ___ day of __________, 20__". Return one field for each blank, each of type text and role prefill, and give each only its own piece of the date: merge_key today_day (the day number), today_month (the month name), today_month_day (month and day together, as in "March 4"), today_year (all four digits) or today_year_short (the last two digits, for a blank that follows a printed "20"). Use merge_key today only for a single blank that takes the whole date. A piece of the agreement's date is never left for the client to type.
 If the document has no place for the client to sign, return an empty list. In "notes", write at most three short plain sentences for the sender.`;
 
+/** Words on a line that ask for a signature, as opposed to a typed closing. */
+const SIGNING_LABEL = /\b(signature|signed|sign here|signatory|authori[sz]ed|by|its)\b|\/s\//i;
 const HINT = /sign|initial|witness|\bby\b|name|date|title|print|agree|accept|client|customer|between|effective|company|whereof/i;
 
 function promptLines(model: Model): string {
@@ -143,7 +162,7 @@ export function buildScannedRequest(pdf: Uint8Array, pages: PageInfo[], companyN
 interface Shape {
   type: (typeof FIELD_TYPES)[number];
   role: (typeof ROLES)[number];
-  merge_key: (typeof MERGE_KEYS)[number];
+  merge_key: (typeof MERGE_KEYS)[number] | (typeof DATE_PART_KEYS)[number];
   label: string;
   required: boolean;
 }
@@ -159,7 +178,11 @@ function resolveShape(shape: Shape, existing?: Field): Pick<Field, "type" | "rol
   const type: FieldType = shape.type;
   let mergeKey: MergeKey | undefined;
   if (role === "prefill") {
-    if (shape.merge_key !== "none") mergeKey = shape.merge_key;
+    const datePart = (DATE_PART_KEYS as readonly string[]).includes(shape.merge_key);
+    // The rules split a date printed as several blanks into its pieces; "today" from the review must not put the whole date back into one of them.
+    if (shape.merge_key === "today" && existing?.role === "prefill" && existing.mergeKey?.startsWith("custom:today_")) return { type: existing.type, role, required: false, label: cleanLabel(shape.label, role, existing.type), mergeKey: existing.mergeKey };
+    if (datePart) return { type: "text", role, required: false, label: cleanLabel(shape.label, role, "text"), mergeKey: `custom:${shape.merge_key}` };
+    if (shape.merge_key !== "none") mergeKey = shape.merge_key as MergeKey;
     else if (existing?.role === "prefill" && existing.mergeKey) mergeKey = existing.mergeKey;
     // A prefill with nothing to fill it from would stay empty; let the client complete it instead.
     else role = "client";
@@ -209,6 +232,7 @@ export function applyTextReview(raw: unknown, model: Model, rule: RuleResult, fi
 
   const lineById = new Map(model.lines.map((l) => [l.id, l]));
   const additions: Field[] = [];
+  let typedSignOff = false;
   for (const addition of parsed.data.additions.slice(0, 60)) {
     const line = lineById.get(addition.line_id.trim());
     if (!line) continue;
@@ -233,6 +257,12 @@ export function applyTextReview(raw: unknown, model: Model, rule: RuleResult, fi
     }
     if (!blank) continue;
     const shape = resolveShape(addition);
+    // A countersignature makes every file wait for the sender after the client has signed. It is added only where the
+    // document asks for one, never in the open space beside a typed closing such as "Sincerely," and a printed name.
+    if (shape.type === "signature" && shape.role === "company" && addition.placement !== "blank" && !SIGNING_LABEL.test(renderLine(line))) {
+      typedSignOff = true;
+      continue;
+    }
     const field: Field = { id: newId("fld"), page: blank.page, ...clampRect(rectFor(model, blank, shape.type)), ...shape, source: "detected", confidence: 0.75 };
     if (!shape.mergeKey) delete field.mergeKey;
     additions.push(field);
@@ -243,15 +273,65 @@ export function applyTextReview(raw: unknown, model: Model, rule: RuleResult, fi
   // The review may refine a way to sign but must never take the only one away.
   const hadClientSignature = fields.some((f) => f.type === "signature" && f.role === "client");
   if (hadClientSignature && !result.some((f) => f.type === "signature" && f.role === "client")) return null;
-  return { fields: result, notes: cleanNotes(parsed.data.notes), changed };
+  let notes = cleanNotes(parsed.data.notes);
+  if (typedSignOff && !result.some((f) => f.type === "signature" && f.role === "company")) {
+    // What the model wrote about the field it wanted to add no longer describes the result.
+    notes = [
+      ...notes.filter((n) => !/\b(added|placed|inserted)\b/i.test(n)).slice(0, 2),
+      "Your document closes with a typed name and has no line for your own signature, so only the client signs and the agreement is complete when they do. If someone on your side signs each one, add a signature field for your company in the editor.",
+    ];
+  }
+  return { fields: result, notes, changed };
+}
+
+/** After a blank: a printed "20" and then another blank, as in "________, 20__". */
+const YEAR_BLANK_FOLLOWS = /^[\s,]*20\s*(_|$)/;
+/** Before a blank: a printed "20" that the blank completes. */
+const PRINTED_CENTURY = /,\s*20\s*$/;
+/** Room a printed ", 20" takes on a typical page, and the width of the short blank after it, as fractions of the page width. */
+const CENTURY_GAP = 0.036;
+const YEAR_BLANK_WIDTH = 0.04;
+
+type ScannedItem = z.infer<typeof ScannedAnswer>["fields"][number];
+
+/**
+ * A date printed as "____________, 20__" is two blanks. Reading an image, the model sometimes
+ * answers with one whole-date field, or leaves the year for the client to type. This puts the
+ * month and day in the first blank and the last two digits of the year in the second, both
+ * filled automatically, adding the second when it was not returned.
+ */
+function splitDateBlanks(items: ScannedItem[]): ScannedItem[] {
+  const out = items.map((item) => ({ ...item }));
+  const sameLine = (a: ScannedItem, b: ScannedItem) => Math.round(a.page) === Math.round(b.page) && Math.abs(a.y + a.h - (b.y + b.h)) <= 0.012;
+  for (const first of [...out]) {
+    if (first.role !== "prefill" || (first.merge_key !== "today" && first.merge_key !== "today_month_day")) continue;
+    const end = first.x + first.w;
+    const follows = YEAR_BLANK_FOLLOWS.test(first.text_after ?? "");
+    // The year blank, if it was returned: the next box on the line that a printed "20" leads into.
+    const next = out
+      .filter((o) => o !== first && sameLine(first, o) && o.x >= end - 0.02 && o.x <= end + 0.14 && (o.type === "text" || o.type === "date"))
+      .filter((o) => PRINTED_CENTURY.test(o.text_before ?? "") || o.merge_key === "today_year_short" || (follows && o.w <= 0.12 && o.x <= end + 0.08))
+      .sort((a, b) => a.x - b.x)[0];
+    const printedCentury = follows || Boolean(next);
+    if (!printedCentury) continue;
+    first.type = "text";
+    first.merge_key = "today_month_day";
+    const year = { type: "text", role: "prefill", merge_key: "today_year_short", required: false } as const;
+    if (next) Object.assign(next, year);
+    else {
+      const x = Math.min(end + CENTURY_GAP, 1 - YEAR_BLANK_WIDTH);
+      out.push({ ...first, ...year, x, w: YEAR_BLANK_WIDTH, label: "Agreement date: year", text_before: ", 20", text_after: "" });
+    }
+  }
+  return out;
 }
 
 /** Turns approximate boxes the model read off a scan into fields. Returns null when the answer is unusable. */
 export function applyScannedResult(raw: unknown, pages: PageInfo[]): { fields: Field[]; notes: string[] } | null {
-  const parsed = ScannedSchema.safeParse(raw);
+  const parsed = ScannedAnswer.safeParse(raw);
   if (!parsed.success) return null;
   const fields: Field[] = [];
-  for (const item of parsed.data.fields.slice(0, 80)) {
+  for (const item of splitDateBlanks(parsed.data.fields.slice(0, 80))) {
     const pageIndex = Math.round(item.page) - 1;
     if (!(pageIndex >= 0 && pageIndex < pages.length)) continue;
     if (![item.x, item.y, item.w, item.h].every((n) => Number.isFinite(n) && n >= 0 && n <= 1)) continue;
@@ -259,7 +339,9 @@ export function applyScannedResult(raw: unknown, pages: PageInfo[]): { fields: F
     // Boxes read off an image are rough; keep them within a sane size for their type.
     const maxH = shape.type === "signature" ? 0.08 : 0.04;
     const h = Math.min(Math.max(item.h, 0.015), maxH);
-    const rect = clampRect({ x: item.x, y: item.y + (item.h - h), w: Math.min(Math.max(item.w, 0.05), 0.6), h });
+    // The blank after a printed "20" holds two digits; widening it would print them over the words that follow.
+    const minW = shape.mergeKey === "custom:today_year_short" ? 0.03 : 0.05;
+    const rect = clampRect({ x: item.x, y: item.y + (item.h - h), w: Math.min(Math.max(item.w, minW), 0.6), h });
     const field: Field = { id: newId("fld"), page: pageIndex, ...rect, ...shape, source: "detected", confidence: 0.4 };
     if (!shape.mergeKey) delete field.mergeKey;
     fields.push(field);

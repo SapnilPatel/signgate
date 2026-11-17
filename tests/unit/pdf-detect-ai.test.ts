@@ -231,6 +231,121 @@ describe("detectFields: AI review", () => {
     expect(r.pdf).toBe(pdf);
   });
 
+  it("fills a scanned date printed as two blanks around a printed 20 with month and day, then the two-digit year", async () => {
+    const sig = { page: 1, x: 0.12, y: 0.8, w: 0.4, h: 0.04, type: "signature", role: "client", merge_key: "none", label: "Client signature", required: true, text_before: "By:", text_after: "" };
+    const whole = { page: 1, x: 0.13, y: 0.2, w: 0.22, h: 0.022, type: "date", role: "prefill", merge_key: "today", label: "Effective date", required: false, text_before: "entered into as of", text_after: ", 20__ (the" };
+    const answers = {
+      // One whole-date field and nothing for the year blank.
+      "year blank missing": [whole, sig],
+      // The year left for the client to type.
+      "year given to the client": [whole, { ...whole, x: 0.39, w: 0.035, type: "text", role: "client", merge_key: "none", label: "Effective date year", required: true, text_before: ", 20", text_after: "(the" }, sig],
+      // Already split by the model.
+      "already split": [{ ...whole, type: "text", merge_key: "today_month_day" }, { ...whole, x: 0.39, w: 0.035, type: "text", merge_key: "today_year_short", label: "Effective date year", text_before: ", 20", text_after: "(the" }, sig],
+    };
+    for (const [name, fields] of Object.entries(answers)) {
+      const r = await detectFieldsWith(await scan(), {}, { ai: async () => ({ pages_with_fields: [1], fields, notes: [] }) });
+      const dates = r.fields.filter((f) => f.page === 0 && f.y < 0.3).sort((a, b) => a.x - b.x);
+      expect(dates.map((f) => [f.type, f.role, f.mergeKey, f.required]), name).toEqual([
+        ["text", "prefill", "custom:today_month_day", false],
+        ["text", "prefill", "custom:today_year_short", false],
+      ]);
+      // The year sits after the first blank and the printed ", 20", on the same line, and stays narrow.
+      expect(dates[1].x, name).toBeGreaterThan(dates[0].x + dates[0].w + 0.02);
+      expect(dates[1].w, name).toBeLessThanOrEqual(0.05);
+      expect(Math.abs(dates[1].y + dates[1].h - (dates[0].y + dates[0].h)), name).toBeLessThan(0.012);
+      expect(r.fields.filter((f) => f.type === "signature")).toHaveLength(1);
+    }
+  });
+
+  it("leaves a scanned whole-date blank and its neighbours alone when no printed 20 follows it", async () => {
+    const fields = [
+      { page: 1, x: 0.13, y: 0.2, w: 0.22, h: 0.022, type: "date", role: "prefill", merge_key: "today", label: "Effective date", required: false, text_before: "dated", text_after: "between Lumen Ridge and" },
+      { page: 1, x: 0.4, y: 0.2, w: 0.1, h: 0.022, type: "text", role: "prefill", merge_key: "client_name", label: "Client name", required: false, text_before: "and", text_after: "" },
+      // A signing date followed by a year blank belongs to the signer, not to the file.
+      { page: 1, x: 0.13, y: 0.6, w: 0.2, h: 0.022, type: "date_signed", role: "client", merge_key: "none", label: "Client signing date", required: true, text_before: "Date:", text_after: ", 20__" },
+      { page: 1, x: 0.12, y: 0.8, w: 0.4, h: 0.04, type: "signature", role: "client", merge_key: "none", label: "Client signature", required: true },
+    ];
+    const r = await detectFieldsWith(await scan(), {}, { ai: async () => ({ fields, notes: [] }) });
+    expect(r.fields.map((f) => [f.type, f.role, f.mergeKey]).sort()).toEqual(
+      [
+        ["date", "prefill", "today"],
+        ["text", "prefill", "client_name"],
+        ["date_signed", "client", undefined],
+        ["signature", "client", undefined],
+      ].sort(),
+    );
+  });
+
+  it("keeps a split date from the rules split when the review calls one piece today's date", async () => {
+    const doc = await PDFDocument.create();
+    const font = await doc.embedFont(StandardFonts.Helvetica);
+    const page = doc.addPage([612, 792]);
+    const text = (value: string, x: number, top: number) => page.drawText(value, { x, y: 792 - top, size: 11, font });
+    text("This Agreement is entered into as of ______________, 20____ (the \"Effective Date\").", 72, 100);
+    text("Client Signature: ______________________", 72, 300);
+    const ai = recorder((request) => ({
+      decisions: [{ candidate_id: candidate(request, /today_month_day/), keep: true, type: "date", role: "prefill", merge_key: "today", label: "Effective date", required: false }],
+      additions: [],
+      notes: [],
+    }));
+    const r = await detectFieldsWith(new Uint8Array(await doc.save()), {}, { ai: ai.caller });
+    expect(r.fields.filter((f) => f.role === "prefill").map((f) => [f.type, f.mergeKey]).sort()).toEqual([
+      ["text", "custom:today_month_day"],
+      ["text", "custom:today_year_short"],
+    ]);
+  });
+
+  describe("a letter that closes with the sender's typed name", () => {
+    async function letter(companyLine = "Managing Partner, Lumen Ridge Advisory"): Promise<Uint8Array> {
+      const doc = await PDFDocument.create();
+      const font = await doc.embedFont(StandardFonts.Helvetica);
+      const page = doc.addPage([612, 792]);
+      const text = (value: string, x: number, top: number) => page.drawText(value, { x, y: 792 - top, size: 11, font });
+      text("Dear Client:", 72, 120);
+      text("This letter confirms the terms of our engagement. If you agree, sign where shown below.", 72, 150);
+      text("Yours faithfully,", 72, 400);
+      text("Morgan Sample", 72, 430);
+      text(companyLine, 72, 444);
+      text("Agreed and accepted:", 72, 480);
+      text("Signature: ______________________", 72, 510);
+      text("Name: ______________________", 72, 540);
+      text("Company: ______________________", 72, 570);
+      text("Date: ______________________", 72, 600);
+      return new Uint8Array(await doc.save());
+    }
+    const shapes = (fields: Field[]) => fields.map((f) => `${f.type}/${f.role}`).sort();
+
+    it("gives the rules one block for the client, with the Company row as a detail of it", async () => {
+      const r = await detectFieldsWith(await letter(), { companyName: "Lumen Ridge Advisory", useAI: false });
+      expect(shapes(r.fields)).toEqual(["company/client", "date_signed/client", "full_name/client", "signature/client"]);
+    });
+
+    it("does not let the review add a company signature in the space beside the closing", async () => {
+      const ai = recorder((request) => ({
+        decisions: [],
+        additions: [{ line_id: lineId(request, /Yours faithfully/), placement: "after_text", blank_index: 0, type: "signature", role: "company", merge_key: "none", label: "Company signature", required: true }],
+        notes: ["The letter has no drawn line for Morgan Sample; a company signature field was added after the closing."],
+      }));
+      const r = await detectFieldsWith(await letter(), { companyName: "Lumen Ridge Advisory" }, { ai: ai.caller });
+      expect(r.fields.filter((f) => f.role === "company")).toHaveLength(0);
+      expect(shapes(r.fields)).toContain("signature/client");
+      const notes = r.meta.notes.join(" ");
+      expect(notes).toMatch(/only the client signs/);
+      expect(notes).not.toMatch(/was added after the closing/);
+    });
+
+    it("still lets the review add a company signature where the document asks for one", async () => {
+      const ai = recorder((request) => ({
+        decisions: [],
+        additions: [{ line_id: lineId(request, /Signed for and on behalf/), placement: "after_text", blank_index: 0, type: "signature", role: "company", merge_key: "none", label: "Company signature", required: true }],
+        notes: [],
+      }));
+      const r = await detectFieldsWith(await letter("Signed for and on behalf of Lumen Ridge Advisory"), { companyName: "Lumen Ridge Advisory" }, { ai: ai.caller });
+      expect(r.fields.filter((f) => f.type === "signature" && f.role === "company")).toHaveLength(1);
+      expect(r.meta.notes.join(" ")).not.toMatch(/only the client signs/);
+    });
+  });
+
   it("appends a signature page for a scan when the model finds nowhere to sign or fails", async () => {
     for (const ai of [async () => ({ fields: [], notes: [] }), async () => ({ fields: [{ page: "one" }] }), async () => Promise.reject(new Error("boom"))] as AiCaller[]) {
       const r = await detectFieldsWith(await scan(), {}, { ai });
