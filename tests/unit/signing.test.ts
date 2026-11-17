@@ -25,7 +25,7 @@ import { ServiceError, type Actor } from "@/lib/services/context";
 import { putBlob } from "@/lib/services/blobs";
 import { clearTestOutbox, getTestOutbox } from "@/lib/services/email";
 import { sendAgreementForFile, voidEnvelope } from "@/lib/services/envelopes";
-import { FINALIZE_FAILED_EVENT, MAX_SIGNER_IMAGE_PIXELS, SEAL_WARNING_EVENT, brandOf, calendarParts, inTransaction, isRetryableTxError, linkDeadEmail, orgTimeZone, declineSigning, finalizeEnvelope, getSignedCopy, getSigningDocument, getSigningSession, listUnsealedEnvelopeIds, longDate, maskEmail, signedDateLabel, submitSigning, validateSignerValues, verifyDocument } from "@/lib/services/signing";
+import { FINALIZE_FAILED_EVENT, MAX_SIGNER_IMAGE_PIXELS, SEAL_WARNING_EVENT, brandOf, calendarParts, certificateIp, inTransaction, isRetryableTxError, linkDeadEmail, orgTimeZone, declineSigning, finalizeEnvelope, getSignedCopy, getSigningDocument, getSigningSession, listUnsealedEnvelopeIds, longDate, maskEmail, signedDateLabel, submitSigning, validateSignerValues, verifyDocument } from "@/lib/services/signing";
 import { findSignerBySecret, hashSigningSecret, signingSecret, signingUrl } from "@/lib/services/tokens";
 import { runScheduledJobs } from "@/lib/services/jobs";
 import { describeEvent, listEvents } from "@/lib/services/events";
@@ -1115,6 +1115,16 @@ describe("the brand that emails carry", () => {
     expect(withLogo.logoUrl).toMatch(/^https?:\/\/[^/]+\/api\/public\/logo\/org_logo_test$/);
     expect(brandOf({ ...base, settings: {} } as unknown as Org).logoUrl).toBeUndefined();
     expect(brandOf({ ...base, settings: { logo: "" } } as unknown as Org).logoUrl).toBeUndefined();
+  });
+});
+
+describe("the address printed on the certificate", () => {
+  it("leaves out loopback addresses and keeps real ones as recorded", () => {
+    for (const loopback of ["::1", "127.0.0.1", "::ffff:127.0.0.1", "[::1]", " 127.0.1.1 ", "", null, undefined]) {
+      expect(certificateIp(loopback)).toBeNull();
+    }
+    expect(certificateIp("203.0.113.9")).toBe("203.0.113.9");
+    expect(certificateIp("2001:db8::1")).toBe("2001:db8::1");
   });
 });
 

@@ -1401,6 +1401,19 @@ export type FinalizeResult =
   | { status: "not_ready"; reason: string }
   | { status: "failed"; error: string };
 
+/**
+ * A loopback address says only that the request reached the server from itself (local
+ * development, or a proxy that passed no client address). Printing it on a certificate as
+ * where someone signed from would be wrong, so it is recorded as not known.
+ */
+export function certificateIp(ip: string | null | undefined): string | null {
+  const value = typeof ip === "string" ? ip.trim() : "";
+  if (!value) return null;
+  const bare = value.replace(/^\[|\]$/g, "").replace(/^::ffff:/i, "").toLowerCase();
+  if (bare === "::1" || bare === "0:0:0:0:0:0:0:1" || bare === "localhost" || /^127\.\d{1,3}\.\d{1,3}\.\d{1,3}$/.test(bare)) return null;
+  return value;
+}
+
 const METHOD_TEXT: Record<string, string> = {
   // Says nothing about email: the link may have been emailed or handed over by the sender,
   // and the certificate must not contradict its own timeline.
@@ -1524,7 +1537,7 @@ export async function finalizeEnvelope(envelopeId: string): Promise<FinalizeResu
           email: s.email,
           signedAt: s.signedAt ?? completedAt,
           consentAt: s.consentAt,
-          ip: s.ip,
+          ip: certificateIp(s.ip),
           userAgent: s.userAgent,
           method: METHOD_TEXT[methodBySigner.get(s.id) ?? "link"] ?? METHOD_TEXT.link,
         }),
