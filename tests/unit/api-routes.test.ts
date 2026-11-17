@@ -469,6 +469,8 @@ describe("reading and changing files", () => {
 
     await expectError(await sendRoute.POST(req("POST", `/files/${id}/send`, world.key, {}), ctx({ id })), 409, "conflict");
     await expectError(await sendRoute.POST(req("POST", `/files/${id}/send`, world.key, { agreement_id: "tpl_doesnotexist" }), ctx({ id })), 404, "not_found");
+    // An id holding a NUL byte cannot exist; it is "not found", not a failure on our side.
+    await expectError(await fileRoute.GET(req("GET", "/files/a%00b", world.key), ctx({ id: "a\u0000b" })), 404, "not_found");
 
     const replaced = await (await sendRoute.POST(req("POST", `/files/${id}/send`, world.key, { replace: true }), ctx({ id }))).json();
     expect(replaced.agreement.sent).toBe(true);

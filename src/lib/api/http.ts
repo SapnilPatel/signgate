@@ -231,6 +231,15 @@ export function apiRoute<P extends RouteParams = Record<string, never>>(
         );
       }
 
+      // Ids are short printable strings. Anything else cannot match a row, and a NUL byte
+      // makes Postgres reject the whole query, which would be reported as our failure.
+      const params = ((await context?.params) ?? {}) as P;
+      for (const value of Object.values(params).flat()) {
+        if (typeof value === "string" && (value.length > 200 || /[\u0000-\u001f\u007f]/.test(value))) {
+          throw new ApiError("not_found", "Nothing was found at this address. Check the id in the path and send the request again.");
+        }
+      }
+
       const method = request.method.toUpperCase();
       const url = new URL(request.url);
       const bodyText = WRITE_METHODS.has(method) ? await readBodyText(request) : "";
@@ -240,7 +249,7 @@ export function apiRoute<P extends RouteParams = Record<string, never>>(
         org: auth.org,
         request,
         url,
-        params: ((await context?.params) ?? {}) as P,
+        params,
         meta: requestMetaFrom(request),
         body: (schema) => validate(schema, (parsedBody ??= parseJsonObject(bodyText, request.headers.get("content-type"))), "body"),
         query: (schema) => validate(schema, Object.fromEntries(url.searchParams), "query string"),
