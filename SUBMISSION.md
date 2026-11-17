@@ -3,6 +3,13 @@
 - **Use it:** https://signgate-theta.vercel.app
 - **Code:** https://github.com/SapnilPatel/signgate (private; `theastraway` is invited as a collaborator)
 - **API reference:** https://signgate-theta.vercel.app/docs/api
+- **See it in use without setting anything up:** sign in at https://signgate-theta.vercel.app/login as
+  `demo@signgate.example` with password `northfield-demo-2026`. This is a fictional firm, "Northfield Legal (demo)",
+  with 17 files in every state (waiting on the client, waiting on countersignature, signed, declined, voided,
+  expired), built by running the real signing lifecycle. Its signed PDFs download and pass `/verify`.
+  All names and addresses in it are invented.
+
+![The files list](docs/screenshots/files-list.png)
 
 ## What I built
 
@@ -121,12 +128,17 @@ confirm a copy is unaltered, computing the hash in the browser so the document i
 
 ## How it was verified
 
-- 884 unit and service tests against an in-memory Postgres, including concurrency cases
+- 894 unit and service tests against an in-memory Postgres, including concurrency cases
   (two submissions of the same link produce one signature) and cross-company access attempts.
 - 15 browser journeys with Playwright, client side on a phone profile, asserting on the bytes of the
   downloaded PDF.
 - A live smoke test against the deployed site with real email: sign up, verify, upload, send, sign on
   a phone, countersign, download, verify.
+- Two evaluator simulations on ten agreements the product was not tuned for (multi-page services
+  agreements with per-page initials, a signature block mid-document followed by exhibits, Word files with
+  table signature blocks, labels under drawn rules, a client-only letter, and scans with no text layer).
+  All ten went from upload to a sealed PDF. In the second round, four of six needed no correction in the
+  editor; the errors found were fixed at the root cause and covered by tests.
 - Two rounds of adversarial review by independent reviewers (documents built to break detection,
   security and tenancy, concurrency and failure, hosting limits, an evaluator simulation), with every
   confirmed finding fixed and covered by a regression test.
