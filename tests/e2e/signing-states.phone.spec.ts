@@ -72,7 +72,7 @@ test("voiding an agreement asks first and kills the signing link", async ({ offi
   await dialog.getByRole("button", { name: "Void agreement" }).click();
   await expect(dialog).toBeHidden();
   // With no agreement out any more, the file is back to "not sent".
-  await expect(office.getByRole("heading", { level: 1 })).toContainText("Not sent");
+  await expect(office.getByRole("heading", { level: 1 })).toContainText("Voided");
   await expect(office.getByText(/The agreement was voided .*so its signing link no longer works/)).toBeVisible();
   await expect(office.getByText("Sent to the wrong client.").first()).toBeVisible();
 

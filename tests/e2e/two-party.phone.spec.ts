@@ -24,7 +24,7 @@ test("a two-party agreement goes from upload to a sealed, verifiable PDF", async
 
   // Add the agreement and check what detection found.
   await addAgreementFile(office, { name: "client-services-agreement.pdf", mimeType: "application/pdf", buffer: await twoPartyPdf() });
-  await expect(office.getByRole("heading", { level: 1, name: "client-services-agreement" })).toBeVisible();
+  await expect(office.getByRole("heading", { level: 1, name: /client.services.agreement/i })).toBeVisible();
   await expect(office.getByText(/Found 2 signature blocks/)).toBeVisible();
   await expect(fieldBoxes(office, /filled by the client/)).toHaveCount(3);
   await expect(fieldBoxes(office, /filled by your company/)).toHaveCount(3);
@@ -41,7 +41,7 @@ test("a two-party agreement goes from upload to a sealed, verifiable PDF", async
 
   // The client signs on a phone, drawing the signature.
   await openToSign(phone, file.signingUrl);
-  await expect(phone.getByRole("heading", { level: 1, name: "client-services-agreement" })).toBeVisible();
+  await expect(phone.getByRole("heading", { level: 1, name: /client.services.agreement/i })).toBeVisible();
   await expect(phone.getByText(`${company.name} sent this agreement for you to read and sign, Casey Client.`)).toBeVisible();
   await expect(phone.getByRole("button", { name: /^Company signature/ })).toHaveCount(0);
   await agreeToSignElectronically(phone);
@@ -98,7 +98,7 @@ test("a two-party agreement goes from upload to a sealed, verifiable PDF", async
   await go(phone, "/verify");
   await phone.locator('input[type="file"]').setInputFiles({ name: "signed-agreement.pdf", mimeType: "application/pdf", buffer: sealed });
   await expect(phone.getByRole("heading", { name: "This is a sealed, unaltered agreement" })).toBeVisible();
-  await expect(phone.getByText("client-services-agreement", { exact: true })).toBeVisible();
+  await expect(phone.getByText(/^client.services.agreement$/i)).toBeVisible();
   await expect(phone.getByText(company.name, { exact: true })).toBeVisible();
   await expect(phone.getByText("Casey Client", { exact: true })).toBeVisible();
   await expect(phone.getByText(createHash("sha256").update(sealed).digest("hex"))).toBeVisible();
