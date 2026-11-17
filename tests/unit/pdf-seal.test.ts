@@ -285,6 +285,28 @@ describe("sealDocument", () => {
     expect(pages[2].text).toContain("Jane Example");
   });
 
+  it("prints the certificate at the agreement's own page size, and at Letter when that size is unusual", async () => {
+    const a4 = await PDFDocument.create();
+    a4.addPage([595.28, 841.89]);
+    await appendCertificate(a4, certificate({ events: events(120) }));
+    const pages = await readPages(await a4.save());
+    expect(pages.length).toBeGreaterThan(2);
+    for (const page of pages) {
+      expect(page.width).toBeCloseTo(595.28, 1);
+      expect(page.height).toBeCloseTo(841.89, 1);
+      for (const run of page.runs) {
+        expect(run.x, run.text).toBeGreaterThanOrEqual(54 - 0.01);
+        expect(run.x + run.width, run.text).toBeLessThanOrEqual(595.28 - 54 + 0.5);
+      }
+    }
+
+    const receipt = await PDFDocument.create();
+    receipt.addPage([220, 400]);
+    await appendCertificate(receipt, certificate());
+    const size = receipt.getPages()[1].getSize();
+    expect([size.width, size.height]).toEqual([612, 792]);
+  });
+
   it("puts a small envelope reference in the bottom margin of every original page, upright on rotated pages", async () => {
     const specs = [{}, { rotation: 90 }, { rotation: 180 }, { rotation: 270 }, { crop: [60, 90, 380, 500] as [number, number, number, number] }];
     const sealed = await sealDocument({ pdf: await agreement(specs), fields: [], values: {}, certificate: certificate() });

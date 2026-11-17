@@ -9,15 +9,42 @@ import { rgb } from "pdf-lib";
 import type { PDFDocument, PDFFont, PDFPage } from "pdf-lib";
 import type { CertificateData, CertificateEvent, CertificateSigner } from "./types";
 import { embedFonts } from "./fonts";
+import { displaySize } from "./geometry";
 import { drawableText, truncateToWidth, undrawableCharacters, wrapText } from "./stamp";
 
-const PAGE_WIDTH = 612;
-const PAGE_HEIGHT = 792;
+const LETTER = { width: 612, height: 792 };
 const MARGIN = 54;
-const CONTENT_WIDTH = PAGE_WIDTH - MARGIN * 2;
 const LABEL_WIDTH = 132;
 const VALUE_X = MARGIN + LABEL_WIDTH;
-const VALUE_WIDTH = CONTENT_WIDTH - LABEL_WIDTH;
+// The page size follows the agreement (see usePageSize). These are set at the start of each
+// certificate and read only by the synchronous drawing that follows, so two seals running in
+// one process cannot see each other's size.
+let PAGE_WIDTH = LETTER.width;
+let PAGE_HEIGHT = LETTER.height;
+let CONTENT_WIDTH = PAGE_WIDTH - MARGIN * 2;
+let VALUE_WIDTH = CONTENT_WIDTH - LABEL_WIDTH;
+
+/**
+ * Matches the certificate to the agreement's last page as displayed, so an A4 agreement does
+ * not end in Letter pages that print at a different scale. Sizes the layout was not designed
+ * for (receipts, posters, unreadable boxes) fall back to Letter.
+ */
+function usePageSize(doc: PDFDocument): void {
+  let size = LETTER;
+  try {
+    const pages = doc.getPages();
+    const last = pages.length ? displaySize(pages[pages.length - 1]) : null;
+    if (last && last.width >= 400 && last.width <= 900 && last.height >= 500 && last.height <= 1300) {
+      size = { width: last.width, height: last.height };
+    }
+  } catch {
+    // keep Letter
+  }
+  PAGE_WIDTH = size.width;
+  PAGE_HEIGHT = size.height;
+  CONTENT_WIDTH = PAGE_WIDTH - MARGIN * 2;
+  VALUE_WIDTH = CONTENT_WIDTH - LABEL_WIDTH;
+}
 /** Content stops here so it never runs into the page footer. */
 const BOTTOM = MARGIN + 22;
 
@@ -266,7 +293,8 @@ function drawTimeline(flow: Flow, events: readonly CertificateEvent[]): void {
 }
 
 /**
- * Appends the signing certificate to the document as one or more Letter pages.
+ * Appends the signing certificate to the document as one or more pages the size of
+ * the agreement's last page (Letter when that size is unusual).
  * Pass `fonts` when the caller has already embedded Noto Sans in this document,
  * so the sealed file does not carry the same font twice.
  * Returns a plain description of each name that holds characters the font could not draw
@@ -275,6 +303,8 @@ function drawTimeline(flow: Flow, events: readonly CertificateEvent[]): void {
 export async function appendCertificate(doc: PDFDocument, data: CertificateData, fonts?: CertificateFonts): Promise<string[]> {
   const lost: string[] = [];
   const f = fonts ?? (await embedFonts(doc, ["regular", "bold"]));
+  // After the last await: everything below is synchronous.
+  usePageSize(doc);
   const text = (value: unknown, max = 600) => drawableText(f.regular, value, max);
   const signers = Array.isArray(data?.signers) ? data.signers : [];
   const events = Array.isArray(data?.events) ? data.events : [];
