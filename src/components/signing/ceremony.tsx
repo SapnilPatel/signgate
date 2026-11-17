@@ -421,6 +421,14 @@ export function Ceremony({ token, org, agreementName, fileReference, signer, pag
     setTyping({ field, text: typeof value === "string" ? value : "" });
   };
 
+  /**
+   * A filled-in value is sized to fit its box, by height and by width, so a long date or name on a
+   * narrow phone is shrunk rather than cut off. Below the smallest readable size it is cut off after all.
+   */
+  const fitText = (text: string): CSSProperties => ({
+    fontSize: `clamp(6px, min(62cqh, ${(165 / Math.max(1, text.length)).toFixed(1)}cqw), 15px)`,
+  });
+
   /** Scroll a field into the middle of the screen, then open it once it has arrived. */
   const goTo = (field: Field) => {
     setStarted(true);
@@ -643,7 +651,7 @@ export function Ceremony({ token, org, agreementName, fileReference, signer, pag
             role="img"
             className="absolute flex items-end [container-type:size]"
           >
-            <span className="truncate border-b border-dotted border-ink-faint text-[clamp(7px,62cqh,15px)] leading-tight text-ink">{today}</span>
+            <span style={fitText(today)} className="truncate border-b border-dotted border-ink-faint leading-tight text-ink">{today}</span>
           </div>
         );
       }
@@ -667,7 +675,7 @@ export function Ceremony({ token, org, agreementName, fileReference, signer, pag
               onFocus={() => setActiveId(field.id)}
               aria-label={`${field.label || "Checkbox"}${field.required ? " (required)" : ""}`}
               aria-invalid={error ? true : undefined}
-              className="h-[18px] w-[18px] accent-ink"
+              className="h-[18px] w-[18px] scroll-mb-36 accent-ink"
             />
             {errorNote}
           </label>
@@ -699,7 +707,7 @@ export function Ceremony({ token, org, agreementName, fileReference, signer, pag
               aria-invalid={error ? true : undefined}
               autoComplete={field.type === "email" ? "email" : field.type === "full_name" ? "name" : field.type === "company" ? "organization" : field.type === "title" ? "organization-title" : "off"}
               style={{ fontSize: `${size}px` }}
-              className="absolute inset-0 h-full w-full rounded-sm bg-transparent px-1 text-ink placeholder:text-flag-ink/70 focus:bg-paper focus:outline-2 focus:outline-note"
+              className="absolute inset-0 h-full w-full scroll-mb-36 rounded-sm bg-transparent px-1 text-ink placeholder:text-flag-ink/70 focus:bg-paper focus:outline-2 focus:outline-note"
             />
             {errorNote}
           </div>
@@ -721,7 +729,7 @@ export function Ceremony({ token, org, agreementName, fileReference, signer, pag
           }
           // With a mouse the pseudo-element widens the target a little; under a finger the halo above does.
           className={cx(
-            "absolute flex items-end rounded-sm text-left [container-type:size]",
+            "absolute flex scroll-mb-36 items-end rounded-sm text-left [container-type:size]",
             !coarse && "after:absolute after:-inset-x-1 after:-inset-y-2 after:content-['']",
             isImage(field) && !done ? "items-center justify-center" : "",
             tone,
@@ -731,7 +739,9 @@ export function Ceremony({ token, org, agreementName, fileReference, signer, pag
             // eslint-disable-next-line @next/next/no-img-element -- a data URL made in this browser
             <img src={value} alt="" className="h-full w-full object-contain object-left-bottom" />
           ) : done ? (
-            <span className="w-full truncate px-[2cqw] text-[clamp(7px,62cqh,15px)] leading-tight text-ink">{shownValue(field, String(value))}</span>
+            <span style={fitText(shownValue(field, String(value)))} className="w-full truncate px-[2cqw] leading-tight text-ink">
+              {shownValue(field, String(value))}
+            </span>
           ) : (
             <span className={cx("w-full truncate px-[2cqw] text-[clamp(7px,58cqh,14px)] leading-tight font-semibold text-flag-ink", isImage(field) && "text-center")}>
               {emptyLabel(field)}
