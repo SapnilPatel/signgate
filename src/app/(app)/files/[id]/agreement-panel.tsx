@@ -4,7 +4,7 @@ import Link from "next/link";
 import { useRouter } from "next/navigation";
 import { useId, useState, useTransition, type FormEvent } from "react";
 import type { ActionState } from "@/lib/action";
-import { Button, FormField, Input, Notice, Textarea, buttonClass } from "@/components/ui";
+import { Button, FormField, Input, Notice, Select, Textarea, buttonClass } from "@/components/ui";
 import type { AgreementOutcome } from "../action-types";
 import {
   archiveFileAction,
@@ -56,7 +56,19 @@ export interface PanelModel {
     canEmail: boolean;
   } | null;
   documents: { label: string; href: string; primary?: boolean }[];
+  /**
+   * The agreements that can be sent now, the default first. A choice is drawn only when
+   * there is more than one; `preferredId` is the one this file last had, when it is still among them.
+   */
+  agreements: { id: string; name: string }[];
+  preferredId: string | null;
 }
+
+/**
+ * For buttons whose label carries a name the company typed (its own name, a colleague's):
+ * the shared button is a single unbreakable line, which pushes a long name off a phone screen.
+ */
+const WRAPS = "h-auto! max-w-full py-2 text-left whitespace-normal! [overflow-wrap:anywhere]";
 
 type Result = ActionState<AgreementOutcome>;
 type Asking = "correct" | "void" | "replace" | null;
@@ -69,7 +81,25 @@ export function AgreementPanel({ model }: { model: PanelModel }) {
   const [asking, setAsking] = useState<Asking>(null);
   const [dialogError, setDialogError] = useState<{ message: string; fields: Record<string, string> } | null>(null);
 
-  const { send, open } = model;
+  const { send, open, agreements } = model;
+  const agreementField = useId();
+  const [picked, setPicked] = useState<string | null>(null);
+  // What was picked wins while it can still be sent; otherwise the file's last agreement, then the default.
+  const agreement = agreements.find((a) => a.id === picked) ?? agreements.find((a) => a.id === model.preferredId) ?? agreements[0] ?? null;
+  // With a single agreement nothing is passed and the service uses the company default, as before.
+  const templateId = agreements.length > 1 ? agreement?.id : undefined;
+  const picker = (id: string, hint: string) =>
+    agreements.length > 1 ? (
+      <FormField label="Agreement" htmlFor={id} hint={hint}>
+        <Select id={id} value={agreement?.id ?? ""} disabled={pending} onChange={(event) => setPicked(event.target.value)} className="sm:max-w-md">
+          {agreements.map((choice, index) => (
+            <option key={choice.id} value={choice.id}>
+              {index === 0 ? `${choice.name} (default)` : choice.name}
+            </option>
+          ))}
+        </Select>
+      </FormField>
+    ) : null;
   const client = open?.client ?? null;
 
   /**
@@ -129,14 +159,15 @@ export function AgreementPanel({ model }: { model: PanelModel }) {
             </p>
           </Notice>
         ) : (
-          <div className="space-y-2">
-            <Button disabled={pending} aria-busy={busy === "send"} onClick={() => run("send", () => sendAgreementAction(model.fileId))}>
+          <div className="space-y-3">
+            {picker(`${agreementField}-send`, "Your company has more than one agreement in use. This one is sent for this file.")}
+            <Button disabled={pending} aria-busy={busy === "send"} onClick={() => run("send", () => sendAgreementAction(model.fileId, { templateId }))}>
               {label("send", send.label, "Sending…")}
             </Button>
             <p className="text-[13px] [overflow-wrap:anywhere] text-ink-soft">
               {send.emailNote
-                ? `"${send.agreementName}" will be prepared for ${send.to}. ${send.emailNote}`
-                : `"${send.agreementName}" will be emailed to ${send.to} for signature.`}
+                ? `"${agreement?.name ?? send.agreementName}" will be prepared for ${send.to}. ${send.emailNote}`
+                : `"${agreement?.name ?? send.agreementName}" will be emailed to ${send.to} for signature.`}
             </p>
           </div>
         )
@@ -144,7 +175,7 @@ export function AgreementPanel({ model }: { model: PanelModel }) {
 
       {open?.countersignerId ? (
         <div>
-          <Button size="lg" disabled={pending} aria-busy={busy === "countersign"} onClick={() => run("countersign", () => countersignAction(open.countersignerId as string))}>
+          <Button size="lg" className={WRAPS} disabled={pending} aria-busy={busy === "countersign"} onClick={() => run("countersign", () => countersignAction(open.countersignerId as string))}>
             {label("countersign", `Sign for ${model.orgName}`, "Opening the agreement…")}
           </Button>
         </div>
@@ -189,7 +220,7 @@ export function AgreementPanel({ model }: { model: PanelModel }) {
             </Button>
           ) : null}
           {open.remindName && open.canEmail ? (
-            <Button variant="secondary" disabled={pending} aria-busy={busy === "remind"} onClick={() => run("remind", () => remindAction(open.envelopeId))}>
+            <Button variant="secondary" className={WRAPS} disabled={pending} aria-busy={busy === "remind"} onClick={() => run("remind", () => remindAction(open.envelopeId))}>
               {label("remind", `Send ${open.remindName} a reminder`, "Sending the reminder…")}
             </Button>
           ) : null}
@@ -254,9 +285,10 @@ export function AgreementPanel({ model }: { model: PanelModel }) {
       {open ? (
         <Dialog open={asking === "replace"} title="Send a fresh copy of the agreement?" onClose={() => setAsking(null)}>
           <p className="text-ink-soft">
-            The request that is out now is voided, so the link {model.clientName} already has stops working. A new request is made from your agreement as it is today and
-            sent to {client?.email ?? "the client"}.
+            The request that is out now is voided, so the link {model.clientName} already has stops working. A new request is made from{" "}
+            {agreements.length > 1 ? "the agreement chosen below" : "your agreement"} as it is today and sent to {client?.email ?? "the client"}.
           </p>
+          {picker(`${agreementField}-replace`, "The fresh copy is made from this agreement.")}
           {dialogError ? <Notice tone="error">{dialogError.message}</Notice> : null}
           <DialogButtons>
             <Button variant="secondary" disabled={pending} onClick={() => setAsking(null)}>
@@ -266,7 +298,7 @@ export function AgreementPanel({ model }: { model: PanelModel }) {
               disabled={pending}
               aria-busy={busy === "replace"}
               // The id of the request on screen makes a repeated click return the first replacement instead of replacing that too.
-              onClick={() => run("replace", () => sendAgreementAction(model.fileId, { replace: true, replaceEnvelopeId: open.envelopeId }), true)}
+              onClick={() => run("replace", () => sendAgreementAction(model.fileId, { templateId, replace: true, replaceEnvelopeId: open.envelopeId }), true)}
             >
               {label("replace", "Void it and send a fresh copy", "Sending…")}
             </Button>

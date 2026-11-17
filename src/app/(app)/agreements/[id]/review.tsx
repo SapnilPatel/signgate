@@ -10,17 +10,21 @@ import {
   SIGNING_ONLY,
   TYPE_LABEL,
   clampRect,
+  confirmed,
   defaultSize,
+  describeField,
   inReadingOrder,
   needsLook,
   newField,
   withChange,
 } from "@/components/field-editor/model";
 import { useHistory } from "@/components/field-editor/use-history";
-import { Button, ButtonLink, Notice, PageHeader, Select, Sheet, buttonClass, cx, formatDate } from "@/components/ui";
+import { Button, ButtonLink, Input, Notice, PageHeader, Select, Sheet, buttonClass, cx, formatDate } from "@/components/ui";
 import type { ActionState } from "@/lib/action";
 import type { Field, FieldRole, FieldType } from "@/lib/types";
-import { activateAgreementAction, saveFieldsAction } from "../actions";
+import { activateAgreementAction, renameAgreementAction, saveFieldsAction } from "../actions";
+import { ConfirmDialog } from "../confirm-dialog";
+import { readableName } from "../naming";
 import { AgreementStatusTag, DefaultTag } from "../status";
 import type { AgreementView } from "../view";
 import { ManageAgreement } from "./manage";
@@ -82,6 +86,17 @@ export function ReviewAgreement({
   const [showAdded, setShowAdded] = useState(added !== null);
   const leaving = useRef(false);
   const doneRef = useRef<HTMLDivElement>(null);
+  /** Open while the person decides about fields nobody has checked. */
+  const [confirmingUnchecked, setConfirmingUnchecked] = useState(false);
+
+  // A draft named after its file ("client-services-agreement") starts with a tidied name in
+  // the box, because clients read this name as the heading of the signing page. The draft is
+  // tied to the stored name it started from, so the box follows a rename made elsewhere.
+  const offeredName = canEdit && view.status === "draft" ? readableName(view.name) : view.name;
+  const [nameDraft, setNameDraft] = useState({ from: view.name, text: offeredName });
+  const nameText = nameDraft.from === view.name ? nameDraft.text : offeredName;
+  const nameTidied = offeredName !== view.name && nameText === offeredName;
+  const nameChanged = nameText.trim() !== "" && nameText.trim() !== view.name;
 
   const selected = fields.find((f) => f.id === selectedId) ?? null;
   const readOnly = !canEdit;
@@ -132,9 +147,9 @@ export function ReviewAgreement({
     requestAnimationFrame(() => doneRef.current?.scrollIntoView({ block: "nearest", behavior: "smooth" }));
   }, []);
 
-  async function save(): Promise<boolean> {
-    if (!dirty) return true;
-    const sending = fields;
+  /** Stores the fields on screen, or `sending` when a change was made too recently to be on screen yet. */
+  async function save(sending: Field[] = fields): Promise<boolean> {
+    if (!canEdit || sending === saved) return true;
     return perform(
       "save",
       () => saveFieldsAction(view.id, sending, view.version),
@@ -148,8 +163,38 @@ export function ReviewAgreement({
     );
   }
 
-  async function activate() {
-    if (!(await save())) return;
+  function rename(): Promise<boolean> {
+    return perform(
+      "rename",
+      () => renameAgreementAction(view.id, nameText),
+      (next: AgreementView) => {
+        adopt(next);
+        announce(`The agreement is now called “${next.name}”. Clients will see that name.`);
+      },
+    );
+  }
+
+  /** "Use this agreement": stops first when the detector's doubts have not been settled by a person. */
+  function activate() {
+    if (toCheck.length > 0) {
+      setConfirmingUnchecked(true);
+      return;
+    }
+    void activateNow();
+  }
+
+  /** The person has read the list and says the unchecked fields are right. */
+  function acceptUncheckedAndActivate() {
+    setConfirmingUnchecked(false);
+    const accepted = fields.map((f) => (needsLook(f) ? confirmed(f) : f));
+    history.commit(accepted);
+    void activateNow(accepted);
+  }
+
+  async function activateNow(sending: Field[] = fields) {
+    if (!(await save(sending))) return;
+    // The name in the box is the one the person has been shown as "what clients will see"; keep that promise.
+    if (nameChanged && !(await rename())) return;
     await perform(
       "activate",
       () => activateAgreementAction(view.id),
@@ -401,6 +446,41 @@ export function ReviewAgreement({
 
         {showAdded && added && ADDED_MESSAGE[added] ? <Notice tone="info">{ADDED_MESSAGE[added]}</Notice> : null}
 
+        {canEdit && view.status !== "archived" ? (
+          <Sheet className="p-4 sm:p-5">
+            <form
+              onSubmit={(event) => {
+                event.preventDefault();
+                if (nameChanged && busy === null) void rename();
+              }}
+            >
+              <label htmlFor="agreement-name" className="block text-sm font-semibold text-ink">
+                Name clients will see
+              </label>
+              <div className="mt-1.5 flex flex-wrap gap-2">
+                <Input
+                  id="agreement-name"
+                  value={nameText}
+                  maxLength={120}
+                  onChange={(event) => setNameDraft({ from: view.name, text: event.target.value })}
+                  className="min-w-0 flex-1 basis-56 sm:max-w-md"
+                  autoComplete="off"
+                  aria-describedby="agreement-name-hint"
+                />
+                <Button type="submit" variant="secondary" disabled={!nameChanged || busy !== null} aria-busy={busy === "rename"}>
+                  {busy === "rename" ? "Saving…" : "Save name"}
+                </Button>
+              </div>
+              <p id="agreement-name-hint" className="mt-1.5 max-w-[70ch] text-[13px] text-ink-soft">
+                {nameTidied
+                  ? `We tidied this up from your file name, “${view.name}”. Change it if it is not right. It is saved when you choose “Save name” or “Use this agreement”. `
+                  : null}
+                It is the heading of the page where clients sign, and it appears in the email asking them to sign and on the signed PDF.
+              </p>
+            </form>
+          </Sheet>
+        ) : null}
+
         <div ref={doneRef}>
           {done?.kind === "activated" ? (
             <Notice tone="success" title="This agreement is now in use">
@@ -437,26 +517,55 @@ export function ReviewAgreement({
               ) : (
                 <p>No fields were found. Add a signature field for the client below: choose “Signature”, then click where they should sign.</p>
               )}
-              {toCheck.length > 0 ? (
-                <p className="text-ink">
-                  <span className="font-semibold">
-                    {toCheck.length === 1 ? "1 field is marked “Check”" : `${toCheck.length} fields are marked “Check”`}
-                  </span>{" "}
-                  because we were not sure about {toCheck.length === 1 ? "it" : "them"}.{" "}
-                  <button type="button" className="font-semibold underline" onClick={() => jumpTo(toCheck[0].id)}>
-                    Show {toCheck.length === 1 ? "it" : "the first one"}
-                  </button>
-                </p>
-              ) : null}
             </div>
             <RoleLegend className="mt-3" />
           </Sheet>
         ) : null}
 
+        {/* Fields the detector doubted. Shown before readiness: "ready" must not be the last word while these are open. */}
+        {view.status !== "archived" && toCheck.length > 0 ? (
+          canEdit ? (
+            <Sheet className="p-4 sm:p-5">
+              <h2 className="text-base font-semibold text-ink">
+                {toCheck.length === 1 ? "1 field needs checking" : `${toCheck.length} fields need checking`}
+                {view.status === "draft" ? " before you use this agreement" : ""}
+              </h2>
+              <p className="mt-1 max-w-[70ch] text-sm text-ink-soft">
+                We were not sure what {toCheck.length === 1 ? "this blank is" : "these blanks are"} for, or who fills {toCheck.length === 1 ? "it" : "them"} in. Every field
+                left on the agreement is put in front of the person it is for, so look at each one and either keep it, correct it or remove it.
+              </p>
+              <ul className="mt-2 divide-y divide-rule-soft">
+                {toCheck.map((field) => (
+                  <li key={field.id} className="flex flex-wrap items-center justify-between gap-x-4 gap-y-2 py-2.5 text-sm">
+                    <p className="min-w-0 flex-1 basis-64 break-words text-ink">{describeField(field)}</p>
+                    <div className="flex flex-wrap gap-1.5">
+                      <Button variant="secondary" size="sm" onClick={() => jumpTo(field.id)}>
+                        Show it
+                      </Button>
+                      <Button variant="secondary" size="sm" onClick={() => changeField(confirmed(field))}>
+                        It is right as it is
+                      </Button>
+                      <Button variant="secondary" size="sm" onClick={() => history.commit(fields.filter((f) => f.id !== field.id))}>
+                        Remove
+                      </Button>
+                    </div>
+                  </li>
+                ))}
+              </ul>
+              <p className="mt-2 text-[13px] text-ink-soft">Removing a field can be undone with “Undo”.</p>
+            </Sheet>
+          ) : (
+            <Notice tone="info" title={toCheck.length === 1 ? "1 field still needs checking" : `${toCheck.length} fields still need checking`}>
+              We were not sure about {toCheck.length === 1 ? "one field" : "some fields"} when we read this document. An owner or admin needs to look at{" "}
+              {toCheck.length === 1 ? "it" : "them"}; {toCheck.length === 1 ? "it is" : "they are"} marked “Check” in the list of fields.
+            </Notice>
+          )
+        ) : null}
+
         {/* Readiness */}
         {view.status !== "archived" || !view.readiness.ready ? (
           view.readiness.ready ? (
-            view.status === "draft" ? (
+            view.status === "draft" && toCheck.length === 0 ? (
               <Notice tone="info" title="Ready to use">
                 {canEdit
                   ? "Check that every box is where it should be, then choose “Use this agreement”. Nothing is sent to a client until you do."
@@ -683,6 +792,34 @@ export function ReviewAgreement({
           </p>
         )}
       </div>
+
+      <ConfirmDialog
+        open={confirmingUnchecked && toCheck.length > 0}
+        title={toCheck.length === 1 ? "1 field has not been checked" : `${toCheck.length} fields have not been checked`}
+        confirmLabel={toCheck.length === 1 ? "It is right; use this agreement" : "They are right; use this agreement"}
+        cancelLabel="Go back and check"
+        onConfirm={acceptUncheckedAndActivate}
+        onCancel={() => {
+          setConfirmingUnchecked(false);
+          if (toCheck[0]) jumpTo(toCheck[0].id);
+        }}
+      >
+        <p>
+          We were not sure about {toCheck.length === 1 ? "this field" : "these fields"} when we read your document. If you use the agreement now,{" "}
+          {toCheck.length === 1 ? "it is" : "they are"} kept exactly as shown{autoSend ? ", and the agreement is sent on the next file you create" : ""}.
+        </p>
+        <ul className="list-disc space-y-1 pl-5 text-ink">
+          {toCheck.slice(0, 8).map((field) => (
+            <li key={field.id} className="break-words">
+              {describeField(field)}
+            </li>
+          ))}
+          {toCheck.length > 8 ? <li>and {toCheck.length - 8} more</li> : null}
+        </ul>
+        {toCheck.some((f) => f.role === "company" && f.type === "signature") ? (
+          <p>A company signature field means someone at your company must countersign every agreement.</p>
+        ) : null}
+      </ConfirmDialog>
     </div>
   );
 }

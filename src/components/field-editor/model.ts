@@ -102,6 +102,7 @@ export const MERGE_OPTIONS: readonly { key: MergeKey; label: string }[] = [
   { key: "today", label: "Today's date (the day it is sent)" },
   { key: "custom:today_day", label: "Today: day of the month" },
   { key: "custom:today_month", label: "Today: month" },
+  { key: "custom:today_month_day", label: "Today: month and day" },
   { key: "custom:today_year", label: "Today: year" },
   { key: "custom:today_year_short", label: "Today: two-digit year" },
 ];

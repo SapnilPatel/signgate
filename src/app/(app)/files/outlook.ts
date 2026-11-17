@@ -12,6 +12,11 @@ import { listTemplates } from "@/lib/services/templates";
 export interface SendingOutlook {
   /** The agreement a new file gets, or null when the company has none it can send. */
   agreement: { id: string; name: string } | null;
+  /**
+   * Every agreement that could be sent right now (in use and ready), the default first.
+   * Empty when sending is blocked. The screens offer a choice only when there is more than one.
+   */
+  choices: { id: string; name: string }[];
   /** Why nothing can be sent at all, in words to show as they are; null when sending works. */
   blocked: string | null;
   /** True when the fix for `blocked` is to set up an agreement, so the screen links there. */
@@ -42,8 +47,14 @@ export async function getSendingOutlook(actor: Actor, org: Org): Promise<Sending
     blocked = chosen.readiness.problems[0]?.message ?? `"${chosen.name}" is not ready to send.`;
   }
 
+  const choices =
+    chosen && !blocked
+      ? [chosen, ...active.filter((t) => t.id !== chosen.id && t.readiness.ready).sort((a, b) => a.name.localeCompare(b.name))].map((t) => ({ id: t.id, name: t.name }))
+      : [];
+
   return {
     agreement: chosen && !blocked ? { id: chosen.id, name: chosen.name } : null,
+    choices,
     blocked,
     needsAgreement,
     email: !email.emailConfigured ? "not_configured" : email.canEmailOutside ? "ok" : "unverified",

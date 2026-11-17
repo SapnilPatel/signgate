@@ -1,5 +1,6 @@
 "use client";
 
+import { readableName } from "../naming";
 import { useRouter } from "next/navigation";
 import { useEffect, useId, useRef, useState, type DragEvent, type FormEvent } from "react";
 import { PdfOpenError } from "@/components/pdf/pdfjs";
@@ -205,7 +206,7 @@ export function AddAgreement({ maxBytes, maxPages }: { maxBytes: number; maxPage
       setError(`"${file.name}" is ${formatBytes(file.size)}, which is over the ${formatBytes(maxBytes)} limit. Save a smaller copy (for example with "Reduce file size") and upload that.`);
       return;
     }
-    void run({ title: file.name, name: "", blob: file, filename: file.name, mimeType: file.type || "application/octet-stream", session: null, original: file });
+    void run({ title: file.name, name: readableName(file.name), blob: file, filename: file.name, mimeType: file.type || "application/octet-stream", session: null, original: file });
   }
 
   function onDrop(event: DragEvent) {

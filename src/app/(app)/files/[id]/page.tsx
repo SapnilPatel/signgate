@@ -9,9 +9,10 @@ import { ServiceError, type Actor } from "@/lib/services/context";
 import type { DescribedEvent, SignerView } from "@/lib/services/envelopes";
 import { getFile, type FileEnvelope } from "@/lib/services/files";
 import { orgTimeZone } from "@/lib/services/signing";
-import { ButtonLink, Notice, PageHeader, SectionTitle, Sheet, StatusBadge, cx, formatDate } from "@/components/ui";
+import { ButtonLink, Notice, PageHeader, SectionTitle, Sheet, cx, formatDate } from "@/components/ui";
 import { onComingDay, onPastDay, pastDay, shortDate } from "../format";
 import { getSendingOutlook } from "../outlook";
+import { FileStatusBadge } from "../status";
 import { AgreementPanel, FileArchiveButton, type PanelModel } from "./agreement-panel";
 
 /** One lookup shared by the page and its title. */
@@ -162,8 +163,9 @@ const CLOSED_LABEL: Record<string, string> = { completed: "Signed", declined: "D
 
 function Detail({ label, children }: { label: string; children: React.ReactNode }) {
   return (
-    <div className="grid grid-cols-[5.5rem_1fr] gap-x-3 py-1.5">
-      <dt className="text-[13px] leading-[22px] text-ink-soft">{label}</dt>
+    // The value sits under its label and has the panel's full width, so an email address is not split to fit a narrow column.
+    <div className="py-1.5">
+      <dt className="text-[13px] text-ink-soft [overflow-wrap:anywhere]">{label}</dt>
       <dd className="min-w-0 [overflow-wrap:anywhere]">{children}</dd>
     </div>
   );
@@ -275,6 +277,9 @@ export default async function FilePage({ params, searchParams }: { params: Promi
           }
         : null,
     documents,
+    agreements: outlook.choices,
+    // Sending again, or sending a fresh copy, starts from the agreement this file already had.
+    preferredId: current?.templateId ?? null,
   };
 
   const recent = [...events].reverse();
@@ -287,7 +292,7 @@ export default async function FilePage({ params, searchParams }: { params: Promi
         title={
           <span className="flex flex-wrap items-center gap-x-3 gap-y-1">
             <span className="min-w-0 break-words">{file.clientName}</span>
-            <StatusBadge status={file.agreementStatus} className="font-sans" />
+            <FileStatusBadge status={file.agreementStatus} voided={current?.status === "voided"} className="font-sans" />
           </span>
         }
         description={

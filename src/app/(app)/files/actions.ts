@@ -17,6 +17,9 @@ import {
 import { archiveFile, createFile, unarchiveFile, updateFile } from "@/lib/services/files";
 import type { AgreementOutcome, CreateFileOutcome, UpdateFileOutcome } from "./action-types";
 
+/** An agreement id from a form or a client component: a short string, or nothing (the company default). */
+const chosenAgreement = (value: unknown): string | undefined => (typeof value === "string" && value.length > 0 && value.length <= 64 ? value : undefined);
+
 const NOT_EMAILED = "The agreement is ready to sign, but it was not emailed.";
 
 /** A sentence for a request that went out, or did not, and the link when it has to be shared by hand. */
@@ -36,6 +39,11 @@ function delivered(result: { delivery: string; deliveryReason?: string; signingU
 export async function createFileAction(_prev: ActionState<CreateFileOutcome>, form: FormData): Promise<ActionState<CreateFileOutcome>> {
   return runAction(async () => {
     const { actor } = await assertActor();
+    const meta = await getRequestMeta();
+    // Always explicit, so what the form said is what happens whatever the company default is.
+    const send = form.get("skipSend") !== "on";
+    // Present when the form offered a choice of agreement.
+    const templateId = send ? chosenAgreement(form.get("templateId")) : undefined;
     const result = await createFile(
       actor,
       {
@@ -46,11 +54,24 @@ export async function createFileAction(_prev: ActionState<CreateFileOutcome>, fo
         clientPhone: field(form, "clientPhone"),
         description: field(form, "description"),
         reference: field(form, "reference"),
-        // Always explicit, so what the form said is what happens whatever the company default is.
-        send: form.get("skipSend") !== "on",
+        // Creating a file can only send the default agreement, so a chosen one is sent as a second step.
+        send: send && !templateId,
       },
-      await getRequestMeta(),
+      meta,
     );
+    if (templateId && result.created) {
+      // The file exists now. Like createFile itself, a problem with the agreement is reported, never thrown.
+      try {
+        const sent = await sendAgreementForFile(actor, result.file.id, { templateId }, meta);
+        result.agreement = { sent: true, envelopeId: sent.envelopeId, delivery: sent.delivery, deliveryReason: sent.deliveryReason, signingUrl: sent.signingUrl };
+      } catch (err) {
+        if (!(err instanceof ServiceError)) console.error("[files] sending the chosen agreement failed", err instanceof Error ? err.message : String(err));
+        result.agreement = {
+          sent: false,
+          reason: err instanceof ServiceError ? err.message : "The file was created, but the agreement could not be sent just now. Open the file and send it from there.",
+        };
+      }
+    }
     const { agreement } = result;
     return {
       data: {
@@ -121,6 +142,8 @@ export async function restoreFileAction(fileId: string): Promise<ActionState<Agr
 // ---------------------------------------------------------------------------
 
 export interface SendChoices {
+  /** The agreement to send, when the sender picked one; otherwise the company default. */
+  templateId?: string;
   /** Void what is out (or supersede what is closed) and send the current agreement. */
   replace?: boolean;
   /** The envelope the sender was looking at, so a repeated click returns the first replacement. */
@@ -136,6 +159,7 @@ export async function sendAgreementAction(fileId: string, choices: SendChoices =
       actor,
       fileId,
       {
+        templateId: chosenAgreement(choices?.templateId),
         replace: choices?.replace === true,
         replaceEnvelopeId: typeof choices?.replaceEnvelopeId === "string" ? choices.replaceEnvelopeId : undefined,
         replaceSigned: choices?.replaceSigned === true,

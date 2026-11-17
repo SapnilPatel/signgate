@@ -1,15 +1,15 @@
 "use client";
 
 import Link from "next/link";
-import { startTransition, useActionState, useState } from "react";
-import { Button, ButtonLink, Notice, Sheet } from "@/components/ui";
+import { startTransition, useActionState, useId, useState } from "react";
+import { Button, ButtonLink, FormField, Notice, Select, Sheet } from "@/components/ui";
 import type { CreateFileOutcome } from "../action-types";
 import { createFileAction } from "../actions";
 import { CopyLink, LabelledInput, LabelledTextarea } from "../controls";
 import type { SendingOutlook } from "../outlook";
 
 /** What saving will do, said before the button is pressed. */
-function Plan({ outlook, manager, skip, email }: { outlook: SendingOutlook; manager: boolean; skip: boolean; email: string }) {
+function Plan({ outlook, manager, skip, email, name }: { outlook: SendingOutlook; manager: boolean; skip: boolean; email: string; name: string }) {
   if (outlook.blocked) {
     return (
       <Notice tone="info" title="No agreement will be sent for this file yet">
@@ -26,7 +26,6 @@ function Plan({ outlook, manager, skip, email }: { outlook: SendingOutlook; mana
       </Notice>
     );
   }
-  const name = outlook.agreement?.name ?? "Your agreement";
   if (skip) {
     return (
       <Notice tone="info" title="Nothing will be sent">
@@ -109,6 +108,10 @@ export function NewFileForm({ outlook, manager }: { outlook: SendingOutlook; man
   // The result on screen belongs to one submission; "Create another file" moves past it.
   const [dismissed, setDismissed] = useState<unknown>(null);
   const [formKey, setFormKey] = useState(0);
+  // Offered only when the company has more than one agreement it could send; the default comes first.
+  const [agreementId, setAgreementId] = useState(outlook.choices[0]?.id ?? "");
+  const agreementField = useId();
+  const chosen = outlook.choices.find((c) => c.id === agreementId) ?? outlook.choices[0];
 
   if (state?.ok && state.data && dismissed !== state) {
     return (
@@ -118,6 +121,7 @@ export function NewFileForm({ outlook, manager }: { outlook: SendingOutlook; man
           setDismissed(state);
           setEmail("");
           setSkip(!outlook.autoSend);
+          setAgreementId(outlook.choices[0]?.id ?? "");
           setFormKey((k) => k + 1);
         }}
       />
@@ -189,7 +193,18 @@ export function NewFileForm({ outlook, manager }: { outlook: SendingOutlook; man
               <span>Create the file without sending the agreement</span>
             </label>
           )}
-          <Plan outlook={outlook} manager={manager} skip={skip} email={email} />
+          {willSend && outlook.choices.length > 1 ? (
+            <FormField label="Agreement" htmlFor={agreementField} hint="Your company has more than one agreement in use. This one is sent for this file.">
+              <Select id={agreementField} name="templateId" value={chosen?.id ?? ""} onChange={(event) => setAgreementId(event.target.value)}>
+                {outlook.choices.map((choice, index) => (
+                  <option key={choice.id} value={choice.id}>
+                    {index === 0 ? `${choice.name} (default)` : choice.name}
+                  </option>
+                ))}
+              </Select>
+            </FormField>
+          ) : null}
+          <Plan outlook={outlook} manager={manager} skip={skip} email={email} name={chosen?.name ?? outlook.agreement?.name ?? "Your agreement"} />
         </div>
 
         <div className="flex flex-col-reverse gap-2 sm:flex-row sm:justify-end">

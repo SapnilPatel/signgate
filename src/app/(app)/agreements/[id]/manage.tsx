@@ -12,7 +12,6 @@ import {
   enableIntakeLinkAction,
   makeDefaultAction,
   redetectFieldsAction,
-  renameAgreementAction,
 } from "../actions";
 import { ConfirmDialog } from "../confirm-dialog";
 import { ApiError, apiJson, beginUpload, cancelUpload, formatBytes, isAbort, sendChunks } from "../upload-client";
@@ -35,7 +34,7 @@ function Row({ id, title, children, controls }: { id?: string; title: string; ch
   );
 }
 
-/** Everything about an agreement besides its fields: name, default, document, intake link, copy and archive. */
+/** Everything about an agreement besides its fields and its name: default, document, intake link, copy and archive. */
 export function ManageAgreement({
   view,
   dirty,
@@ -59,11 +58,6 @@ export function ManageAgreement({
 }) {
   const router = useRouter();
   const ids = useId();
-  // What is being typed in the name box, tied to the stored name it started from: when the
-  // stored name changes (a save, a colleague's rename after a reload) the box follows it.
-  const [nameDraft, setNameDraft] = useState({ from: view.name, text: view.name });
-  const name = nameDraft.from === view.name ? nameDraft.text : view.name;
-  const setName = (text: string) => setNameDraft({ from: view.name, text });
   const [confirming, setConfirming] = useState<Confirming>(null);
   const [upload, setUpload] = useState<{ sent: number; total: number } | "reading" | null>(null);
   const [copied, setCopied] = useState<"yes" | "manual" | null>(null);
@@ -75,17 +69,6 @@ export function ManageAgreement({
   useEffect(() => () => abortRef.current?.abort(), []);
 
   const unsavedWarning = dirty ? <p className="font-semibold text-ink">The changes you have not saved will be lost too.</p> : null;
-
-  function rename() {
-    void perform(
-      "rename",
-      () => renameAgreementAction(view.id, name),
-      (next: AgreementView) => {
-        adopt(next);
-        announce(`The agreement is now called “${next.name}”.`);
-      },
-    );
-  }
 
   function makeDefault() {
     void perform(
@@ -209,37 +192,12 @@ export function ManageAgreement({
     setConfirming({ kind: "replace", file });
   }
 
-  const nameChanged = name.trim() !== "" && name.trim() !== view.name;
-
   return (
     <section aria-labelledby={`${ids}-manage`} className="pt-4">
       <h2 id={`${ids}-manage`} className="mb-2 font-serif text-xl font-semibold text-ink">
         Manage this agreement
       </h2>
       <Sheet className="divide-y divide-rule-soft">
-        <Row
-          title="Name"
-          controls={
-            <form
-              className="flex w-full flex-wrap gap-2 sm:w-auto"
-              onSubmit={(event) => {
-                event.preventDefault();
-                if (nameChanged && !working) rename();
-              }}
-            >
-              <label htmlFor={`${ids}-name`} className="sr-only">
-                Name of this agreement
-              </label>
-              <Input id={`${ids}-name`} value={name} maxLength={120} onChange={(event) => setName(event.target.value)} className="min-w-0 flex-1 sm:w-64" autoComplete="off" />
-              <Button type="submit" variant="secondary" disabled={!nameChanged || working} aria-busy={busy === "rename"}>
-                {busy === "rename" ? "Saving…" : "Save name"}
-              </Button>
-            </form>
-          }
-        >
-          Clients see this name in the email asking them to sign.
-        </Row>
-
         <Row
           title="Default agreement"
           controls={
