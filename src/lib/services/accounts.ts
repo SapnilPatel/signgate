@@ -1405,3 +1405,20 @@ export async function clearSignature(actor: Actor): Promise<Member> {
     return toMember(updated);
   });
 }
+
+
+/**
+ * A company's logo as image bytes, for the one public address that serves it to
+ * email clients (which do not display inline data: images). Returns nothing else
+ * about the company, and only PNG or JPEG: the types accepted when a logo is saved.
+ */
+export async function getOrgLogo(orgId: unknown): Promise<{ bytes: Buffer; contentType: "image/png" | "image/jpeg" } | null> {
+  if (typeof orgId !== "string" || !/^org_[0-9a-z]{8,40}$/.test(orgId)) return null;
+  const db = await getDb();
+  const [row] = await db.select({ settings: orgs.settings }).from(orgs).where(eq(orgs.id, orgId)).limit(1);
+  const logo = row?.settings?.logo;
+  if (typeof logo !== "string") return null;
+  const match = /^data:(image\/png|image\/jpeg);base64,([A-Za-z0-9+/=]+)$/.exec(logo);
+  if (!match) return null;
+  return { bytes: Buffer.from(match[2], "base64"), contentType: match[1] as "image/png" | "image/jpeg" };
+}
