@@ -45,8 +45,9 @@ The client's request has two halves, and I built for both:
   renders the pages to images and the agreement is rebuilt from those. An upload cannot dead-end.
 - *AI is an improvement, not a dependency.* An optional AI pass can reclassify the candidates the rules
   found, but only by pointing at real lines of text, so it cannot invent coordinates. Any AI failure
-  falls back silently to the rules. The live deployment runs on rules alone, so what you test does not
-  depend on a model being available.
+  falls back silently to the rules within a 25-second cap. The live deployment has the AI pass switched
+  on, and the same agreements were tested with it off: both produce a signable result, so what you test
+  does not depend on a model being available.
 
 **A "file" is the unit, because that is how these companies work.** Law firms, mortgage brokers, public
 adjusters, accountants and consultancies all open a file per client job, and the agreement is the gate
@@ -120,7 +121,7 @@ confirm a copy is unaltered, computing the hash in the browser so the document i
 
 ## How it was verified
 
-- About 880 unit and service tests against an in-memory Postgres, including concurrency cases
+- 884 unit and service tests against an in-memory Postgres, including concurrency cases
   (two submissions of the same link produce one signature) and cross-company access attempts.
 - 15 browser journeys with Playwright, client side on a phone profile, asserting on the bytes of the
   downloaded PDF.
