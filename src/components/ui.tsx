@@ -4,7 +4,7 @@
  * Keep every screen on these so the product reads as one thing.
  */
 import Link from "next/link";
-import type { ComponentProps, ReactNode } from "react";
+import { cloneElement, isValidElement, type ComponentProps, type ReactNode } from "react";
 
 export function cx(...parts: (string | false | null | undefined)[]): string {
   return parts.filter(Boolean).join(" ");
@@ -97,19 +97,30 @@ export function FormField({
   children: ReactNode;
   className?: string;
 }) {
+  // The control is told which paragraph explains it, so a screen reader that lands on
+  // an invalid field reads the reason and not only "invalid".
+  const noteId = error ? `${htmlFor}-error` : hint ? `${htmlFor}-hint` : undefined;
+  let control = children;
+  if (noteId && isValidElement<{ "aria-describedby"?: string; "aria-invalid"?: boolean | "true" | "false" }>(children)) {
+    const existing = children.props["aria-describedby"];
+    control = cloneElement(children, {
+      "aria-describedby": existing ? `${existing} ${noteId}` : noteId,
+      ...(error ? { "aria-invalid": true } : {}),
+    });
+  }
   return (
     <div className={cx("space-y-1.5", className)}>
       <label htmlFor={htmlFor} className="flex items-baseline justify-between text-sm font-semibold text-ink">
         <span>{label}</span>
-        {optional ? <span className="text-xs font-normal text-ink-faint">Optional</span> : null}
+        {optional ? <span className="text-xs font-normal text-ink-soft">Optional</span> : null}
       </label>
-      {children}
+      {control}
       {error ? (
-        <p className="text-[13px] text-stop" role="alert">
+        <p id={noteId} className="text-[13px] text-stop" role="alert">
           {error}
         </p>
       ) : hint ? (
-        <p className="text-[13px] text-ink-soft">{hint}</p>
+        <p id={noteId} className="text-[13px] text-ink-soft">{hint}</p>
       ) : null}
     </div>
   );

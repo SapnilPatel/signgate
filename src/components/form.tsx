@@ -1,6 +1,6 @@
 "use client";
 
-import { createContext, startTransition, useActionState, useContext, type ReactNode } from "react";
+import { createContext, startTransition, useActionState, useContext, useEffect, useRef, type ReactNode } from "react";
 import type { ActionState } from "@/lib/action";
 import { Button, Notice } from "@/components/ui";
 
@@ -21,8 +21,19 @@ export function useFormState() {
  */
 export function ActionForm({ action, children, className }: { action: Action; children: ReactNode; className?: string }) {
   const [state, formAction, pending] = useActionState(action, null);
+  const formRef = useRef<HTMLFormElement>(null);
+  const errorRef = useRef<HTMLDivElement>(null);
+  // After a failed submit the browser leaves focus on nothing; a keyboard user would
+  // start again from the top of the page. Put them on the first field to correct, or
+  // on the message when no single field is at fault.
+  useEffect(() => {
+    if (!state || state.ok) return;
+    const invalid = formRef.current?.querySelector<HTMLElement>('[aria-invalid="true"]:not([disabled])');
+    (invalid ?? errorRef.current)?.focus();
+  }, [state]);
   return (
     <form
+      ref={formRef}
       action={formAction}
       onSubmit={(event) => {
         event.preventDefault();
@@ -33,7 +44,11 @@ export function ActionForm({ action, children, className }: { action: Action; ch
       className={className ?? "space-y-4"}
       noValidate
     >
-      {state && !state.ok ? <Notice tone="error">{state.error}</Notice> : null}
+      {state && !state.ok ? (
+        <div ref={errorRef} tabIndex={-1} className="rounded-md focus:outline-none focus-visible:ring-2 focus-visible:ring-note/40">
+          <Notice tone="error">{state.error}</Notice>
+        </div>
+      ) : null}
       {state && state.ok && state.message ? <Notice tone="success">{state.message}</Notice> : null}
       <FormContext.Provider value={{ state, pending }}>{children}</FormContext.Provider>
     </form>

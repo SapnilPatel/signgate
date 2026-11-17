@@ -198,16 +198,32 @@ export function contentDisposition(filename: string, inline = false): string {
   return `${inline ? "inline" : "attachment"}; filename="${ascii}"; filename*=UTF-8''${encoded}`;
 }
 
+const PDF_SLICE_BYTES = 512 * 1024;
+
 /** A PDF for download, or with `inline` for display in the browser's viewer. Never cached: agreements are private. */
 export function pdfResponse(bytes: Uint8Array, filename: string, opts: { inline?: boolean } = {}): Response {
   const name = /\.pdf$/i.test(filename) ? filename : `${filename || "document"}.pdf`;
   // A copy with its own exact-size buffer: a Buffer can be a window onto a larger shared pool.
-  const body = new Uint8Array(bytes);
+  const all = new Uint8Array(bytes);
+  // Sent as a stream in slices: the host rejects a single buffered response body above
+  // about 4.5 MB, and agreements (phone scans) are allowed up to 25 MB.
+  let offset = 0;
+  const body = new ReadableStream<Uint8Array>({
+    pull(controller) {
+      if (offset >= all.byteLength) {
+        controller.close();
+        return;
+      }
+      const end = Math.min(offset + PDF_SLICE_BYTES, all.byteLength);
+      controller.enqueue(all.subarray(offset, end));
+      offset = end;
+    },
+  });
   return new Response(body, {
     status: 200,
     headers: {
       "Content-Type": "application/pdf",
-      "Content-Length": String(body.byteLength),
+      "Content-Length": String(all.byteLength),
       "Content-Disposition": contentDisposition(name, opts.inline === true),
       ...PRIVATE_HEADERS,
     },

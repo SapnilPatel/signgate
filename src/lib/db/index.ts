@@ -31,8 +31,17 @@ async function connect(): Promise<Db> {
       // Serverless instances each hold their own pool; keep it small and let the
       // provider's pooler (Neon pgbouncer) do the multiplexing.
       max: Number(process.env.DATABASE_POOL_MAX ?? 5),
-      idleTimeoutMillis: 20_000,
+      // Short, so idle sockets are usually closed before the instance is frozen.
+      idleTimeoutMillis: 5_000,
       connectionTimeoutMillis: 10_000,
+      keepAlive: true,
+    });
+    // node-postgres emits 'error' on the pool when an idle client's socket dies (the
+    // provider closes connections while a serverless instance is frozen). Without a
+    // listener that is an uncaught exception that kills the instance mid-request.
+    // The pool has already discarded the dead client; the next query opens a new one.
+    pool.on("error", (err) => {
+      console.error("[db] idle connection lost:", err.message);
     });
     // Migrations for hosted Postgres run in the build step (npm run db:migrate),
     // never at request time.
