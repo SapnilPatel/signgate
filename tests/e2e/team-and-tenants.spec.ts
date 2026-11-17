@@ -84,7 +84,7 @@ test("one company cannot open another company's file, agreement or documents", a
     // These pages stream behind a loading state, so the status line has already gone out
     // as 200 by the time the lookup fails; what the person gets is the not-found page.
     await other.goto(path);
-    await expect(other.getByRole("heading", { name: /We could not find that page|Agreement not found/ }), path).toBeVisible();
+    await expect(other.getByRole("heading", { name: /We could not find that page|File not found|Agreement not found/ }), path).toBeVisible();
     await expect(other.getByText("Alex Achterberg")).toHaveCount(0);
     await expect(other.getByText("Engagement terms")).toHaveCount(0);
   }
