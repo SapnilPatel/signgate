@@ -338,7 +338,7 @@ function MemberItem({
                   danger: true,
                 }}
               >
-                Turn off
+                Turn off account
               </ActionButton>
             )}
           </div>

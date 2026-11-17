@@ -398,7 +398,7 @@ export function ImportFlow({ outlook, manager, maxRows }: { outlook: SendingOutl
                     <tr key={column.index} className="border-b border-rule-soft last:border-b-0">
                       <td className={cx(td, "pl-4 font-semibold break-words")}>{column.header}</td>
                       <td className={cx(td, "pr-4 break-words", column.target === null ? "text-ink-faint" : "text-ink-soft")}>
-                        {column.target?.startsWith("data:") ? "Kept on the file as an extra value" : describeTarget(column.target)}
+                        {column.target?.startsWith("data:") ? "Kept on the file as an extra value" : column.target === "description" ? "Notes" : describeTarget(column.target)}
                       </td>
                     </tr>
                   ))}

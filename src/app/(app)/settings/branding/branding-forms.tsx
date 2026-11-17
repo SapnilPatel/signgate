@@ -149,7 +149,7 @@ function Preview({ orgName, color, logo }: { orgName: string; color: string; log
             <div className="h-2 w-4/5 rounded-sm bg-rule-soft" />
             <div className="h-2 w-3/5 rounded-sm bg-rule-soft" />
             <span style={buttonStyle} className="mt-2 inline-block rounded-md px-4 py-2 text-sm font-semibold">
-              Finish signing
+              Finish and sign
             </span>
           </div>
         </div>
