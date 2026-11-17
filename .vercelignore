@@ -1,0 +1,14 @@
+# Uploaded to the host: source only. Local build output, caches, test output and secrets stay here.
+node_modules
+.next
+.next-*
+.data
+.git
+.neon
+.env*
+!.env.example
+test-results
+playwright-report
+tests
+public/pdfjs
+*.tsbuildinfo
