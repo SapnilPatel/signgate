@@ -173,7 +173,8 @@ type Tone = "info" | "success" | "warning" | "error";
 const toneClass: Record<Tone, string> = {
   info: "bg-note-soft border-note/30 text-ink",
   success: "bg-signed-soft border-signed/30 text-ink",
-  warning: "bg-flag-soft border-flag text-ink",
+  // Not the yellow flag: that colour means one thing only, "waiting on a signature".
+  warning: "bg-paper border-rule border-l-4 border-l-ink-soft text-ink",
   error: "bg-stop-soft border-stop/30 text-ink",
 };
 
