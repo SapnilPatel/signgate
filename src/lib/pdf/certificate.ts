@@ -16,7 +16,7 @@ const LETTER = { width: 612, height: 792 };
 const MARGIN = 54;
 const LABEL_WIDTH = 132;
 const VALUE_X = MARGIN + LABEL_WIDTH;
-// The page size follows the agreement (see usePageSize). These are set at the start of each
+// The page size follows the agreement (see applyPageSize). These are set at the start of each
 // certificate and read only by the synchronous drawing that follows, so two seals running in
 // one process cannot see each other's size.
 let PAGE_WIDTH = LETTER.width;
@@ -29,7 +29,7 @@ let VALUE_WIDTH = CONTENT_WIDTH - LABEL_WIDTH;
  * not end in Letter pages that print at a different scale. Sizes the layout was not designed
  * for (receipts, posters, unreadable boxes) fall back to Letter.
  */
-function usePageSize(doc: PDFDocument): void {
+function applyPageSize(doc: PDFDocument): void {
   let size = LETTER;
   try {
     const pages = doc.getPages();
@@ -304,7 +304,7 @@ export async function appendCertificate(doc: PDFDocument, data: CertificateData,
   const lost: string[] = [];
   const f = fonts ?? (await embedFonts(doc, ["regular", "bold"]));
   // After the last await: everything below is synchronous.
-  usePageSize(doc);
+  applyPageSize(doc);
   const text = (value: unknown, max = 600) => drawableText(f.regular, value, max);
   const signers = Array.isArray(data?.signers) ? data.signers : [];
   const events = Array.isArray(data?.events) ? data.events : [];
