@@ -51,7 +51,9 @@ The client's request has two halves, and I built for both:
   If the server cannot open a PDF at all (files "secured" against editing are common), the browser
   renders the pages to images and the agreement is rebuilt from those. An upload cannot dead-end.
 - *AI is an improvement, not a dependency.* An optional AI pass can reclassify the candidates the rules
-  found, but only by pointing at real lines of text, so it cannot invent coordinates. Any AI failure
+  found, but only by pointing at real lines of text, so it cannot invent coordinates. The one exception
+  is a scan with no text at all: there the model looks at the page images and proposes approximate
+  boxes, and the sender is told to check each one. Any AI failure
   falls back silently to the rules within a 25-second cap. The live deployment has the AI pass switched
   on, and the same agreements were tested with it off: both produce a signable result, so what you test
   does not depend on a model being available.
@@ -102,7 +104,7 @@ confirm a copy is unaltered, computing the hash in the browser so the document i
 | More than one client signer, or custom signing order | The request is one client per file signing one standard agreement. Co-signers and routing are a different product (a general e-signature tool) and would complicate the screen every client sees. |
 | Several documents per file (packets) | Same reason: "the same agreement on every file". Multiple agreement templates are supported; one is sent per file. |
 | Editing the agreement's wording inside the product | Companies already have their agreement and their counsel. Signgate fills blanks and collects signatures; it does not draft. |
-| OCR for scanned agreements | Scans still work (fields are placed by hand or on an appended page). OCR would add a heavy dependency for a case a company fixes once by exporting a proper PDF. |
+| OCR for scanned agreements | Scans still work: the AI pass reads the page images and proposes fields, and without it fields are placed by hand or on an appended signature page. The scan's text is never converted to real text, because OCR would add a heavy dependency for a case a company fixes once by exporting a proper PDF. |
 | SMS delivery, identity checks (ID, knowledge-based), notarization | Each needs a paid third party and, for some, licensing. Email plus a secret link is the accepted standard for client agreements. |
 | Native integrations with specific CRMs or case systems | I do not know which systems this industry's buyers run. The API and webhooks let any of them connect; named integrations should follow real customer demand. |
 | Single sign-on and two-factor sign-in | Worth adding for larger firms. Not what stands between a small firm and a signed agreement. |
