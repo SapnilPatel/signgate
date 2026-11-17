@@ -4,6 +4,8 @@
  *
  *   DEMO_PASSWORD=<at least 10 characters> npm run seed:demo
  *
+ * Against a hosted database, also pass that deployment's DATABASE_URL, APP_SECRET and APP_URL.
+ *
  * Everything in it is fictional (reserved example domains, invented people and firms).
  *
  * How it works, and why it is safe to point at a hosted database:
@@ -70,6 +72,12 @@ if (process.env.DATABASE_URL?.trim() && (process.env.APP_SECRET?.trim().length ?
   fail(
     "DATABASE_URL is set but APP_SECRET is not. Signing links are derived from APP_SECRET, so seeding a hosted database " +
       "without the deployment's own APP_SECRET would create links the deployment cannot open. Set APP_SECRET to the deployment's value and run again.",
+  );
+}
+if (process.env.DATABASE_URL?.trim() && !/^https:\/\//.test(process.env.APP_URL?.trim() ?? "")) {
+  fail(
+    "DATABASE_URL is set but APP_URL is not. The sealed PDFs print the address where they can be verified, and without APP_URL " +
+      "that would be a localhost address. Set APP_URL to the deployment's public https address and run again.",
   );
 }
 if (!process.env.DATABASE_URL?.trim() && (process.env.NODE_ENV === "test" || process.env.PGLITE_MEMORY === "1")) {

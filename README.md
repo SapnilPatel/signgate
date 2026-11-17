@@ -9,6 +9,21 @@ The file shows as signed, and work can start.
 
 Live: https://signgate-theta.vercel.app
 
+## What it looks like
+
+| | |
+| --- | --- |
+| ![The files list](docs/screenshots/files-list.png) | ![A signed file](docs/screenshots/signed-file.png) |
+| The files list: what is waiting on clients, what is waiting on you, and what is signed. | A signed file: the sealed PDF to download and the full timeline of who did what, and when. |
+| ![Reviewing an agreement](docs/screenshots/agreement-review.png) | ![The signing certificate](docs/screenshots/signing-certificate.png) |
+| Reviewing an agreement: the fields Signgate found, drawn on the document, yellow for the client and blue for your company. | The signing certificate sealed into every signed PDF: signers, times, devices and the document's fingerprint. |
+
+<img src="docs/screenshots/signing-phone.png" alt="The signing page on a phone" width="300">
+
+What the client sees on their phone: no account, the agreement itself, and a guided path to "Finish and sign".
+
+The screenshots show the fictional demo company described under [Demo data](#demo-data).
+
 ## How it works
 
 1. **Add your agreement.** Upload a PDF, a Word document, an image or pasted text. Signgate has never
@@ -53,6 +68,30 @@ npm test            # unit and service tests against an in-memory Postgres
 npm run test:e2e    # Playwright journeys in a real browser, client side on a phone profile
 npm run lint
 ```
+
+## Demo data
+
+```bash
+DEMO_PASSWORD='<at least 10 characters>' npm run seed:demo
+```
+
+Creates one fictional company, "Northfield Legal (demo)", so you can sign in as `demo@signgate.example`
+and see the product in use: an active engagement agreement, a second one in draft, a team member, and
+17 files across every state (signed and sealed, waiting on the client, waiting on countersignature,
+declined, voided, expired, not sent, archived) spread over the last month. The data is produced by
+running the real lifecycle through the service layer, so the signed PDFs download and verify.
+
+Safety rules the script enforces:
+
+- **It never sends email.** It refuses to start if `RESEND_API_KEY` or `SMTP_USER` is set, and it keeps
+  every message in memory and discards it.
+- **It runs once.** If `demo@signgate.example` already exists it says so and changes nothing.
+- **It only creates the demo company.** No other company's data is read or changed.
+- **Everything in it is invented.** Names are made up and addresses use reserved example domains.
+- It writes to whatever database the app would use: `DATABASE_URL` if set, otherwise the local `.data/pglite`.
+  Stop `npm run dev` first when seeding the local database, since the embedded database allows one process at a time.
+  Against a hosted database it also requires that deployment's `APP_SECRET` (signing links are derived
+  from it) and `APP_URL` (the verification address printed on sealed PDFs).
 
 ## Deploy
 
