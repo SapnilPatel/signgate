@@ -10,7 +10,7 @@ import { envelopes, files, orgs, signers, type Envelope, type FileRow, type Org,
 import { newId, randomString } from "@/lib/ids";
 import { LIMITS, ORG_SETTING_DEFAULTS } from "@/lib/types";
 import { cleanMultilineText, cleanText, isValidEmail, normalizeEmail } from "@/lib/validation";
-import { ServiceError, type Actor, type RequestMeta } from "./context";
+import { ServiceError, systemActor, type Actor, type RequestMeta } from "./context";
 import { assertActiveActor } from "./accounts";
 import { normalizeDataKey, type ImportRow } from "./csv";
 import {
@@ -25,7 +25,9 @@ import {
   type SignerView,
 } from "./envelopes";
 import { listEvents, recordEvent } from "./events";
+import { describeWait, rateLimit } from "./rate-limit";
 import { calendarParts, orgTimeZone } from "./signing";
+import { getTemplateByIntakeToken } from "./templates";
 import { enqueueWebhookEvent } from "./webhooks";
 
 // ---------------------------------------------------------------------------
@@ -1243,4 +1245,59 @@ export function summarizeImport(results: readonly ImportRowResult[]): { created:
     if (r.agreementSent) summary.agreementsSent++;
   }
   return summary;
+}
+
+// ---------------------------------------------------------------------------
+// Public intake link
+// ---------------------------------------------------------------------------
+
+const INTAKE_UNAVAILABLE = "This link is no longer in use. Contact the company directly and they will send you the agreement.";
+/** One person signing up once needs one request; a household or office behind one address needs a few. */
+const INTAKE_PER_ADDRESS_PER_HOUR = 5;
+/** A ceiling per link, so a leaked link cannot be used to send a company's quota of agreements. */
+const INTAKE_PER_LINK_PER_HOUR = 60;
+
+/**
+ * A client starts their own file from a company's public intake link. There is no
+ * signed-in caller: the token is the proof of access, and the company comes from the
+ * agreement the token belongs to, never from the request. Returns the client's own
+ * signing link so they can sign straight away.
+ */
+export async function createIntakeFile(
+  token: unknown,
+  input: { clientName: unknown; clientEmail: unknown; clientCompany?: unknown; clientPhone?: unknown },
+  meta?: RequestMeta,
+): Promise<{ fileId: string; signingUrl: string | null }> {
+  const found = await getTemplateByIntakeToken(token);
+  if (!found) throw new ServiceError("gone", INTAKE_UNAVAILABLE);
+  const { template, org } = found;
+
+  // Only the fields the public form offers; a reference, custom data or "do not send" cannot be supplied from outside.
+  const record: Record<string, unknown> = isRecord(input) ? input : {};
+  const values = validateCreate({
+    clientName: record.clientName,
+    clientEmail: record.clientEmail,
+    clientCompany: record.clientCompany,
+    clientPhone: record.clientPhone,
+  });
+
+  // Counted after validation so a typing mistake does not use up an attempt.
+  const perAddress = await rateLimit(`intake:ip:${meta?.ip || "unknown"}`, INTAKE_PER_ADDRESS_PER_HOUR, 3600);
+  const perLink = perAddress.ok ? await rateLimit(`intake:template:${template.id}`, INTAKE_PER_LINK_PER_HOUR, 3600) : perAddress;
+  if (!perLink.ok) {
+    throw new ServiceError("rate_limited", `Too many requests were sent from here. Try again ${describeWait(perLink.retryAfterSeconds)}, or contact the company directly.`);
+  }
+
+  const actor = systemActor(org.id);
+  const db = await getDb();
+  const { file } = await insertFile(db, actor, org, values, "intake", meta);
+
+  try {
+    const sent = await sendAgreementForFile(actor, file.id, { templateId: template.id }, meta);
+    return { fileId: file.id, signingUrl: sent.signingUrl };
+  } catch (err) {
+    // The file is kept and shows on the company's list as not sent, so the request is not lost.
+    console.error("[files] intake agreement could not be sent", { fileId: file.id, error: err instanceof Error ? err.message : String(err) });
+    throw new ServiceError("not_ready", "Your details were received, but the agreement could not be prepared just now. The company has your request and will send the agreement to you.");
+  }
 }

@@ -1399,10 +1399,23 @@ export type FinalizeResult =
   | { status: "failed"; error: string };
 
 const METHOD_TEXT: Record<string, string> = {
-  link: "Signed through an emailed signing link",
+  // Says nothing about email: the link may have been emailed or handed over by the sender,
+  // and the certificate must not contradict its own timeline.
+  link: "Signed through a private signing link issued to this signer",
   session: "Signed while signed in to the company account",
   auto: "Saved signature applied automatically when the client signed",
 };
+
+/**
+ * The certificate is read by the client and by third parties. A delivery failure is
+ * stated as a fact; the reason and the advice to the sender stay on the file's timeline.
+ */
+function certificateEventText(event: Parameters<typeof describeEvent>[0]): string {
+  if (event.type !== "envelope.delivery_failed") return describeEvent(event);
+  const data: Record<string, unknown> = event.data && typeof event.data === "object" && !Array.isArray(event.data) ? event.data : {};
+  const to = [data.to, data.recipient, data.email].find((v): v is string => typeof v === "string" && v.length > 0 && v.length <= 320);
+  return to ? `Email to ${to} was not sent` : "An email was not sent";
+}
 
 async function recordFinalizeFailure(ctx: EnvelopeContext, error: string): Promise<void> {
   let first = false;
@@ -1514,7 +1527,7 @@ export async function finalizeEnvelope(envelopeId: string): Promise<FinalizeResu
         }),
       ),
       events: [
-        ...trail.filter((e) => e.type !== FINALIZE_FAILED_EVENT).map((e) => ({ at: e.createdAt, description: describeEvent(e) })),
+        ...trail.filter((e) => e.type !== FINALIZE_FAILED_EVENT).map((e) => ({ at: e.createdAt, description: certificateEventText(e) })),
         { at: completedAt, description: describeEvent({ type: "envelope.completed", actor: "System", actorType: "system" }) },
       ],
       completedAt,

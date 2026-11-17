@@ -208,10 +208,68 @@ interface RawPiece {
   hardBreak: boolean;
 }
 
-function splitRun(run: TextRun): RawPiece[] {
+interface TypeScale {
+  /** How much wider or narrower this document's type is than the width table above. */
+  text: number;
+  /** Width of one underscore as a share of the font size, when the document shows it. */
+  underscore: number | null;
+}
+
+/**
+ * Measures the document's own type on ordinary lines of text, and its underscore on
+ * the runs that are mostly underscores (where the guess about the words matters least).
+ * Null when there is too little text to tell.
+ */
+function typeScale(runs: TextRun[]): TypeScale | null {
+  const ratios: number[] = [];
+  for (const run of runs) {
+    if (run.text.length < 25 || !(run.width > 0) || !(run.size > 0) || /_|\.{4,}|\s{3,}/.test(run.text)) continue;
+    let units = 0;
+    for (const ch of run.text) units += charWidth(ch);
+    ratios.push(run.width / ((units / 1000) * run.size));
+    if (ratios.length >= 400) break;
+  }
+  if (ratios.length < 3) return null;
+  const text = median(ratios, 1);
+  const ems: number[] = [];
+  for (const run of runs) {
+    const count = run.text.split("_").length - 1;
+    if (count < 8 || count < 0.6 * run.text.length || !(run.width > 0) || !(run.size > 0)) continue;
+    let others = 0;
+    for (const ch of run.text) if (ch !== "_") others += charWidth(ch);
+    ems.push((run.width - text * (others / 1000) * run.size) / count / run.size);
+    if (ems.length >= 200) break;
+  }
+  const underscore = ems.length ? median(ems, 0) : null;
+  return { text, underscore: underscore && underscore >= 0.35 && underscore <= 0.85 ? underscore : null };
+}
+
+function splitRun(run: TextRun, scale: TypeScale | null): RawPiece[] {
   const text = run.text;
+  const widths: number[] = [];
+  for (let i = 0; i < text.length; i++) widths.push(charWidth(text[i]));
+  // The underscore is the one glyph whose width varies wildly between typefaces (half
+  // an em in some, two thirds in others), and a blank is made of nothing else. Without
+  // its real width a blank after printed text ("20____") is placed on top of that text.
+  const underscores = text.split("_").length - 1;
+  if (scale && underscores >= 3 && run.width > 0 && run.size > 0) {
+    let others = 0;
+    for (let i = 0; i < text.length; i++) if (text[i] !== "_") others += widths[i];
+    // Prefer the width measured across the document; otherwise what this run's words leave over.
+    let each = scale.underscore ? scale.underscore * run.size : (run.width - scale.text * (others / 1000) * run.size) / underscores;
+    let perUnit = scale.text * (run.size / 1000);
+    if (scale.underscore && others > 0) {
+      const rest = run.width - each * underscores;
+      // The words must still fit believably beside the blanks, or the measurement does not apply to this run.
+      if (rest > 0.6 * perUnit * others && rest < 1.6 * perUnit * others) perUnit = rest / others;
+      else each = (run.width - perUnit * others) / underscores;
+    }
+    if (each >= 0.35 * run.size && each <= 0.85 * run.size) {
+      for (let i = 0; i < text.length; i++) widths[i] = text[i] === "_" ? each : perUnit * widths[i];
+    }
+  }
   const cumulative: number[] = [0];
-  for (let i = 0; i < text.length; i++) cumulative.push(cumulative[i] + charWidth(text[i]));
+  for (let i = 0; i < text.length; i++) cumulative.push(cumulative[i] + widths[i]);
   const total = cumulative[text.length] || 1;
   const width = run.width > 0 ? run.width : (total / 1000) * run.size;
   const at = (index: number) => run.x + (cumulative[index] / total) * width;
@@ -252,8 +310,8 @@ function splitRun(run: TextRun): RawPiece[] {
   return out;
 }
 
-function buildPieces(line: RunLine): RawPiece[] {
-  const raw = line.runs.flatMap(splitRun).sort((a, b) => a.x0 - b.x0);
+function buildPieces(line: RunLine, scale: TypeScale | null): RawPiece[] {
+  const raw = line.runs.flatMap((run) => splitRun(run, scale)).sort((a, b) => a.x0 - b.x0);
   const merged: RawPiece[] = [];
   for (const piece of raw) {
     const prev = merged[merged.length - 1];
@@ -309,10 +367,11 @@ export function buildModel(layout: ExtractedLayout, formFields: Field[] = []): M
   const linesByPage: Line[][] = pages.map(() => []);
   const blanks: Blank[] = [];
 
+  const scale = typeScale(layout.runs);
   for (const runLine of groupLines(layout.runs)) {
     if (!linesByPage[runLine.page]) continue;
     const line: Line = { id: "", page: runLine.page, baseline: runLine.baseline, size: runLine.size, pieces: [], synthetic: false };
-    for (const raw of buildPieces(runLine)) {
+    for (const raw of buildPieces(runLine, scale)) {
       const piece: Piece = { kind: raw.kind, text: raw.text, x0: raw.x0, x1: raw.x1 };
       if (raw.kind === "blank") {
         // Underscores are printed a little below the baseline.

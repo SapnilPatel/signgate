@@ -217,7 +217,10 @@ function contextAround(model: Model, blank: Blank): { left: string; right: strin
     }
     right += ` ${p.text}`;
   }
-  if (!hitBlank && right.trim().length < 14 && li >= 0 && li + 1 < lines.length) {
+  // A sentence that runs on to the next line carries its meaning there ("____, with its
+  // principal place of business / at ____ ("Client")"), so an unfinished one is read on.
+  const unfinished = right.trim().length < 14 || (right.trim().length < 70 && !/[.;:!?]/.test(right));
+  if (!hitBlank && unfinished && li >= 0 && li + 1 < lines.length) {
     const next = lines[li + 1];
     if (!next.synthetic && next.baseline - blank.line.baseline <= 2.4 * Math.max(next.size, blank.line.size)) right += ` ${next.pieces.map(show).join(" ")}`;
   }
@@ -349,7 +352,7 @@ export function detectByRules(model: Model, companyName?: string, options: RuleO
     let match = classifyBodyBlank(ctx.left, ctx.right);
     // What the agreement itself calls the party named right after the blank outranks the generic words.
     const defined = vocab.terms ? DEFINITION_AFTER.exec(ctx.right) : null;
-    if (defined && vocab.terms) {
+    if (defined && vocab.terms && !match.settled) {
       const term = normalize(defined[2]).replace(/^the /, "");
       if (vocab.terms.client.includes(term)) match = { type: "full_name", role: "prefill", mergeKey: "client_name", label: "Client name", confidence: 0.8 };
       else if (vocab.terms.sender.includes(term)) match = { type: "company", role: "prefill", mergeKey: "company_name", label: "Company name", confidence: 0.7 };
@@ -520,6 +523,8 @@ export function detectByRules(model: Model, companyName?: string, options: RuleO
     if (!cell || cellKey(cell) === cellKey(from) || emptyCells.has(cellKey(cell))) return false;
     return piecesInCell(model, cell).length === 0;
   };
+  const shortCells: { cell: Cell; pieces: Piece[]; cand: Candidate }[] = [];
+  const signatureCells: Blank[] = [];
   for (const line of model.lines) {
     if (line.synthetic || cellFields >= MAX_CELL_FIELDS) continue;
     for (const piece of line.pieces) {
@@ -570,13 +575,31 @@ export function detectByRules(model: Model, companyName?: string, options: RuleO
           emptyCells.add(cellKey(below));
         }
       }
+      if (!blank && !colon && (kind === "full_name" || kind === "date" || kind === "title" || kind === "company") && cell.x1 - pad - (textRight + 8) >= 70) {
+        // A short cell with its label in the corner and nothing else ("Full name", "Date").
+        // On its own that is a column heading; under a signature cell it is that signer's line.
+        const beside: Blank = { id: `c-${line.id}-${Math.round(cell.x0)}`, page: line.page, line: lastLine, x0: textRight + 8, x1: cell.x1 - pad, y: cell.y1 - pad, size: lastLine.size, source: "cell", top: cell.y0 + 1 };
+        shortCells.push({ cell, pieces: inside.map((p) => p.piece), cand: { blank: beside, kind, party: match.party, labelFrom: "left", labelX0: Math.min(...inside.map((p) => p.piece.x0)), implicit: false, inZone: inZone(line.page, beside.y), labelText: text } });
+        continue;
+      }
       if (!blank || blank.x1 - blank.x0 < 24) continue;
       for (const p of inside) consumed.add(p.piece);
       cellFields++;
       const cand: Candidate = { blank, kind, party: match.party, labelFrom: "left", labelX0: Math.min(...inside.map((p) => p.piece.x0)), implicit: false, inZone: inZone(line.page, blank.y), labelText: text };
       if (cand.kind === "initials") initials.push(cand);
       else block.push(cand);
+      if (cand.kind === "signature" && blank.source === "cell") signatureCells.push(blank);
     }
+  }
+
+  for (const short of shortCells) {
+    if (cellFields >= MAX_CELL_FIELDS) break;
+    const { cell } = short;
+    const under = signatureCells.some((sig) => sig.page === cell.page && sig.x0 >= cell.x0 - 1 && sig.x1 <= cell.x1 + 1 && sig.y <= cell.y0 + 2 && cell.y0 - sig.y <= 160);
+    if (!under) continue;
+    for (const piece of short.pieces) consumed.add(piece);
+    cellFields++;
+    block.push(short.cand);
   }
 
   // Three or more identical unlabelled lines stacked together are a write-in area
@@ -786,7 +809,8 @@ export function detectByRules(model: Model, companyName?: string, options: RuleO
   const unknown = signing.filter((c) => !c.role);
   if (unknown.length === 1) {
     unknown[0].role = !known("client") ? "client" : !known("company") ? "company" : "client";
-    unknown[0].guessed = true;
+    // With the other party named, the remaining block is the remaining party: not a guess.
+    unknown[0].guessed = signing.length !== 2 || known("client") === known("company");
   } else if (unknown.length > 1) {
     let companyPick: Cluster | null = null;
     if (!known("company")) {

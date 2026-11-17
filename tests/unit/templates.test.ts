@@ -37,6 +37,8 @@ import {
   type ReadinessMember,
 } from "@/lib/services/templates";
 import { beginUpload, putChunk } from "@/lib/services/uploads";
+import { createIntakeFile } from "@/lib/services/files";
+import { findSignerBySecret } from "@/lib/services/tokens";
 import { uploadChunks } from "@/lib/db/schema";
 
 // ---------------------------------------------------------------------------
@@ -1086,6 +1088,31 @@ describe("intake link", () => {
     const fresh = await enableIntakeLink(w.owner, t.id);
     expect(fresh.token).not.toBe(link.token);
     expect(await getTemplateByIntakeToken(link.token)).toBeNull();
+  });
+
+  it("creates a file for the link's own company and returns the client's signing link", async () => {
+    const w = await makeWorld("Harbour Test Ltd");
+    const other = await makeWorld("Other Test Ltd");
+    const t = await readyTemplate(w.owner);
+    await activateTemplate(w.owner, t.id);
+    const link = await enableIntakeLink(w.owner, t.id);
+    const meta = { ip: `203.0.113.${Math.floor(Math.random() * 200) + 1}`, userAgent: "vitest" };
+
+    const made = await createIntakeFile(link.token, { clientName: "Dana Test", clientEmail: "Dana@Example.test", orgId: other.orgId, send: false } as never, meta);
+    const db = await getDb();
+    const [file] = await db.select().from(files).where(eq(files.id, made.fileId));
+    expect(file).toMatchObject({ orgId: w.orgId, source: "intake", clientName: "Dana Test", clientEmail: "dana@example.test" });
+    expect(made.signingUrl).toMatch(/\/sign\/[A-Za-z0-9._~-]+$/);
+    const signer = await findSignerBySecret(made.signingUrl!.split("/sign/")[1]);
+    expect(signer).toMatchObject({ orgId: w.orgId, role: "client", email: "dana@example.test" });
+    const [envelope] = await db.select().from(envelopes).where(eq(envelopes.fileId, made.fileId));
+    expect(envelope.templateId).toBe(t.id);
+
+    await expectError(createIntakeFile(link.token, { clientName: "", clientEmail: "nope" }, meta), "invalid", /./);
+    await expectError(createIntakeFile("a".repeat(32), { clientName: "Dana Test", clientEmail: "dana@example.test" }, meta), "gone", /no longer in use/);
+    // Five an hour from one address; the first one above counted.
+    for (let i = 0; i < 4; i++) await createIntakeFile(link.token, { clientName: `Client ${i}`, clientEmail: `c${i}@example.test` }, meta);
+    await expectError(createIntakeFile(link.token, { clientName: "Sixth", clientEmail: "six@example.test" }, meta), "rate_limited", /Too many requests/);
   });
 
   it("returns null for anything that is not a live link", async () => {

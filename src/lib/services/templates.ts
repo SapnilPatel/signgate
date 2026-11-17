@@ -1343,6 +1343,7 @@ function sampleValues(fields: Field[], org: Org, countersigner: { name: string; 
     // The detector emits these for "this ___ day of ___, 20__" wording.
     "custom:today_day": ordinal(now.getUTCDate()),
     "custom:today_month": month,
+    "custom:today_month_day": `${month} ${now.getUTCDate()}`,
     "custom:today_year": year,
     "custom:today_year_short": year.slice(-2),
   };

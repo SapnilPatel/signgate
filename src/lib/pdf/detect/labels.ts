@@ -219,6 +219,8 @@ export interface BodyMatch {
   mergeKey?: MergeKey;
   label: string;
   confidence: number;
+  /** The words before the blank decide it; a party definition after it must not override. */
+  settled?: boolean;
 }
 
 const CLIENT_AFTER = /^[\s,]*\(?\s*(?:hereinafter|hereafter|herein|referred to as|called|known as|the|as|a|an|\s|,|"|“|”|\()*["“(]*\s*(?:the\s+)?["“]?(client|customer|patient|tenant|member|participant|buyer|purchaser|you|subscriber|homeowner|borrower|licensee|recipient)\b/i;
@@ -244,6 +246,10 @@ export function classifyBodyBlank(left: string, right: string): BodyMatch {
   const dateLead =
     /\b(dated|date|made|entered into|effective|executed|commenc\w*|as of|signed)\b\s*(and entered into\s*)?(effective\s*)?(as of|on|this|of)?\s*[:,]?\s*(the|this)?\s*$/.test(l) ||
     /^[\s,]*\(?\s*(the\s+)?["“]?effective date/.test(rl);
+  // "as of ____________, 20____": the year is its own blank after a printed "20", so the
+  // first blank takes the month and day and the second the last two digits.
+  if (/_\s*,\s*20\s*$/.test(l)) return { type: "text", role: "prefill", mergeKey: "custom:today_year_short", label: "Agreement date: year", confidence: 0.7 };
+  if (dateLead && !otherDate && /^\s*,\s*20\s*_/.test(rl)) return { type: "text", role: "prefill", mergeKey: "custom:today_month_day", label: "Agreement date: month and day", confidence: 0.75 };
   if (dateLead && !otherDate) return { type: "date", role: "prefill", mergeKey: "today", label: "Agreement date", confidence: 0.8 };
   if (/\bdate\b\s*[:]?\s*$/.test(l)) return { type: "date", role: "client", label: tailLabel(left, "Date"), confidence: 0.5 };
 
@@ -262,12 +268,28 @@ export function classifyBodyBlank(left: string, right: string): BodyMatch {
   if (/(^|[\s.:])i,?\s*$/.test(l) && /^\s*,?\s*(the undersigned|hereby|agree|acknowledge|understand|consent|authori[sz]e|certify|have|am|,)/.test(rl))
     return { type: "full_name", role: "prefill", mergeKey: "client_name", label: "Client name", confidence: 0.7 };
 
+  // "with its principal place of business at ____ ("Client")": the blank is an address, even
+  // though the definition after it names the party. Only the client can supply it.
+  if (/\b(place of business|registered office|offices?|address|residing|resides|located|domiciled)\s*(is|are)?\s*(at|in|of|:)?\s*$/.test(l)) {
+    return { type: "text", role: "client", label: clientLead || CLIENT_AFTER.test(r.slice(0, 70)) ? "Client address" : "Address", confidence: 0.6, settled: true };
+  }
+
+  // "... and ________, with its principal place of business at ____ ("Client")": the name
+  // comes first and its definition follows the address clause.
+  const afterAddress = /^[\s,]*(?:with|having|whose|of|located|residing|an?\s+\w+(?:\s+\w+){0,4}\s+(?:with|having|whose|located))\b[^.;_]{0,80}____\s*(.{0,60})/i.exec(right.replace(/\s+/g, " ").slice(0, 220));
+  if (afterAddress) {
+    if (CLIENT_AFTER.test(afterAddress[1])) return { type: "full_name", role: "prefill", mergeKey: "client_name", label: "Client name", confidence: 0.75 };
+    if (COMPANY_AFTER.test(afterAddress[1])) return { type: "company", role: "prefill", mergeKey: "company_name", label: "Company name", confidence: 0.65 };
+  }
+
   // "... and ________ (the "Client")": the definition right after the blank names who goes in it.
   const firstClause = r.split(/[.;]|____/)[0].slice(0, 70);
   if (CLIENT_AFTER.test(firstClause)) return { type: "full_name", role: "prefill", mergeKey: "client_name", label: "Client name", confidence: 0.8 };
   if (COMPANY_AFTER.test(firstClause)) return { type: "company", role: "prefill", mergeKey: "company_name", label: "Company name", confidence: 0.7 };
 
-  return { type: "text", role: "client", label: tailLabel(left, ""), confidence: 0.4 };
+  // Only words that were written as a label ("Policy number: ____") name the field. The
+  // tail of an ordinary sentence makes a label nobody can read ("California Consultant and").
+  return { type: "text", role: "client", label: /[:：]\s*$/.test(left) ? tailLabel(left, "") : "", confidence: 0.4 };
 }
 
 /** A short human label from the words just before a blank. */

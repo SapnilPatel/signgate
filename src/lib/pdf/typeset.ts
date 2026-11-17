@@ -11,6 +11,7 @@ import { PDFDocument, rgb, type PDFFont, type PDFImage, type PDFPage } from "pdf
 import { parse, NodeType, type HTMLElement, type Node } from "node-html-parser";
 import { LIMITS } from "@/lib/types";
 import { DocumentError } from "./types";
+import { ALIGN_MARK, TAB_TO_CLOSE, TAB_TO_OPEN } from "./ingest-zip";
 import { embedFonts, safeText, canRender, type FontSet, type FontStyle } from "./fonts";
 
 const PAGE_W = 612;
@@ -21,6 +22,8 @@ const CONTENT_H = PAGE_H - 2 * MARGIN;
 const BODY_SIZE = 11;
 const LEADING = 1.4;
 const TAB_STOP = 36;
+const TAB_MARKS = new RegExp(`${TAB_TO_OPEN}\\d{1,5}${TAB_TO_CLOSE}`, "g");
+const TOKENS = new RegExp(`\\n|\\t|${TAB_TO_OPEN}\\d{1,5}${TAB_TO_CLOSE}|[ ]+|[^\\n\\t ${TAB_TO_OPEN}]+`, "g");
 const LIST_INDENT = 24;
 const CELL_PAD = 4;
 const MAX_DEPTH = 150;
@@ -231,6 +234,13 @@ class Builder {
     const inlines = this.cur;
     this.cur = [];
     this.atBoundary = true;
+    // A Word paragraph's alignment arrives as a marker at the start of its text.
+    const lead = inlines.find((i) => i.t === "text");
+    if (lead && lead.t === "text" && lead.text.startsWith(ALIGN_MARK)) {
+      const align = lead.text[1] === "c" ? "center" : lead.text[1] === "r" ? "right" : this.curCtx.align;
+      lead.text = lead.text.slice(2);
+      this.curCtx = { ...this.curCtx, align };
+    }
     const visible = inlines.some((i) => i.t === "img" || i.t === "br" || (i.t === "text" && /[^\s]/.test(i.text)));
     if (!visible) return false;
     // A single trailing <br> before a block boundary does not add a line in a browser.
@@ -799,12 +809,16 @@ function layoutPara(p: Para, width: number, env: Env): Item[] {
     }
     const st = inline.st;
     const font = fontFor(env, st);
-    if (!env.replaced && !canRender(font, inline.text)) env.replaced = true;
-    for (const tok of inline.text.match(/\n|\t|[ ]+|[^\n\t ]+/g) ?? []) {
+    // Tab-stop markers are layout instructions, not characters the font is asked to draw.
+    if (!env.replaced && !canRender(font, inline.text.replace(TAB_MARKS, ""))) env.replaced = true;
+    for (const tok of inline.text.match(TOKENS) ?? []) {
       if (tok === "\n") {
         finish(false);
-      } else if (tok === "\t") {
-        const next = (Math.floor((line.w + 0.5) / TAB_STOP) + 1) * TAB_STOP;
+      } else if (tok === "\t" || tok[0] === TAB_TO_OPEN) {
+        // A tab to one of the paragraph's own stops goes there; one already passed, or an
+        // ordinary tab, goes to the next regular stop.
+        const custom = tok === "\t" ? 0 : Number(tok.slice(1, -1));
+        const next = custom > line.w + 0.5 ? custom : (Math.floor((line.w + 0.5) / TAB_STOP) + 1) * TAB_STOP;
         if (next > avail) finish(true);
         else {
           line.w = next;

@@ -59,26 +59,53 @@ export function listZipEntries(bytes: Uint8Array): ZipEntry[] {
 
 const LEADER_CHARS: Record<string, string> = { underscore: "_", heavy: "_", dot: ".", middleDot: ".", hyphen: "-" };
 
-/** Rewrites the tabs of one paragraph that has leader tab stops into the characters Word would draw. */
+/**
+ * Private-use characters that carry paragraph formatting through the Word-to-HTML
+ * step, which keeps text only. The typesetter reads them back (see typeset.ts).
+ */
+export const TAB_TO_OPEN = "\ue000";
+export const TAB_TO_CLOSE = "\ue001";
+export const ALIGN_MARK = "\ue002";
+
+/**
+ * Rewrites one paragraph so its layout survives conversion: leader tabs become the
+ * characters Word would draw, tabs to a custom stop say where they stop, and a centred
+ * or right-aligned paragraph says so.
+ */
 function rewriteParagraph(xml: string): string {
+  const props = /<w:pPr>[\s\S]*?<\/w:pPr>/.exec(xml);
+  const jc = props ? /<w:jc\s+w:val="(center|right|end)"/.exec(props[0])?.[1] : undefined;
+  if (props && jc && /<w:t[ >]/.test(xml)) {
+    const at = props.index + props[0].length;
+    xml = `${xml.slice(0, at)}<w:r><w:t>${ALIGN_MARK}${jc === "center" ? "c" : "r"}</w:t></w:r>${xml.slice(at)}`;
+  }
   const tabs = /<w:tabs>([\s\S]*?)<\/w:tabs>/.exec(xml);
-  if (!tabs || !tabs[1].includes("w:leader")) return xml;
-  const stops: { fill: string | undefined; pos: number }[] = [];
+  if (!tabs) return xml;
+  const stops: { fill: string | undefined; pos: number; left: boolean }[] = [];
   for (const m of tabs[1].matchAll(/<w:tab\b([^>]*)\/>/g)) {
     const attrs = m[1];
     if (/w:val="clear"/.test(attrs)) continue;
     const leader = /w:leader="(\w+)"/.exec(attrs)?.[1];
     const pos = Number(/w:pos="(-?\d+)"/.exec(attrs)?.[1] ?? "0");
-    stops.push({ fill: leader ? LEADER_CHARS[leader] : undefined, pos });
+    stops.push({ fill: leader ? LEADER_CHARS[leader] : undefined, pos, left: /w:val="(left|start)"/.test(attrs) });
   }
+  if (stops.length === 0) return xml;
   stops.sort((a, b) => a.pos - b.pos);
   const head = xml.slice(0, tabs.index + tabs[0].length);
+  const rest = xml.slice(head.length);
   let index = 0;
-  const body = xml.slice(head.length).replace(/<w:tab\s*\/>/g, (tab) => {
+  const body = rest.replace(/<w:tab\s*\/>/g, (tab, offset: number) => {
     const stop = stops[index];
     const previous = index > 0 ? stops[index - 1].pos : (stop?.pos ?? 0) * 0.3;
     index += 1;
-    if (!stop?.fill) return tab;
+    if (!stop) return tab;
+    if (!stop.fill) {
+      // An underlined tab is a line to sign on and is handled as one; any other tab to a
+      // left stop keeps its position, so "Date" still lands under its own blank.
+      const run = rest.slice(Math.max(0, rest.lastIndexOf("<w:r>", offset), rest.lastIndexOf("<w:r ", offset)), offset);
+      if (!stop.left || stop.pos <= 0 || /<w:u\b(?![^>]*w:val="none")/.test(run)) return tab;
+      return `<w:t>${TAB_TO_OPEN}${Math.round(stop.pos / 20)}${TAB_TO_CLOSE}</w:t>`;
+    }
     // Positions are in twentieths of a point; an underscore is about 5.5 pt wide at body size.
     const points = Math.max(0, stop.pos - previous) / 20;
     const count = Math.min(60, Math.max(6, Math.round(points / 5.5)));
@@ -90,8 +117,9 @@ function rewriteParagraph(xml: string): string {
 /**
  * Word draws many signature lines as a tab with a "leader" (a tab stop that fills
  * its gap with underscores or dots). The leader is paragraph formatting, not text,
- * so it is lost in conversion and the signature line with it. This rewrites such
- * tabs as real characters before conversion. On any problem the original bytes are
+ * so it is lost in conversion and the signature line with it. Custom tab stops and
+ * centred paragraphs are lost the same way. This rewrites all three into the text
+ * before conversion. On any problem the original bytes are
  * returned unchanged: this is an improvement, never a reason to fail an upload.
  */
 export async function applyTabLeaders(docx: Uint8Array): Promise<Uint8Array> {
@@ -101,7 +129,7 @@ export async function applyTabLeaders(docx: Uint8Array): Promise<Uint8Array> {
     const part = zip.file("word/document.xml");
     if (!part) return docx;
     const xml = await part.async("string");
-    if (!xml.includes("w:leader=")) return docx;
+    if (!xml.includes("<w:tabs>") && !xml.includes("<w:jc ")) return docx;
     const rewritten = xml.replace(/<w:p[ >][\s\S]*?<\/w:p>/g, rewriteParagraph);
     if (rewritten === xml) return docx;
     zip.file("word/document.xml", rewritten);

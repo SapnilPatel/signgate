@@ -311,7 +311,9 @@ export function resolvePrefill(
       case "client_email":
         return file.clientEmail;
       case "client_company":
-        return file.clientCompany;
+        // The blank for the contracting party must never print empty: an individual
+        // client with no company contracts in their own name.
+        return file.clientCompany || file.clientName;
       case "client_title":
         return file.clientTitle;
       case "client_phone":
@@ -334,6 +336,8 @@ export function resolvePrefill(
         return ordinal(today.day);
       case "today_month":
         return today.month;
+      case "today_month_day":
+        return `${today.month} ${today.day}`;
       case "today_year":
         return String(today.year);
       case "today_year_short":

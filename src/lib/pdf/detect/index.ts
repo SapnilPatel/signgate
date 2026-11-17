@@ -184,7 +184,7 @@ async function detect(pdf: Uint8Array, options: DetectOptions, deps: DetectDeps)
         ? `Found ${plural(blocks, "signature block")}. Check that the company block is assigned to your side.`
         : `Found ${plural(blocks, "signature block")} and assigned it to the client.`,
     );
-    if (rule.stats.guessedRoles && blocks > 1) notes.push("The document does not say which block belongs to which party, so the first one was given to the client. Swap them in the editor if that is wrong.");
+    if (rule.stats.guessedRoles && blocks > 1) notes.push("The document does not say which block belongs to which party, so that was a best guess. Check who signs where, and swap them in the editor if it is wrong.");
   } else if (signatures.length) {
     notes.push(`Found ${plural(signatures.length, "place")} to sign: ${clientSigs} for the client and ${companySigs} for your side.`);
   }
