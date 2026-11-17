@@ -1,4 +1,5 @@
 import type { Metadata } from "next";
+import { cache } from "react";
 import { getViewer } from "@/lib/auth/session";
 import { getRequestMeta } from "@/lib/request";
 import { ServiceError } from "@/lib/services/context";
@@ -9,12 +10,38 @@ import { StateScreen, readableOn, safeColor } from "@/components/signing/brand";
 import { RefreshButton } from "@/components/signing/refresh-button";
 
 // The address holds the signing secret: never indexed, never sent on as a referrer, never cached.
-export const metadata: Metadata = {
+const sealedMetadata: Metadata = {
   title: "Sign your agreement",
   robots: { index: false, follow: false, nocache: true },
   referrer: "no-referrer",
 };
 export const dynamic = "force-dynamic";
+
+/** One lookup per request, shared by the tab title and the page, so opening the link is recorded once. */
+const loadSession = cache(async (token: string) => getSigningSession(token, await getRequestMeta()));
+
+const TITLE_BY_STATE: Record<Exclude<SigningSession["state"], "unknown">, string> = {
+  ready: "Sign",
+  signed: "Signed",
+  completed: "Signed and complete",
+  not_your_turn: "Not ready to sign yet",
+  voided: "Cancelled",
+  declined: "Declined",
+  expired: "Link expired",
+};
+
+/** The tab says what state the agreement is in, so a tab kept open for the download does not still ask for a signature. */
+export async function generateMetadata({ params }: { params: Promise<{ token: string }> }): Promise<Metadata> {
+  try {
+    const { token } = await params;
+    const session = await loadSession(token);
+    if (session.state === "unknown") return { ...sealedMetadata, title: "Signing link does not work" };
+    const name = session.agreementName.trim().slice(0, 80);
+    return { ...sealedMetadata, title: name ? `${TITLE_BY_STATE[session.state]}: ${name}` : sealedMetadata.title };
+  } catch {
+    return sealedMetadata;
+  }
+}
 
 type Known = Exclude<SigningSession, { state: "unknown" }>;
 
@@ -50,7 +77,7 @@ export default async function SignPage({ params }: { params: Promise<{ token: st
 
   let session: SigningSession;
   try {
-    session = await getSigningSession(token, await getRequestMeta());
+    session = await loadSession(token);
   } catch (err) {
     if (!(err instanceof ServiceError)) throw err;
     // Too many requests, most likely: say so and offer the way forward.
