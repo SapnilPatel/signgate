@@ -7,6 +7,9 @@ import { NavLink, SetupPrompt } from "./nav-link";
 import { ResendVerificationButton } from "./welcome/resend-button";
 import { getSetup } from "./welcome/setup";
 
+// The scheduled work started below runs after the response and takes up to about 40 seconds.
+export const maxDuration = 60;
+
 export default async function AppLayout({ children }: LayoutProps<"/">) {
   const { user, org } = await requireViewer();
   // Reminders and expiry keep moving whenever anyone uses the product, not only when the daily host cron fires.
