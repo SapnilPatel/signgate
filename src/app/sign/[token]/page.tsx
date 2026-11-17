@@ -1,4 +1,5 @@
 import type { Metadata } from "next";
+import { getViewer } from "@/lib/auth/session";
 import { getRequestMeta } from "@/lib/request";
 import { ServiceError } from "@/lib/services/context";
 import { getSigningSession, type SigningSession } from "@/lib/services/signing";
@@ -38,7 +39,7 @@ function Contact({ session }: { session: Known }) {
           .
         </>
       ) : (
-        " by replying to the email that brought you here."
+        " directly."
       )}
     </p>
   );
@@ -71,6 +72,18 @@ export default async function SignPage({ params }: { params: Promise<{ token: st
   }
 
   const { org } = session;
+  // Someone signing for the company while signed in came from the product and needs a way back to it.
+  // The file's own page when the session names the file, the file list otherwise.
+  let backHref: string | null = null;
+  if (session.signer.role === "company" && (await getViewer().catch(() => null))) {
+    const fileId = (session as { fileId?: unknown }).fileId;
+    backHref = typeof fileId === "string" && /^[\w-]{1,64}$/.test(fileId) ? `/files/${fileId}` : "/files";
+  }
+  const back = backHref ? (
+    <a href={backHref} className={buttonClass("secondary", "lg", "w-full sm:w-auto")}>
+      {backHref === "/files" ? "Back to your files" : "Back to the file"}
+    </a>
+  ) : null;
   const base = `/api/sign/${encodeURIComponent(token)}`;
   const brandButton = { backgroundColor: safeColor(org.brandColor), color: readableOn(org.brandColor) };
   const subject = (
@@ -93,6 +106,7 @@ export default async function SignPage({ params }: { params: Promise<{ token: st
           defaults={session.defaults}
           expiresOn={session.expiresAt ? formatDate(session.expiresAt) : null}
           contactEmail={contactEmailOf(session)}
+          backHref={backHref}
         />
       );
 
@@ -111,9 +125,13 @@ export default async function SignPage({ params }: { params: Promise<{ token: st
                 <a href={`${base}/signed?view=1`} target="_blank" rel="noopener noreferrer" className={buttonClass("secondary", "lg", "w-full sm:w-auto")}>
                   Open in the browser
                 </a>
+                {back}
               </>
             ) : (
-              <RefreshButton>Check for the signed copy</RefreshButton>
+              <>
+                <RefreshButton>Check for the signed copy</RefreshButton>
+                {back}
+              </>
             )
           }
           footer={
@@ -145,7 +163,12 @@ export default async function SignPage({ params }: { params: Promise<{ token: st
           brand={org}
           tone="signed"
           title={session.signer.role === "company" ? `You have signed for ${org.name}` : "You have signed this agreement"}
-          actions={<RefreshButton>Check for the completed copy</RefreshButton>}
+          actions={
+            <>
+              <RefreshButton>Check for the completed copy</RefreshButton>
+              {back}
+            </>
+          }
           footer={<Contact session={session} />}
         >
           {subject}

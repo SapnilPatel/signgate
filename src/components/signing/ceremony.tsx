@@ -30,6 +30,8 @@ export interface CeremonyProps {
   expiresOn: string | null;
   /** The company's reply-to address, when it has one. */
   contactEmail: string | null;
+  /** Where a signed-in countersigner goes back to (their file); null for clients. */
+  backHref?: string | null;
 }
 
 type ImageKind = "signature" | "initials";
@@ -153,11 +155,47 @@ interface ApiFailure {
 
 const wait = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 
+/**
+ * POSTs JSON with a time limit that covers the whole exchange. The timer is built by hand
+ * because AbortSignal.timeout does not exist on Safari before 16 or older Android WebViews,
+ * and a missing function there must not be mistaken for a dropped connection.
+ * Rejects only when the server could not be reached (or took too long).
+ */
+async function postJson(url: string, body: string, ms: number): Promise<{ response: Response; data: unknown }> {
+  const controller = typeof AbortController === "undefined" ? null : new AbortController();
+  const timer = controller ? setTimeout(() => controller.abort(), ms) : null;
+  try {
+    const response = await fetch(url, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body,
+      cache: "no-store",
+      ...(controller ? { signal: controller.signal } : {}),
+    });
+    const data: unknown = await response.json().catch(() => null);
+    return { response, data };
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
+
+/** The agreement's bytes on their way to this browser, then on screen. Nothing can be signed before "ready" and shown. */
+type DocState =
+  | { kind: "loading"; received: number; total: number | null }
+  | { kind: "ready"; bytes: Uint8Array }
+  | { kind: "failed"; why: "connection" | "server" | "viewer" };
+
+function loadingLabel(doc: { received: number; total: number | null }): string {
+  if (doc.total) return `Loading the agreement, ${Math.min(99, Math.floor((doc.received / doc.total) * 100))}%`;
+  if (doc.received > 0) return `Loading the agreement, ${(doc.received / 1_000_000).toFixed(1)} MB so far`;
+  return "Loading the agreement…";
+}
+
 // ---------------------------------------------------------------------------
 // The ceremony
 // ---------------------------------------------------------------------------
 
-export function Ceremony({ token, org, agreementName, fileReference, signer, pages, fields, defaults, expiresOn, contactEmail }: CeremonyProps) {
+export function Ceremony({ token, org, agreementName, fileReference, signer, pages, fields, defaults, expiresOn, contactEmail, backHref = null }: CeremonyProps) {
   const router = useRouter();
   const color = safeColor(org.brandColor);
   const brandButton: CSSProperties = { backgroundColor: color, color: readableOn(color) };
@@ -187,6 +225,9 @@ export function Ceremony({ token, org, agreementName, fileReference, signer, pag
   const [coarse, setCoarse] = useState(true);
   const [docWidth, setDocWidth] = useState(0);
   const [pageCount, setPageCount] = useState(pages.length);
+  const [doc, setDoc] = useState<DocState>({ kind: "loading", received: 0, total: null });
+  const [docShown, setDocShown] = useState(false);
+  const [docAttempt, setDocAttempt] = useState(0);
 
   const [signing, setSigning] = useState<{ field: Field; kind: ImageKind; open: number; mode: "draw" | "type" | "upload"; style?: number } | null>(null);
   const [draft, setDraft] = useState<string | null>(null);
@@ -251,6 +292,65 @@ export function Ceremony({ token, org, agreementName, fileReference, signer, pag
 
   useEffect(() => () => void (pendingOpen.current && clearTimeout(pendingOpen.current)), []);
 
+  // The agreement is downloaded here, not by the viewer, so the page can say how far along it is
+  // and can keep every field and the sign button out of reach until there is something to read.
+  useEffect(() => {
+    const controller = typeof AbortController === "undefined" ? null : new AbortController();
+    let cancelled = false;
+    (async () => {
+      try {
+        const response = await fetch(documentUrl, { cache: "no-store", ...(controller ? { signal: controller.signal } : {}) });
+        if (cancelled) return;
+        if (!response.ok) {
+          // Cancelled, expired or already signed since this page opened: show that screen instead.
+          if (response.status === 404 || response.status === 409 || response.status === 410) router.refresh();
+          setDoc({ kind: "failed", why: "server" });
+          return;
+        }
+        const total = Number(response.headers.get("Content-Length")) || null;
+        const reader = response.body && typeof response.body.getReader === "function" ? response.body.getReader() : null;
+        let bytes: Uint8Array;
+        if (reader) {
+          const chunks: Uint8Array[] = [];
+          let received = 0;
+          let reported = 0;
+          for (;;) {
+            const { done, value } = await reader.read();
+            if (done) break;
+            chunks.push(value);
+            received += value.byteLength;
+            // About a hundred updates per document is plenty; a re-render per network chunk is not.
+            if (!cancelled && received - reported >= (total ?? 5_000_000) / 100) {
+              reported = received;
+              setDoc({ kind: "loading", received, total });
+            }
+          }
+          bytes = new Uint8Array(received);
+          let offset = 0;
+          for (const chunk of chunks) {
+            bytes.set(chunk, offset);
+            offset += chunk.byteLength;
+          }
+        } else {
+          bytes = new Uint8Array(await response.arrayBuffer());
+        }
+        if (!cancelled) setDoc({ kind: "ready", bytes });
+      } catch {
+        if (!cancelled) setDoc({ kind: "failed", why: "connection" });
+      }
+    })();
+    return () => {
+      cancelled = true;
+      controller?.abort();
+    };
+  }, [documentUrl, docAttempt, router]);
+
+  const reloadDocument = () => {
+    setDocShown(false);
+    setDoc({ kind: "loading", received: 0, total: null });
+    setDocAttempt((n) => n + 1);
+  };
+
   const problem = status.kind === "error" ? status : null;
   useEffect(() => {
     // An error that is not about one field is explained at the top; make sure it is seen.
@@ -262,6 +362,8 @@ export function Ceremony({ token, org, agreementName, fileReference, signer, pag
   const doneCount = todo.length - missingFields.length;
   const allDone = consent && missingFields.length === 0;
   const sending = status.kind === "sending";
+  /** True once the agreement is drawn on screen. Until then nothing can be filled in or signed. */
+  const docReady = doc.kind === "ready" && docShown;
 
   const setValue = useCallback((id: string, value: string | boolean | null) => {
     setValues((current) => {
@@ -384,7 +486,7 @@ export function Ceremony({ token, org, agreementName, fileReference, signer, pag
 
   const submit = async () => {
     // One request at a time, however many times the button is tapped.
-    if (busy.current) return;
+    if (busy.current || !docReady) return;
     if (!allDone) {
       setShowMissing(true);
       return;
@@ -402,14 +504,11 @@ export function Ceremony({ token, org, agreementName, fileReference, signer, pag
       for (let attempt = 1; attempt <= 3; attempt++) {
         setStatus({ kind: "sending", note: attempt === 1 ? "Signing…" : "The connection dropped. Trying again…" });
         let response: Response;
+        let data: (SigningResult & ApiFailure) | null;
         try {
-          response = await fetch(`${base}/submit`, {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body,
-            cache: "no-store",
-            signal: AbortSignal.timeout(70_000),
-          });
+          const answer = await postJson(`${base}/submit`, body, 70_000);
+          response = answer.response;
+          data = answer.data as (SigningResult & ApiFailure) | null;
         } catch {
           // No answer at all. The server ignores a repeat of a signature it already has, so trying again is safe.
           if (attempt < 3) {
@@ -423,7 +522,6 @@ export function Ceremony({ token, org, agreementName, fileReference, signer, pag
           });
           return;
         }
-        const data = (await response.json().catch(() => null)) as (SigningResult & ApiFailure) | null;
         if (response.ok && data?.status === "signed") {
           try {
             window.sessionStorage.removeItem(key);
@@ -467,14 +565,9 @@ export function Ceremony({ token, org, agreementName, fileReference, signer, pag
     if (declineState.busy) return;
     setDeclineState({ busy: true, error: null });
     try {
-      const response = await fetch(`${base}/decline`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ reason: declineReason }),
-        cache: "no-store",
-        signal: AbortSignal.timeout(45_000),
-      });
-      const data = (await response.json().catch(() => null)) as ApiFailure | null;
+      const answer = await postJson(`${base}/decline`, JSON.stringify({ reason: declineReason }), 45_000);
+      const response = answer.response;
+      const data = answer.data as ApiFailure | null;
       if (!response.ok && response.status !== 404 && response.status !== 409 && response.status !== 410) {
         setDeclineState({ busy: false, error: data?.error?.message || "The agreement could not be declined just now. Try again." });
         return;
@@ -494,12 +587,38 @@ export function Ceremony({ token, org, agreementName, fileReference, signer, pag
   // ----- after signing -----------------------------------------------------
 
   if (status.kind === "done") {
-    return <Done result={status.result} org={org} signer={signer} signedUrl={`${base}/signed`} brandButton={brandButton} onCheck={() => router.refresh()} />;
+    return <Done result={status.result} org={org} signer={signer} signedUrl={`${base}/signed`} backHref={backHref} brandButton={brandButton} onCheck={() => router.refresh()} />;
   }
 
   // ----- overlay -----------------------------------------------------------
 
-  const renderOverlay = (pageIndex: number) =>
+  const renderOverlay = (pageIndex: number) => [
+    ...fieldHalos(pageIndex),
+    ...fieldBoxes(pageIndex),
+  ];
+
+  /**
+   * Under a finger, a line on the document is only a few pixels tall. Each tappable field gets an
+   * invisible area at least 44 px high, centred on it. They are drawn before the fields themselves,
+   * so where a neighbour's area reaches over a field, the field's own box still wins the tap.
+   */
+  const fieldHalos = (pageIndex: number) =>
+    !coarse
+      ? []
+      : (byPage.get(pageIndex) ?? [])
+          .filter((field) => !isAuto(field) && field.type !== "checkbox" && (isImage(field) || !typesInPlace(field)))
+          .map((field) => (
+            <span
+              key={`halo-${field.id}`}
+              aria-hidden
+              data-halo-for={field.id}
+              onClick={() => openField(field)}
+              style={{ left: `${field.x * 100}%`, top: `${(field.y + field.h / 2) * 100}%`, width: `${field.w * 100}%`, height: `max(${field.h * 100}%, 44px)` }}
+              className="absolute -translate-y-1/2 cursor-pointer"
+            />
+          ));
+
+  const fieldBoxes = (pageIndex: number) =>
     (byPage.get(pageIndex) ?? []).map((field) => {
       const value = values[field.id];
       const done = isDone(field, values);
@@ -600,9 +719,10 @@ export function Ceremony({ token, org, agreementName, fileReference, signer, pag
               ? `${field.label || emptyLabel(field)}: ${isImage(field) ? `your ${what} is added` : shownValue(field, String(value))}. Change.`
               : `${field.label || emptyLabel(field)}${field.required ? " (required)" : " (optional)"}. ${isImage(field) ? `Add your ${what}` : "Fill in"}.`
           }
-          // The pseudo-element widens the tap target: a line on a phone screen is only a few pixels tall.
+          // With a mouse the pseudo-element widens the target a little; under a finger the halo above does.
           className={cx(
-            "absolute flex items-end rounded-sm text-left [container-type:size] after:absolute after:-inset-x-1 after:-inset-y-2 after:content-['']",
+            "absolute flex items-end rounded-sm text-left [container-type:size]",
+            !coarse && "after:absolute after:-inset-x-1 after:-inset-y-2 after:content-['']",
             isImage(field) && !done ? "items-center justify-center" : "",
             tone,
           )}
@@ -707,20 +827,20 @@ export function Ceremony({ token, org, agreementName, fileReference, signer, pag
           </h2>
           <div className="flex flex-wrap items-center gap-1">
             <div role="group" aria-label="Zoom" className="flex items-center">
-              <Button variant="quiet" size="sm" className="w-9 px-0 text-lg" aria-label="Zoom out" disabled={zoom === 0} onClick={() => setZoom((z) => Math.max(0, z - 1))}>
+              <Button variant="quiet" size="sm" className="w-9 px-0 text-lg max-sm:h-11 max-sm:w-11" aria-label="Zoom out" disabled={zoom === 0} onClick={() => setZoom((z) => Math.max(0, z - 1))}>
                 −
               </Button>
               <span className="tabular w-12 text-center text-[13px] text-ink-soft" aria-live="polite">
                 {Math.round(scale * 100)}%
               </span>
-              <Button variant="quiet" size="sm" className="w-9 px-0 text-lg" aria-label="Zoom in" disabled={zoom === ZOOMS.length - 1} onClick={() => setZoom((z) => Math.min(ZOOMS.length - 1, z + 1))}>
+              <Button variant="quiet" size="sm" className="w-9 px-0 text-lg max-sm:h-11 max-sm:w-11" aria-label="Zoom in" disabled={zoom === ZOOMS.length - 1} onClick={() => setZoom((z) => Math.min(ZOOMS.length - 1, z + 1))}>
                 +
               </Button>
             </div>
-            <a href={`${documentUrl}?download=1`} className={buttonClass("quiet", "sm")}>
+            <a href={`${documentUrl}?download=1`} className={buttonClass("quiet", "sm", "max-sm:h-11")}>
               Download
             </a>
-            <a href={documentUrl} target="_blank" rel="noopener noreferrer" className={buttonClass("quiet", "sm")}>
+            <a href={documentUrl} target="_blank" rel="noopener noreferrer" className={buttonClass("quiet", "sm", "max-sm:h-11")}>
               Open to print
             </a>
           </div>
@@ -728,7 +848,51 @@ export function Ceremony({ token, org, agreementName, fileReference, signer, pag
 
         <div ref={scrollerRef} className="mt-2 overflow-x-auto overscroll-x-contain rounded-sm" tabIndex={zoom > 0 ? 0 : undefined} aria-label={zoom > 0 ? "Agreement, zoomed in. Scroll sideways to see the whole page." : undefined}>
           <div style={{ width: `${scale * 100}%` }} className="p-px">
-            <PdfPages source={documentUrl} pages={pages} renderOverlay={renderOverlay} onLoaded={(loaded) => setPageCount(loaded.length)} label={agreementName} />
+            {doc.kind === "ready" ? (
+              <PdfPages
+                source={doc.bytes}
+                pages={pages}
+                // No field can be touched until the words around it are on screen.
+                renderOverlay={docShown ? renderOverlay : undefined}
+                onLoaded={(loaded) => {
+                  setPageCount(loaded.length);
+                  setDocShown(true);
+                }}
+                onError={() => setDoc({ kind: "failed", why: "viewer" })}
+                label={agreementName}
+              />
+            ) : doc.kind === "loading" ? (
+              <div
+                role="status"
+                className="flex w-full flex-col items-center justify-center gap-3 rounded-sm bg-white px-6 shadow-sheet ring-1 ring-rule"
+                style={{ aspectRatio: pages[0] ? `${pages[0].width} / ${pages[0].height}` : "8.5 / 11" }}
+              >
+                <p className="tabular text-center text-sm text-ink-soft">{loadingLabel(doc)}</p>
+                <div aria-hidden className="h-1 w-40 max-w-full overflow-hidden rounded-sm bg-rule-soft">
+                  <div className="h-full bg-ink-soft" style={{ width: `${doc.total ? Math.min(100, (doc.received / doc.total) * 100) : 0}%` }} />
+                </div>
+                <p className="max-w-[40ch] text-center text-[13px] text-ink-faint">You can sign once the agreement is on screen.</p>
+              </div>
+            ) : (
+              <Notice tone="error" title="The agreement could not be shown">
+                <p>
+                  {doc.why === "viewer"
+                    ? "This browser could not display the agreement. It may be too old. Open this link in an up-to-date Safari or Chrome, or try again."
+                    : doc.why === "server"
+                      ? "The agreement could not be loaded just now. Wait a moment and try again."
+                      : "The agreement did not finish loading. Check your connection and try again."}{" "}
+                  Nothing can be signed until it is on screen. Anything you entered is kept.
+                </p>
+                <div className="mt-3 flex flex-wrap gap-2">
+                  <Button variant="secondary" onClick={reloadDocument}>
+                    Try again
+                  </Button>
+                  <a href={`${documentUrl}?download=1`} className={buttonClass("quiet")}>
+                    Download the agreement
+                  </a>
+                </div>
+              </Notice>
+            )}
           </div>
         </div>
 
@@ -745,12 +909,13 @@ export function Ceremony({ token, org, agreementName, fileReference, signer, pag
                 .
               </>
             ) : (
-              " by replying to the email that brought you here."
+              " directly."
             )}
           </p>
-          <p>
-            Do not want to sign?{" "}
-            <button type="button" onClick={() => setDeclining(true)} className="font-semibold text-ink underline underline-offset-2">
+          <p className="flex flex-wrap items-center gap-x-1.5">
+            <span>Do not want to sign?</span>
+            {/* Tall enough to hit with a thumb, without looking like the main action. */}
+            <button type="button" onClick={() => setDeclining(true)} className="inline-flex min-h-11 items-center font-semibold text-ink underline underline-offset-2">
               Decline to sign
             </button>
           </p>
@@ -785,6 +950,10 @@ export function Ceremony({ token, org, agreementName, fileReference, signer, pag
           <p className="tabular text-sm text-ink-soft" role="status">
             {sending ? (
               status.note
+            ) : doc.kind === "failed" ? (
+              <span className="font-semibold text-stop">The agreement could not be shown, so it cannot be signed yet.</span>
+            ) : !docReady ? (
+              "Loading the agreement. You can sign once it is on screen."
             ) : problem ? (
               <span className="font-semibold text-stop">{problem.retry ? "Not signed yet: your signature could not be sent." : "Not signed yet: check the fields marked in red."}</span>
             ) : allDone ? (
@@ -803,7 +972,7 @@ export function Ceremony({ token, org, agreementName, fileReference, signer, pag
           </p>
           <div className="flex w-full gap-2 sm:w-auto">
             {!allDone ? (
-              <Button size="lg" className="flex-1 sm:flex-none" style={brandButton} onClick={next}>
+              <Button size="lg" className="flex-1 sm:flex-none" style={docReady ? brandButton : undefined} disabled={!docReady} onClick={next}>
                 {started ? "Next" : "Start"}
               </Button>
             ) : null}
@@ -813,8 +982,9 @@ export function Ceremony({ token, org, agreementName, fileReference, signer, pag
               className={cx("flex-1 sm:flex-none", !allDone && "text-ink-faint")}
               style={allDone ? brandButton : undefined}
               aria-expanded={allDone ? undefined : showMissing}
-              // Never disabled outright: pressing it early lists exactly what is still missing.
-              disabled={sending}
+              // Once the agreement is on screen this is never disabled outright: pressing it early
+              // lists exactly what is still missing. Before that, there is nothing yet to agree to.
+              disabled={sending || !docReady}
               aria-describedby={showMissing && !allDone ? "sign-missing" : undefined}
               aria-busy={sending}
               onClick={() => void submit()}
@@ -986,6 +1156,7 @@ function Done({
   org,
   signer,
   signedUrl,
+  backHref,
   brandButton,
   onCheck,
 }: {
@@ -993,6 +1164,7 @@ function Done({
   org: Brand;
   signer: CeremonyProps["signer"];
   signedUrl: string;
+  backHref: string | null;
   brandButton: CSSProperties;
   onCheck: () => void;
 }) {
@@ -1030,15 +1202,12 @@ function Done({
             ) : result.next === "awaiting_countersignature" ? (
               <>
                 <li>{org.name} signs their part. Nothing more is needed from you.</li>
-                <li>
-                  When they have, the completed agreement is emailed to {signer.email} as a PDF. If it does not arrive, open this link again: the
-                  download will be here.
-                </li>
+                <li>When they have, open this link again to download the completed agreement as a PDF. Keep the link somewhere safe.</li>
               </>
             ) : (
               <>
                 <li>The final copy is being put together. This usually takes less than a minute.</li>
-                <li>It is emailed to {signer.email} when it is ready, and you can download it from this link.</li>
+                <li>You can download it from this link as soon as it is ready.</li>
               </>
             )}
           </ul>
@@ -1053,6 +1222,11 @@ function Done({
                 {checking ? "Checking…" : "Check for the completed copy"}
               </Button>
             )}
+            {backHref ? (
+              <a href={backHref} className={buttonClass("secondary", "lg", "w-full sm:w-auto")}>
+                {backHref === "/files" ? "Back to your files" : "Back to the file"}
+              </a>
+            ) : null}
           </div>
         </div>
         <PoweredBy className="mt-6 max-w-[560px] text-center" />
