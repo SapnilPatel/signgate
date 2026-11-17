@@ -1,12 +1,14 @@
 import type { Metadata } from "next";
 import type { ReactNode } from "react";
 import { canManage } from "@/lib/auth/session";
+import { PRODUCT_NAME } from "@/lib/env";
 import { requireActor } from "@/lib/request";
 import { listMembers } from "@/lib/services/accounts";
 import { ButtonLink, PageHeader, Sheet } from "@/components/ui";
 import { SettingsNav } from "./settings-nav";
 
-export const metadata: Metadata = { title: "Settings" };
+// A plain string here would drop the root title template for every settings page below.
+export const metadata: Metadata = { title: { default: "Settings", template: `%s | ${PRODUCT_NAME}` } };
 
 export default async function SettingsLayout({ children }: { children: ReactNode }) {
   const { viewer, actor } = await requireActor();
