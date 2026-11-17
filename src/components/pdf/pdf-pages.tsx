@@ -56,6 +56,8 @@ export function PdfPages({
   useEffect(() => {
     let cancelled = false;
     let opened: PDFDocumentProxy | null = null;
+    // A new source (or a retry) starts from a clean slate before the async load begins.
+    // eslint-disable-next-line react-hooks/set-state-in-effect
     setError(null);
     setDoc(null);
     (async () => {
@@ -151,6 +153,8 @@ function PdfPage({
     const el = frameRef.current;
     if (!el || near) return;
     if (typeof IntersectionObserver === "undefined") {
+      // Very old browsers: no lazy loading, render every page.
+      // eslint-disable-next-line react-hooks/set-state-in-effect
       setNear(true);
       return;
     }
