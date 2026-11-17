@@ -1,5 +1,6 @@
 import "server-only";
 import { cache } from "react";
+import { canManage } from "@/lib/auth/session";
 import { requireActor } from "@/lib/request";
 import {
   getEmailSendingStatus,
@@ -15,8 +16,9 @@ export interface SetupStep {
   title: string;
   detail: string;
   done: boolean;
-  href: string;
-  action: string;
+  /** Null when the step is someone else's to do: it is shown as information, with no button. */
+  href: string | null;
+  action: string | null;
 }
 
 export interface Setup {
@@ -71,6 +73,8 @@ export const getSetup = cache(async (): Promise<Setup> => {
   if (main && main.fields.some((f) => f.role === "company")) {
     const { member } = resolveCountersigner(settings, members);
     const isViewer = member?.id === viewer.user.id;
+    // Members cannot open company settings, so they are told who to ask instead of being sent there.
+    const manager = canManage(viewer.user);
     steps.push({
       key: "countersign",
       title: "Choose who countersigns and save their signature",
@@ -79,15 +83,25 @@ export const getSetup = cache(async (): Promise<Setup> => {
           ? `${member.name} signs for your company after each client.`
           : isViewer
             ? "Your agreement has places for your company to sign, and you are the one who signs them. Save your signature once so countersigning takes a moment."
-            : `Your agreement has places for your company to sign. ${member.name} signs them and has not saved a signature yet; ask them to save one in their account, or choose someone else.`
-        : "Your agreement has places for your company to sign. Choose the person who signs them.",
+            : manager
+              ? `Your agreement has places for your company to sign. ${member.name} signs them and has not saved a signature yet; ask them to save one in their account, or choose someone else.`
+              : `Your agreement has places for your company to sign. ${member.name} signs them and has not saved a signature yet; ask them to save one in their account.`
+        : manager
+          ? "Your agreement has places for your company to sign. Choose the person who signs them."
+          : "Your agreement has places for your company to sign, and nobody has been chosen to sign them yet. Ask an owner or admin to choose someone under Settings.",
       done: Boolean(member?.hasSignature),
       href:
         member && isViewer
           ? "/account#signature"
-          : "/settings/signing#countersigning",
+          : manager
+            ? "/settings/signing#countersigning"
+            : null,
       action:
-        member && isViewer ? "Save your signature" : "Choose the countersigner",
+        member && isViewer
+          ? "Save your signature"
+          : manager
+            ? "Choose the countersigner"
+            : null,
     });
   }
 
