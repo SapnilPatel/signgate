@@ -135,7 +135,10 @@ export async function loadEnvelopeContext(db: DbOrTx, envelopeId: string): Promi
 }
 
 export function brandOf(org: Org): Brand {
-  return { orgName: org.name, brandColor: resolveSettings(org).brandColor };
+  const settings = resolveSettings(org);
+  // Email clients do not show inline data: images, so the logo is served from a public address.
+  const hasLogo = typeof settings.logo === "string" && settings.logo.length > 0;
+  return { orgName: org.name, brandColor: settings.brandColor, ...(hasLogo ? { logoUrl: `${env.appUrl}/api/public/logo/${org.id}` } : {}) };
 }
 
 export function fileUrl(fileId: string): string {

@@ -25,7 +25,7 @@ import { ServiceError, type Actor } from "@/lib/services/context";
 import { putBlob } from "@/lib/services/blobs";
 import { clearTestOutbox, getTestOutbox } from "@/lib/services/email";
 import { sendAgreementForFile, voidEnvelope } from "@/lib/services/envelopes";
-import { FINALIZE_FAILED_EVENT, MAX_SIGNER_IMAGE_PIXELS, SEAL_WARNING_EVENT, calendarParts, inTransaction, isRetryableTxError, linkDeadEmail, orgTimeZone, declineSigning, finalizeEnvelope, getSignedCopy, getSigningDocument, getSigningSession, listUnsealedEnvelopeIds, longDate, maskEmail, signedDateLabel, submitSigning, validateSignerValues, verifyDocument } from "@/lib/services/signing";
+import { FINALIZE_FAILED_EVENT, MAX_SIGNER_IMAGE_PIXELS, SEAL_WARNING_EVENT, brandOf, calendarParts, inTransaction, isRetryableTxError, linkDeadEmail, orgTimeZone, declineSigning, finalizeEnvelope, getSignedCopy, getSigningDocument, getSigningSession, listUnsealedEnvelopeIds, longDate, maskEmail, signedDateLabel, submitSigning, validateSignerValues, verifyDocument } from "@/lib/services/signing";
 import { findSignerBySecret, hashSigningSecret, signingSecret, signingUrl } from "@/lib/services/tokens";
 import { runScheduledJobs } from "@/lib/services/jobs";
 import { describeEvent, listEvents } from "@/lib/services/events";
@@ -1104,6 +1104,17 @@ describe("company time zone helpers", () => {
     expect(calendarParts(at, "America/New_York")).toEqual({ day: 31, month: "December", year: 2026 });
     expect(calendarParts(at, null)).toEqual({ day: 1, month: "January", year: 2027 });
     expect(calendarParts(at, "Not/Real")).toEqual({ day: 1, month: "January", year: 2027 });
+  });
+});
+
+describe("the brand that emails carry", () => {
+  it("points at the public logo address only when the company has uploaded a logo", () => {
+    const base = { id: "org_logo_test", name: "Harbor Works" };
+    const withLogo = brandOf({ ...base, settings: { logo: "data:image/png;base64,AAAA" } } as unknown as Org);
+    expect(withLogo.orgName).toBe("Harbor Works");
+    expect(withLogo.logoUrl).toMatch(/^https?:\/\/[^/]+\/api\/public\/logo\/org_logo_test$/);
+    expect(brandOf({ ...base, settings: {} } as unknown as Org).logoUrl).toBeUndefined();
+    expect(brandOf({ ...base, settings: { logo: "" } } as unknown as Org).logoUrl).toBeUndefined();
   });
 });
 
