@@ -1,6 +1,7 @@
 import Link from "next/link";
 import { requireViewer } from "@/lib/auth/session";
 import { PRODUCT_NAME } from "@/lib/env";
+import { tickAfterResponse } from "@/lib/api/tick";
 import { logOutAction } from "../(auth)/actions";
 import { NavLink, SetupPrompt } from "./nav-link";
 import { ResendVerificationButton } from "./welcome/resend-button";
@@ -8,6 +9,8 @@ import { getSetup } from "./welcome/setup";
 
 export default async function AppLayout({ children }: LayoutProps<"/">) {
   const { user, org } = await requireViewer();
+  // Reminders and expiry keep moving whenever anyone uses the product, not only when the daily host cron fires.
+  tickAfterResponse();
   const setup = await getSetup();
   const onHold = setup.email.reason !== null;
 
